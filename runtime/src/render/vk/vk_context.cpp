@@ -559,6 +559,7 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
             features.pNext = &have13;
             vkGetPhysicalDeviceFeatures2(physical_, &features);
             features13.maintenance4 = have13.maintenance4;
+            features13.privateData = have13.privateData;  // Streamline's private data slots (FB)
             optical_flow.opticalFlow = optical_flow_family != UINT32_MAX ? VK_TRUE : VK_FALSE;
         }
         if (1u + extra <= props[queue_family_].queueCount) {
@@ -776,6 +777,7 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
         vkGetPhysicalDeviceFeatures2(physical_, &features);
         sync2_core = have13.synchronization2 == VK_TRUE;
         features13.synchronization2 = have13.synchronization2;
+        features13.privateData = have13.privateData;  // Streamline's private data slots (FB)
     }
     VkPhysicalDeviceSynchronization2FeaturesKHR sync2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR};
     bool sync2_extension = false;
@@ -845,11 +847,12 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
         // A pass reads the texture a ray meets: an index that differs from pixel to pixel.
         rt_caps_.bindless = bindless_ && have12.shaderSampledImageArrayNonUniformIndexing == VK_TRUE;
     }
-    // The prepass's pixel stage reads its triangle's number, which Vulkan gives a fragment shader only on a device
-    // with geometry shaders (LOOK-INVENTORY G8: a device without them needs the triangle another way).
-    const bool rt_enable = ray_tracing && rt_caps_.ray_queries && rt_caps_.acceleration_structures && rt_caps_.bindless &&
-                           available.geometryShader == VK_TRUE;
-    if (rt_enable) {
+    // The prepass's pixel stage reads its triangle's number where Vulkan gives a fragment shader one: on a device with
+    // geometry shaders. Without them (or under rt-no-geometry, the test of that) the prepass names its item only and
+    // the surface pass finds the triangle by a ray (D11).
+    rt_caps_.triangle_ids = available.geometryShader == VK_TRUE && !::galaxy::diagnosing(::galaxy::kDiagnoseRtNoGeometry);
+    const bool rt_enable = ray_tracing && rt_caps_.ray_queries && rt_caps_.acceleration_structures && rt_caps_.bindless;
+    if (rt_enable && rt_caps_.triangle_ids) {
         enabled.geometryShader = VK_TRUE;
     }
     // Only what the tracer uses is enabled, whatever else the device reports in these structures.
@@ -999,6 +1002,7 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
         if (other != nullptr) {
             other->synchronization2 = VK_TRUE;
             other->maintenance4 = (other->maintenance4 || ours->maintenance4) ? VK_TRUE : VK_FALSE;
+            other->privateData = (other->privateData || ours->privateData) ? VK_TRUE : VK_FALSE;
             other->subgroupSizeControl = (other->subgroupSizeControl || ours->subgroupSizeControl) ? VK_TRUE : VK_FALSE;
             other->computeFullSubgroups = (other->computeFullSubgroups || ours->computeFullSubgroups) ? VK_TRUE : VK_FALSE;
             for (auto* node = reinterpret_cast<VkBaseOutStructure*>(&device_info); node->pNext != nullptr; node = node->pNext) {

@@ -2,6 +2,7 @@
 // RenderCore's part of ray tracing: when the tracer runs, which meshes it holds structures for, and what a frame
 // builds (render/rt holds the policy, rt_backend.h the API).
 #include "galaxy/render/render_core.h"
+#include "galaxy/render/rt/rt_denoiser.h"
 
 #include "galaxy/launch_args.h"
 #include "galaxy/render/ambient_occlusion_shape.h"
@@ -10,6 +11,7 @@
 #include "galaxy/render/rt_caps.h"
 #include "galaxy/platform_time.h"
 #include "galaxy/render/post_process_settings.h"
+#include "galaxy/render/rt_materials.h"
 #include "render/core/pipelines.h"
 #include "render/core/world_lights.h"
 
@@ -29,9 +31,12 @@ namespace {
 #include "render/rt/rt_effect_lights.inc"
 #include "render/rt/rt_blue_noise.inc"
 
-// A particle effect's luminance (candela a square metre of what it draws), by the name its draws carry: -1 for a
-// name that is not one of the game's own effects (a mod's, another archive's).
+// A particle effect's luminance (candela a square metre of what it draws), by the name its draws carry: the pak's row
+// (rt_effects.tsv, a mod's pack may add its effects), else the compiled table's; -1 for a name neither holds.
 float effect_luminance(std::uint32_t name) noexcept {
+    if (const RtEffectRow* const row = rt_effect(name); row != nullptr) {
+        return row->luminance;
+    }
     const RtEffectLight* const end = std::end(kRtEffectLights);
     const RtEffectLight* const at =
         std::lower_bound(std::begin(kRtEffectLights), end, name, [](const RtEffectLight& e, std::uint32_t n) { return e.name < n; });
@@ -59,6 +64,12 @@ constexpr std::size_t kRtItemWords = 16u;
 constexpr bool item_is_sky_dome(const NebulaFrameItem& item) noexcept {
     const std::uint32_t category = (item.flags & NEBULA_ITEM_CATEGORY_MASK) >> NEBULA_ITEM_CATEGORY_SHIFT;
     return category == NEBULA_CATEGORY_SKY || category == NEBULA_CATEGORY_ASTRO_DOME_SKY;
+}
+
+// The draw types (MR::DrawType) whose code draws a water surface: OceanBowl 6, OceanRing 7, its pipe's inside 8 and
+// outside 9, OceanSphere 10, WaterRoad 11, WhirlPoolAccelerator 12 (SceneFunction.hpp; WaterPlant is weed).
+constexpr bool category_is_water(std::uint32_t category) noexcept {
+    return category >= NEBULA_CATEGORY_DRAW + 6u && category <= NEBULA_CATEGORY_DRAW + 12u;
 }
 
 // What the game drew the item as (NEBULA_CATEGORY_*).
@@ -132,6 +143,7 @@ void RenderCore::rt_stop() noexcept {
     rt_light_frame_ = RtFrame{};
     rt_light_history_ = false;
     rt_light_retired_.clear();
+    rt_bounce_stop();
     rt_light_on_ = false;
     rt_prepass_walk_ = false;
     rt_skin_buffer_ = rt::kNoBuffer;
@@ -139,6 +151,10 @@ void RenderCore::rt_stop() noexcept {
     rt_skin_retired_.clear();
     rt_drop_volumes_.clear();
     rt_sun_known_ = false;
+    rt_sun_ease_ = 0u;
+    rt_sun_light_ = 0u;
+    rt_sun_source_ = 0u;
+    rt_sun_up_known_ = false;
     rt_scene_pass_ = NEBULA_NONE32;
     rt_scene_view_ = NEBULA_NONE32;
     rt_scene_.clear();
@@ -248,7 +264,8 @@ void RenderCore::rt_scene(const NebulaFramePass& begin) {
                                     eye[r * 4u + 3u];
                 emitter.colour[r] = light.color[r] * std::min(candela, 5000.0f);
             }
-            emitter.radius = 25.0f;
+            // Its body's size where the game knows it (the actor's binder), else a small lamp's.
+            emitter.radius = light.radius > 0.0f && std::isfinite(light.radius) ? std::clamp(light.radius, 5.0f, 400.0f) : 25.0f;
             emitter.reach = 0.0f;
             emitter.slot = NEBULA_NONE32;
             emitter.kind = 0u;
@@ -256,6 +273,8 @@ void RenderCore::rt_scene(const NebulaFramePass& begin) {
         }
     }
     rt_emitter_blocks_.clear();
+    rt_water_ring_item_ = ~0u;
+    rt_emissive_areas_.assign(walk_.now->list->item_count, 0u);
     rt_drops_.clear();
     rt_drop_volumes_.clear();
     rt_scene_pass_ = NEBULA_NONE32;
@@ -314,7 +333,7 @@ void RenderCore::rt_scene(const NebulaFramePass& begin) {
                     // What stops light is a surface of the scene's opaque phases; an opaque draw made after them (a
                     // fill, a silhouette, a helper shape) is seen by the views and casts nothing.
                     ? rt::kMaskOpaque | (early ? rt::kMaskEarly : 0u) |
-                          (kind == 0u && early ? rt::kMaskSolid | (program_lit(pipeline.desc.pixel) ? rt::kMaskLit : 0u) : 0u) |
+                          (kind == 0u && early ? rt::kMaskSolid | (program_lit(pipeline.desc.pixel) || program_sums_key(pipeline.desc.pixel) ? rt::kMaskLit : 0u) : 0u) |
                           (kind != 0u && early ? rt::kMaskCutout : 0u)
                     : rt::kMaskBlended;
             if ((item.flags & (NEBULA_ITEM_INSTANCES | NEBULA_ITEM_PARTICLE | NEBULA_ITEM_WIDE)) != 0u) {
@@ -333,9 +352,11 @@ void RenderCore::rt_scene(const NebulaFramePass& begin) {
                 if (stride < 12u || list.ring_vertices == nullptr) {
                     continue;
                 }
-                RtRing& ring = rt_rings_[(mask & rt::kMaskEarly) != 0u ? 0u : (mask & rt::kMaskOpaque) != 0u ? 1u : 2u];
+                const bool water = category_is_water(item_category(item));
+                RtRing& ring = rt_rings_[water ? 3u : (mask & rt::kMaskEarly) != 0u ? 0u : (mask & rt::kMaskOpaque) != 0u ? 1u : 2u];
                 if (ring.positions.empty()) {
                     ring.item = i;
+                    rt_water_ring_item_ = water ? i : rt_water_ring_item_;
                 }
                 ring.regenerated = ring.regenerated || (item.flags & NEBULA_ITEM_DISCRETE_VERTICES) != 0u;
                 const auto* vertices = static_cast<const std::byte*>(list.ring_vertices) + item.ring_at;
@@ -479,6 +500,8 @@ void RenderCore::rt_scene(const NebulaFramePass& begin) {
             const float (*place)[4] = walk_rows_cpu_ + walk_block_rows_[item.block] + matrix * kRowsPerMatrix;
             rt_scene_.add(place, i, mask, structure, faces, kind);
             count.triangles += triangles;
+            // Off screen (the game keeps it drawn for the tracer while it traces, 5.3 G-1): the raster passes leave it out.
+            count.outside += item_culled(item, pass, state, &mesh) ? 1u : 0u;
             if ((item.slot != 0u && list.shadow_drop_count != 0u) || mesh.glow[3] != 0.0f) {
                 // The mesh's box through its matrix: for the drop shadow its object may cast and the light it may give.
                 float centre[3], radius = 0.0f;
@@ -527,8 +550,9 @@ void RenderCore::rt_scene(const NebulaFramePass& begin) {
         }
     }
     // The ring meshes: their triangles into this frame's rows memory, each kind one structure.
-    static constexpr std::uint32_t kRingMasks[3] = {rt::kMaskOpaque | rt::kMaskEarly | rt::kMaskSolid, rt::kMaskOpaque, rt::kMaskBlended};
-    for (unsigned kind = 0; kind < 3u; ++kind) {
+    static constexpr std::uint32_t kRingMasks[4] = {rt::kMaskOpaque | rt::kMaskEarly | rt::kMaskSolid, rt::kMaskOpaque, rt::kMaskBlended,
+                                                    rt::kMaskBlended};
+    for (unsigned kind = 0; kind < 4u; ++kind) {
         RtRing& ring = rt_rings_[kind];
         if (ring.positions.empty()) {
             continue;
@@ -550,7 +574,7 @@ void RenderCore::rt_scene(const NebulaFramePass& begin) {
             rt_scene_.add(skin.root, skin.item, skin.mask, structure, skin.faces, skin.kind);
         }
     }
-    for (unsigned kind = 0; kind < 3u; ++kind) {
+    for (unsigned kind = 0; kind < 4u; ++kind) {
         RtRing& ring = rt_rings_[kind];
         if (!ring.positions.empty()) {
             if (const std::uint64_t structure = rt_geometry_.name(1ull << 62u | kind); structure != 0u) {
@@ -829,6 +853,7 @@ void RenderCore::rt_prepass(const NebulaFramePass& begin) {
     }
     rt_prepass_walk_ = false;
     rt_light();
+    rt_signals();
     if (!rt_light_on_) {
         rt_drop_volumes_.clear();
         rt_drops_.clear();
@@ -846,7 +871,7 @@ struct RtImageKind {
     std::uint8_t size;
     std::uint8_t passes;
 };
-constexpr std::uint8_t kForLight = 1u, kForIndirect = 2u, kForReflect = 4u, kForVolume = 8u, kForTransmit = 16u, kForBlend = 32u;
+constexpr std::uint8_t kForLight = 1u, kForIndirect = 2u, kForReflect = 4u, kForVolume = 8u, kForTransmit = 16u, kForBlend = 32u, kForGuides = 64u;
 constexpr rt::ImageFormat kHalf4 = rt::ImageFormat::Rgba16f;  // shares as fractions: an average over time in bytes stalls
 constexpr RtImageKind kRtImageKinds[] = {
     {"Nebula RT Guide A", kHalf4, kRtFull, kForLight},
@@ -902,6 +927,10 @@ constexpr RtImageKind kRtImageKinds[] = {
     {"Nebula RT GI Reservoirs B", rt::ImageFormat::Rgba32ui, kRtHalf, kForIndirect},
     {"Nebula RT GI Weights A", kHalf4, kRtHalf, kForIndirect},
     {"Nebula RT GI Weights B", kHalf4, kRtHalf, kForIndirect},
+    {"Nebula RT Indirect Guide A", kHalf4, kRtHalf, kForIndirect},
+    {"Nebula RT Indirect Guide B", kHalf4, kRtHalf, kForIndirect},
+    {"Nebula RT Indirect Motion", kHalf4, kRtHalf, kForIndirect},
+    {"Nebula RT Indirect Step", kHalf4, kRtHalf, kForIndirect},
     {"Nebula RT Reflect Raw", kHalf4, kRtFull, kForReflect},
     {"Nebula RT Reflect Average A", kHalf4, kRtFull, kForReflect},
     {"Nebula RT Reflect Average B", kHalf4, kRtFull, kForReflect},
@@ -909,6 +938,12 @@ constexpr RtImageKind kRtImageKinds[] = {
     {"Nebula RT Transmit", kHalf4, kRtFull, kForTransmit},
     {"Nebula RT Volume A", kHalf4, kRtVolume, kForVolume},
     {"Nebula RT Volume B", kHalf4, kRtVolume, kForVolume},
+    {"Nebula RT Scatter", kHalf4, kRtVolume, kForVolume},  // FB: the light in the air, integrated (rt_scatter.hlsl)
+    {"Nebula RT Reflect Moved", rt::ImageFormat::R8, kRtFull, kForReflect},  // FB: where R changed (rt_reflect_time.hlsl)
+    {"Nebula RT Guide Diffuse", rt::ImageFormat::Rgba8, kRtFull, kForGuides},  // FB: an outside denoiser's (rt_rr_guides.hlsl)
+    {"Nebula RT Guide Specular", rt::ImageFormat::Rgba8, kRtFull, kForGuides},
+    {"Nebula RT Guide Normal Roughness", kHalf4, kRtFull, kForGuides},
+    {"Nebula RT Guide Hit", rt::ImageFormat::R16f, kRtFull, kForGuides},
 };
 // The light volume's cells: across, down and deep over the scene camera's view.
 constexpr std::uint32_t kRtVolumeCells[3] = {96u, 54u, 48u};
@@ -939,7 +974,7 @@ struct RtPassConstants {
 bool RenderCore::rt_images(unsigned width, unsigned height, std::uint32_t wanted) {
     static_assert(std::size(kRtImageKinds) == kRtImages);
     static_assert(kRtPassLight == kForLight && kRtPassIndirect == kForIndirect && kRtPassReflect == kForReflect && kRtPassVolume == kForVolume &&
-                  kRtPassTransmit == kForTransmit && kRtPassBlend == kForBlend);
+                  kRtPassTransmit == kForTransmit && kRtPassBlend == kForBlend && kRtPassGuides == kForGuides);
     std::erase_if(rt_light_retired_, [&](const std::pair<std::uint64_t, std::uint32_t>& retired) {
         if (retired.first + rt::kFramesToRelease > frame_index_) {
             return false;
@@ -1197,6 +1232,7 @@ void RenderCore::rt_filters() {
         over_space.reads[0] = step == 0u ? average : step == 1u ? light : light_step;
         over_space.reads[2] = guide;
         over_space.reads[3] = step == 2u ? motion : rt::kNoImage;  // the last step's, for --diagnostics rt-motion
+        over_space.reads[4] = step == 2u && rt_pass_indirect_on() ? rt_image(RtImage::Indirect) : rt::kNoImage;  // the sky's share
         over_space.reads[5] = step == 2u ? rt_image(RtImage::SunOut) : rt::kNoImage;  // the last step's V (rgb)
         over_space.writes[0] = step == 1u ? light_step : light;
         rt_backend_.dispatch(RtShader::LightSpace, over_space, frame.across, frame.down);
@@ -1329,12 +1365,18 @@ void RenderCore::rt_tables(const Affine34& world_from_now) {
                                   rt_set_words_[std::size_t{item.light_set} * 4u + 3u] != 0.0f;
                 const core::PipelineEntry& pipeline = registries_.pipeline(item.pipeline);
                 const bool thin = (pipeline.desc.state >> 15u & 3u) == NEBULA_CULL_NONE;  // drawn from both sides: a sheet
+                // 32: a glowing surface too large to be one light (kItemEmissiveArea, rt_emitter, L-3).
+                const bool area = i < rt_emissive_areas_.size() && rt_emissive_areas_[i] != 0u;
                 rt_item_words_[i * kItemWords + 1u] = (program_sums_key(pipeline.desc.pixel) ? 1u : 0u) |
                                                       (pass.phase != kPhaseNoShadow ? 2u : 0u) | 4u | (thin ? 8u : 0u) |
-                                                      (lamp ? (item.light_set + 1u) << 8u : 0u);
+                                                      (area ? 32u : 0u) | (lamp ? (item.light_set + 1u) << 8u : 0u);
             }
             // Its mesh, for a pixel of it and for a ray that meets it.
             if ((item.flags & (NEBULA_ITEM_RING | NEBULA_ITEM_INSTANCES)) != 0u) {
+                if (i == rt_water_ring_item_) {
+                    // The code-drawn water's ring: water to a ray (class, and water's roughness 0.03).
+                    rt_item_words_[i * kItemWords + 11u] = std::uint32_t{NEBULA_HIT_WATER} | 8u << 16u;
+                }
                 continue;
             }
             const core::GpuMesh& mesh = registries_.mesh(item.mesh);
@@ -1384,6 +1426,20 @@ void RenderCore::rt_tables(const Affine34& world_from_now) {
                         byte_of(mesh.hit_metal) << 24u;
             words[12] = byte_of(mesh.hit_base[0]) | byte_of(mesh.hit_base[1]) << 8u | byte_of(mesh.hit_base[2]) << 16u |
                         byte_of(mesh.hit_environment) << 24u;
+            // What it shows with no light, and whether it glows (rt_shade.hlsli rt_hit_read).
+            words[14] = byte_of(mesh.hit_emission[0]) | byte_of(mesh.hit_emission[1]) << 8u | byte_of(mesh.hit_emission[2]) << 16u |
+                        (mesh.glow[3] != 0.0f ? 1u << 24u : 0u);
+            // Its mirror and see-through numbers (FA and FB read them): bits 0-11 its painted environment map's own
+            // colour, 4 bits a channel, the largest 15 (all 0: no painted map): what tints the real reflection that
+            // takes the map's place (12.4); bits 12-19 its index of refraction, (ior - 1) * 100; bits 20-25 its
+            // shine * 4 (63: the class's own); bits 26-31 its body * 62 (63: the class's own) (13.2, 14.4).
+            const auto bits_of = [](float v, float scale, std::uint32_t top) {
+                return std::min(top, static_cast<std::uint32_t>(std::max(v, 0.0f) * scale + 0.5f));
+            };
+            words[15] = bits_of(mesh.hit_env_tint[0], 15.0f, 15u) | bits_of(mesh.hit_env_tint[1], 15.0f, 15u) << 4u |
+                        bits_of(mesh.hit_env_tint[2], 15.0f, 15u) << 8u | bits_of(mesh.hit_ior - 1.0f, 100.0f, 255u) << 12u |
+                        (mesh.hit_shine < 0.0f ? 63u : bits_of(mesh.hit_shine, 4.0f, 62u)) << 20u |
+                        (mesh.hit_body < 0.0f ? 63u : bits_of(mesh.hit_body, 62.0f, 62u)) << 26u;
         }
     }
     if (covering) {
@@ -1409,6 +1465,8 @@ void RenderCore::rt_tables(const Affine34& world_from_now) {
     constexpr float kSkyInShadow = 0.5f;  // what the sun's shadow keeps of the sky's light: the sky turned down (the
                                           // view's tint gives back up to 0.3 of the rest in the sky's colour)
     constexpr float kFullFacing = 0.6f;  // a painted surface keeps its authored brightness from this n.l up
+    constexpr float kPaintedStyle = 1.0f;  // a painted surface whose model's paint holds its shadows
+                                           // (NEBULA_HIT_PAINTED_SHADOW) is shadowed by lit things only (14.6)
     const float* const sun = rt_sun_eye_;
     const bool sunned = rt_sun_now_;
     float ambient = 0.0f, key = 0.0f;
@@ -1418,21 +1476,28 @@ void RenderCore::rt_tables(const Affine34& world_from_now) {
             key = 0.2126f * light->color[0] + 0.7152f * light->color[1] + 0.0722f * light->color[2];
         }
     }
-    // The sky's colour in shadow: the stage's ambient colour, its strongest part as one, by a share. A
-    // shadow on a blue day is blue, under a red sky red; a stage that names none takes nothing back.
-    constexpr float kSkyTint = 0.2f;
-    rt_tint_[0] = rt_tint_[1] = rt_tint_[2] = 0.0f;
-    if (list.stage_light_known != 0u && ambient > 0.02f) {
-        const float most = std::max({list.stage_ambient[0], list.stage_ambient[1], list.stage_ambient[2]});
-        // Told apart from grey before it counts: a grey ambient would only lift the shadow.
-        const float least = std::min({list.stage_ambient[0], list.stage_ambient[1], list.stage_ambient[2]});
-        const float coloured = most > 0.0f ? std::min(1.0f, (most - least) / most * 4.0f) : 0.0f;
-        for (unsigned c = 0; c < 3u; ++c) {
-            rt_tint_[c] = kSkyTint * (0.35f + 0.65f * coloured) * list.stage_ambient[c] / most;
-        }
-    }
+    const bool stage_named = ambient > 0.02f && key > 0.02f;
     if (!(ambient > 0.02f) || !(key > 0.02f)) {
         ambient = key = 0.5f;  // a stage that names no light of its own: an even split
+    }
+    // The stage's own numbers where its row gives them (rt_stages.tsv, RT-MASTER-PLAN 23.2).
+    const RtStage& stage_row = rt_stage(list.stage_hash) != nullptr ? *rt_stage(list.stage_hash) : kRtStageDefaults;
+    key *= stage_row.sun_gain;
+    ambient *= stage_row.ambient_gain / kRtStageDefaults.ambient_gain;
+    // The stage's ambient and key colours for the programs' painted composite (RT-MASTER-PLAN 3.4): a shadow takes
+    // the sky's colour, a channel at a time, by kShadowTint. By the row's gains; an even grey where the stage names
+    // no light of its own.
+    {
+        constexpr float kShadowTint = 0.2f;
+        const NebulaFrameWorldLight* const key_light = stage_named ? core::find_world_light(list, list.stage_light) : nullptr;
+        for (unsigned c = 0; c < 3u; ++c) {
+            const float a = key_light != nullptr ? list.stage_ambient[c] : 0.5f;
+            const float k = key_light != nullptr ? key_light->color[c] : 0.5f;
+            rt_stage_a_[c] = a * stage_row.ambient_gain / kRtStageDefaults.ambient_gain;
+            rt_stage_k_[c] = k * stage_row.sun_gain;
+        }
+        rt_stage_a_[3] = kShadowTint;
+        rt_stage_k_[3] = 0.0f;
     }
     if (!rt_drops_.empty()) {
         rt_drop_bins(width, height, frame.ray);
@@ -1448,7 +1513,8 @@ void RenderCore::rt_tables(const Affine34& world_from_now) {
     static_assert(sizeof(RtDrop) == 48u && sizeof(RtEmitter) == 48u);
     // The stage's exposure: the light a fully lit surface of it stands in, from its own key and ambient: 40 lux
     // in the dark of space (a glow carries far), 150 on a bright day (a glow is a touch of colour near it).
-    rt_emitters_finish(40.0f + 110.0f * std::clamp((ambient + key) / 1.2f, 0.0f, 1.0f));
+    rt_emitters_finish(stage_row.exposure_low +
+                       (stage_row.exposure_high - stage_row.exposure_low) * std::clamp((ambient + key) / 1.2f, 0.0f, 1.0f));
     const bool glowing = !rt_emitters_.empty();
     if (glowing) {
         rt_emitter_bins(width, height, frame.ray);
@@ -1533,12 +1599,13 @@ void RenderCore::rt_tables(const Affine34& world_from_now) {
     constants.sun[0] = sun[0];
     constants.sun[1] = sun[1];
     constants.sun[2] = sun[2];
-    constants.sun[3] = kSunTan;
+    constants.sun[3] = stage_row.sun_size > 0.0f ? stage_row.sun_size : kSunTan;
     constants.stage[0] = ambient;
     constants.stage[1] = key;
     constants.stage[2] = 128.0f / 255.0f;  // the game's fill: black at alpha 0x80 (MR::fillSilhouetteColor)
     constants.stage[3] = kDropTan;
     constants.look[0] = kSkyInShadow;
+    constants.look[1] = kPaintedStyle;
     constants.look[2] = kFullFacing;
     constants.look[3] = kSkyReach;
     // The mesh memory: the arenas the items named, and the frame's rows. A slot no arena fills reads the
@@ -1578,6 +1645,14 @@ void RenderCore::rt_tables(const Affine34& world_from_now) {
     constants.more[2] = (sunned && rt_part(render, RtPart::Sun) != 0u ? 1u : 0u) | 8u |
                         (rt_part(render, RtPart::Reflect) >= 2u ? 32u : 0u) | 64u;  // low: the painted maps stay, as off
     std::memcpy(constants.up, sky_up_, sizeof(sky_up_));
+    if (rt_pass_indirect_on()) {
+        // The sky and bounce light pass gives the sky's share (bit 8): no sky rays here. A painted surface keeps
+        // kShadowTint of its colour from it (traced_painted: plan 11.4's faint cast; the light pass takes none back).
+        constants.more[2] = (constants.more[2] & ~8u) | 256u;
+    }
+    if (rt_pass_reflect_on()) {
+        constants.more[2] |= 1024u;  // the reflections pass writes the opaque layer's mirror (rt_pass_reflect.cpp)
+    }
     // For a pixel whose mesh the pass cannot read: the camera's own move since the frame before (none where there is
     // no frame before: the filter starts anew there anyway).
     Affine34 before_from_now = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
@@ -1597,24 +1672,24 @@ void RenderCore::rt_tables(const Affine34& world_from_now) {
         }
     }
     rt_light_ticks_before_ = ticks;
+    constants.more[2] |= rt_raw_ ? 2048u : 0u;  // FB (22.20): the signals raw, for an outside denoiser
     constants.kept[3] = std::bit_cast<std::uint32_t>(std::clamp(rt_frame_rate_ / 60.0f, 0.5f, 2.0f));
     std::memcpy(constants.before, before_from_now.data(), sizeof(constants.before));
     if (::galaxy::diagnosing(::galaxy::kDiagnoseRtAdded)) {
-        // The scene under its emitters alone: no sun, no sky, no mirror, no tint.
+        // The scene under its emitters alone: no sun, no sky, no mirror.
         constants.more[2] = (constants.more[2] & ~32u) | 128u;
-        rt_tint_[0] = rt_tint_[1] = rt_tint_[2] = 0.0f;
     }
     if (::galaxy::diagnosing(::galaxy::kDiagnoseRtMotion)) {
         // Each point's motion in place of the light (shown the way rt-light shows it), nothing added over it.
         constants.more[2] |= 512u;
         constants.glow[3] = 0u;
-        rt_tint_[0] = rt_tint_[1] = rt_tint_[2] = 0.0f;
     }
     // A ray that leaves the scene and meets no sky (a stage without a dome): the stage's ambient colour.
     for (unsigned c = 0; c < 3u; ++c) {
         constants.sky[c] = list.stage_light_known != 0u ? list.stage_ambient[c] : 0.25f;
     }
     static_assert(sizeof(RtFrameConstants) <= 512u && offsetof(RtFrameConstants, more) == 64u);
+    static_assert(offsetof(RtFrameConstants, kept) == 304u);  // rt_pass_indirect.cpp HalfFrameConstants
     const UploadRing::Allocation at = renderer_.constant_ring().allocate(512u, 256u);
     std::memcpy(at.cpu, &constants, sizeof(constants));
     binds.constants = {at.gpu, 512u};
@@ -1639,7 +1714,10 @@ void RenderCore::rt_light() {
     unsigned width = 0u, height = 0u;
     if (renderer_.rt_light_begin(depth, items, width, height)) {
         rt_backend_.begin(commands.commands, renderer_.frame_slot(), commands.descriptors);
-        const std::uint32_t wanted = kRtPassLight | (rt_pass_indirect_on() ? kRtPassIndirect : 0u) |
+        // FB (22.20): the renderer's outside denoiser takes the signals raw (rt_denoiser.h).
+        const rt::Denoiser* const denoiser = renderer_.rt_denoiser();
+        rt_raw_ = denoiser != nullptr && denoiser->raw_signals() == rt::kSignalAll;
+        const std::uint32_t wanted = (rt_raw_ ? kRtPassGuides : 0u) | kRtPassLight | (rt_pass_indirect_on() ? kRtPassIndirect : 0u) |
                                      (rt_pass_reflect_on() ? kRtPassReflect : 0u) | (rt_pass_volume_on() ? kRtPassVolume : 0u) |
                                      (rt_blend_seen_ ? kRtPassBlend : 0u);
         rt_light_wanted_ = wanted & ~kRtPassBlend;
@@ -1682,8 +1760,11 @@ void RenderCore::rt_light() {
             rt_pass_light();
             rt_pass_reflect();
             rt_pass_volume();
+            rt_pass_guides();
+            rt_pass_reference();
             rt_backend_.end_counters();
             rt_filters();
+            rt_reference_publish();
             rt_light_view_before_ = view_now;
             std::memcpy(rt_light_ray_before_, eye.ray, sizeof(rt_light_ray_before_));
             rt_light_walk_before_ = walk_.serial;
@@ -1701,7 +1782,28 @@ void RenderCore::rt_light() {
                 rt_added_slot_ = renderer_.rt_publish_light(added, texture_store_, 1u);
                 rt_mirror_slot_ = renderer_.rt_publish_light(mirror, texture_store_, 2u);
                 rt_facing_slot_ = renderer_.rt_publish_light(facing, texture_store_, 3u);
+                // The light volume (FB): picture 4, read through a linear sampler (program.hlsli traced_air).
+                if (rt_volume_drawn_) {
+                    if (void* const volume = rt_backend_.image_to_sample(rt_now(RtImage::VolumeA)); volume != nullptr) {
+                        rt_volume_slot_ = renderer_.rt_publish_light(volume, texture_store_, 4u);
+                        TextureSampler linear;
+                        linear.mag_linear = linear.min_linear = true;
+                        rt_volume_sampler_ = renderer_.sampler_slot(make_sampler_key(linear, false, 1u));
+                    } else {
+                        rt_volume_drawn_ = false;
+                    }
+                }
+                // The light in the air (FB): picture 5 (program.hlsli traced_scatter).
+                rt_scatter_drawn_ = rt_scatter_drawn_ && rt_volume_drawn_;
+                if (rt_scatter_drawn_) {
+                    if (void* const scatter = rt_backend_.image_to_sample(rt_image(RtImage::Scatter)); scatter != nullptr) {
+                        rt_scatter_slot_ = renderer_.rt_publish_light(scatter, texture_store_, 5u);
+                    } else {
+                        rt_scatter_drawn_ = false;
+                    }
+                }
                 rt_light_on_ = true;
+                rt_guides_publish();
                 view_flags_ |= 8u | (::galaxy::diagnosing(::galaxy::kDiagnoseRtLight | ::galaxy::kDiagnoseRtMotion) ? 16u : 0u) |
                                (rt_lamps_own_ ? 32u : 0u);  // local lights off: the programs' own lamp (FC)
                 ++walk_view_stamp_;  // the scene's views are written again, with the light
@@ -1794,6 +1896,20 @@ void RenderCore::rt_report() {
     }
     std::fprintf(stderr, "[rt-inputs]   emitters now: %u point lights of the game, %u glowing meshes, %u particles\n", kinds[0],
                  kinds[1], kinds[2]);
+    // What they are, over the report's frames (emitter_census.py names them): most lights first.
+    if (!rt_emitter_sources_.empty()) {
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> sources(rt_emitter_sources_.begin(), rt_emitter_sources_.end());
+        std::sort(sources.begin(), sources.end(), [](const auto& a, const auto& b) {
+            return a.second != b.second ? a.second > b.second : a.first < b.first;
+        });
+        std::fprintf(stderr, "[rt-inputs]   sources:");
+        for (std::size_t s = 0; s < sources.size() && s < 96u; ++s) {
+            std::fprintf(stderr, " %c%08x x%u", (sources[s].first >> 32u) == 1u ? 'm' : 'p',
+                         static_cast<unsigned>(sources[s].first & 0xFFFFFFFFu), sources[s].second);
+        }
+        std::fprintf(stderr, "\n");
+        rt_emitter_sources_.clear();
+    }
     // The six strongest, as the pass reads them: kind, the source's radius and reach in metres, and its
     // intensity back in candela (what it adds at its own radius, times the exposure and the radius squared).
     std::vector<const RtEmitter*> order;
@@ -1837,6 +1953,13 @@ void RenderCore::rt_reactive() {
         binds.constants = rt_light_frame_.binds.constants;
         binds.pass_constants = rt_light_frame_.pass;
         binds.reads[0] = moments;
+        // FB: where the reflections changed too (plan 16.4's R), when the reflection pass wrote it this frame.
+        const std::uint32_t reflect_moved = rt_reflect_moved_ ? rt_image(RtImage::ReflectMoved) : rt::kNoImage;
+        if (reflect_moved != rt::kNoImage) {
+            binds.reads[1] = reflect_moved;
+            binds.pass_constants = rt_pass_constants(0u, 0u, 0u, 1u);
+        }
+        rt_reflect_moved_ = false;
         binds.write_texture = reactive;
         rt_backend_.dispatch(RtShader::Reactive, binds, rt_light_frame_.across, rt_light_frame_.down);
         renderer_.rt_reactive_end();
@@ -1903,15 +2026,24 @@ bool RenderCore::rt_sun(float eye_direction[3]) {
         v[2] /= size;
         return true;
     };
+    const auto dot = [](const float x[3], const float y[3]) { return x[0] * y[0] + x[1] * y[1] + x[2] * y[2]; };
+    const bool report = ::galaxy::diagnosing(::galaxy::kDiagnoseRtInputs) && rt_light_frames_ == 0u;
+    const RtStage* const row = rt_stage(list.stage_hash);
+    const RtStage::Sun mode = row != nullptr ? row->sun : RtStage::Sun::Auto;
+    const bool fresh = !rt_sun_known_ || walk_.time.reset || now.cut;
     float up[3]{};
-    const bool up_known = list.sky_up_known != 0u;
-    if (up_known) {
-        to_world(sky_up_, up);
-    }
+    const bool up_known = list.sky_up_known != 0u && (to_world(sky_up_, up), unit(up));
     float target[3]{};
-    bool known = false, follows = false;
+    std::uint8_t source = 0u;
+    std::uint64_t key_id = 0u;
+    bool follows = false;
+    float key_brightness = -1.0f;
+    if (mode == RtStage::Sun::Fixed) {
+        std::memcpy(target, row->direction, sizeof(target));
+        source = unit(target) ? 3u : 0u;
+    }
     // The sun the player sees, where the stage has one: `position` is the unit direction from the camera to it.
-    for (std::uint32_t i = 0; i < list.world_light_count && !known; ++i) {
+    for (std::uint32_t i = 0; i < list.world_light_count && source == 0u && (mode == RtStage::Sun::Auto || mode == RtStage::Sun::Object); ++i) {
         const NebulaFrameWorldLight& light = list.world_lights[i];
         if (light.kind == NEBULA_WORLD_LIGHT_SUN) {
             if ((light.flags & NEBULA_WORLD_LIGHT_FOLLOWS_CAMERA) != 0u) {
@@ -1919,72 +2051,168 @@ bool RenderCore::rt_sun(float eye_direction[3]) {
             } else {
                 std::memcpy(target, light.position, sizeof(target));
             }
-            known = unit(target);
+            source = unit(target) ? 1u : 0u;
         }
     }
-    // Else the stage's key light, from where the camera stands.
-    if (!known && list.stage_light_known != 0u) {
+    // Else the stage's key light, from where the camera stands; none where the key is off (an interior, a night).
+    if (source == 0u && (mode == RtStage::Sun::Auto || mode == RtStage::Sun::Key) && list.stage_light_known != 0u) {
         if (const NebulaFrameWorldLight* key = core::find_world_light(list, list.stage_light); key != nullptr) {
-            follows = (key->flags & NEBULA_WORLD_LIGHT_FOLLOWS_CAMERA) != 0u;
-            if (follows) {
-                to_world(key->position, target);
-            } else {
-                const float offset[3] = {view[3], view[7], view[11]};
-                float camera[3];
-                to_world(offset, camera);  // the camera stands at -R^T t
-                for (unsigned c = 0; c < 3u; ++c) {
-                    target[c] = key->position[c] + camera[c];
+            key_brightness = 0.2126f * key->color[0] + 0.7152f * key->color[1] + 0.0722f * key->color[2];
+            if (mode == RtStage::Sun::Key || key_brightness >= 0.05f) {
+                follows = (key->flags & NEBULA_WORLD_LIGHT_FOLLOWS_CAMERA) != 0u;
+                if (follows) {
+                    to_world(key->position, target);
+                } else {
+                    const float offset[3] = {view[3], view[7], view[11]};
+                    float camera[3];
+                    to_world(offset, camera);  // the camera stands at -R^T t
+                    for (unsigned c = 0; c < 3u; ++c) {
+                        target[c] = key->position[c] + camera[c];
+                    }
+                }
+                if (unit(target)) {
+                    source = 2u;
+                    key_id = list.stage_light;
                 }
             }
-            known = unit(target);
         }
     }
-    // Else straight overhead.
-    if (!known && up_known) {
+    // Else, for a stage that says nothing of its light, straight overhead.
+    if (source == 0u && mode == RtStage::Sun::Auto && list.stage_light_known == 0u && up_known) {
         std::memcpy(target, up, sizeof(target));
-        known = unit(target);
+        source = 4u;
     }
-    if (!known) {
+    if (source == 0u) {
+        if (report) {
+            std::fprintf(stderr, "[rt-inputs] sun: none (stage %08x %s, key %.3f)\n", list.stage_hash, row != nullptr ? "row" : "default",
+                         static_cast<double>(key_brightness));
+        }
+        rt_sun_known_ = false;
+        rt_sun_source_ = 0u;
+        rt_sun_light_ = 0u;
+        rt_sun_ease_ = 0u;
         return false;
     }
-    if (follows && rt_sun_known_ && !walk_.time.reset && !now.cut) {
+    // Where it is held: a key that moves with the camera keeps the direction it was latched at until the zone's light
+    // changes (or a cut); a change of source or zone eases over 30 frames; a direction of the world follows at once.
+    constexpr std::uint32_t kEase = 30u;
+    const bool jump = source != rt_sun_source_ || key_id != rt_sun_light_;
+    if (fresh) {
+        std::memcpy(rt_sun_world_, target, sizeof(target));
+        std::memcpy(rt_sun_to_, target, sizeof(target));
+        rt_sun_ease_ = 0u;
+    } else if (jump) {
+        std::memcpy(rt_sun_from_, rt_sun_world_, sizeof(target));
+        std::memcpy(rt_sun_to_, target, sizeof(target));
+        rt_sun_ease_ = kEase;
+    } else if (!follows) {
+        std::memcpy(rt_sun_to_, target, sizeof(target));
+    }
+    if (rt_sun_ease_ > 0u) {
         if (!walk_.between) {
-            constexpr float kShare = 1.0f / 60.0f;  // a second's lag at the game's 60 frames
-            for (unsigned c = 0; c < 3u; ++c) {
-                rt_sun_world_[c] += (target[c] - rt_sun_world_[c]) * kShare;
-            }
-            if (!unit(rt_sun_world_)) {
-                std::memcpy(rt_sun_world_, target, sizeof(target));
-            }
+            --rt_sun_ease_;
+        }
+        const float t = 1.0f - static_cast<float>(rt_sun_ease_) / static_cast<float>(kEase);
+        const float share = t * t * (3.0f - 2.0f * t);
+        for (unsigned c = 0; c < 3u; ++c) {
+            rt_sun_world_[c] = rt_sun_from_[c] + (rt_sun_to_[c] - rt_sun_from_[c]) * share;
+        }
+        if (!unit(rt_sun_world_)) {
+            std::memcpy(rt_sun_world_, rt_sun_to_, sizeof(target));
+            rt_sun_ease_ = 0u;
         }
     } else {
-        std::memcpy(rt_sun_world_, target, sizeof(target));
+        std::memcpy(rt_sun_world_, rt_sun_to_, sizeof(target));
     }
     rt_sun_known_ = true;
+    rt_sun_source_ = source;
+    rt_sun_light_ = key_id;
+    // The player's up as the lift uses it: as given, but where it turns more than a degree in a frame (a jump between
+    // planets, a gravity change) it eases there, so the shadows do not snap.
+    if (up_known) {
+        if (fresh || !rt_sun_up_known_ || dot(rt_sun_up_, up) >= 0.99985f) {
+            std::memcpy(rt_sun_up_, up, sizeof(up));
+        } else if (!walk_.between) {
+            for (unsigned c = 0; c < 3u; ++c) {
+                rt_sun_up_[c] += (up[c] - rt_sun_up_[c]) * 0.125f;
+            }
+            if (!unit(rt_sun_up_)) {
+                std::memcpy(rt_sun_up_, up, sizeof(up));
+            }
+        }
+        rt_sun_up_known_ = true;
+    } else {
+        rt_sun_up_known_ = false;
+    }
     float sun[3] = {rt_sun_world_[0], rt_sun_world_[1], rt_sun_world_[2]};
-    if (up_known && unit(up)) {
+    bool lifted = false;
+    if (rt_sun_up_known_) {
+        const float* const held = rt_sun_up_;
         constexpr float kLeastRise = 0.5f, kFlat = 0.8660254f;  // 30 degrees above the player's horizon
-        const float rise = sun[0] * up[0] + sun[1] * up[1] + sun[2] * up[2];
+        const float rise = dot(sun, held);
         if (rise < kLeastRise) {
-            float flat[3] = {sun[0] - up[0] * rise, sun[1] - up[1] * rise, sun[2] - up[2] * rise};
+            lifted = true;
+            float flat[3] = {sun[0] - held[0] * rise, sun[1] - held[1] * rise, sun[2] - held[2] * rise};
             if (!unit(flat)) {
                 // Straight below: any side will do.
-                const float side[3] = {std::fabs(up[0]) < 0.9f ? 1.0f : 0.0f, std::fabs(up[0]) < 0.9f ? 0.0f : 1.0f, 0.0f};
-                flat[0] = up[1] * side[2] - up[2] * side[1];
-                flat[1] = up[2] * side[0] - up[0] * side[2];
-                flat[2] = up[0] * side[1] - up[1] * side[0];
+                const float side[3] = {std::fabs(held[0]) < 0.9f ? 1.0f : 0.0f, std::fabs(held[0]) < 0.9f ? 0.0f : 1.0f, 0.0f};
+                flat[0] = held[1] * side[2] - held[2] * side[1];
+                flat[1] = held[2] * side[0] - held[0] * side[2];
+                flat[2] = held[0] * side[1] - held[1] * side[0];
                 static_cast<void>(unit(flat));
             }
             for (unsigned c = 0; c < 3u; ++c) {
-                sun[c] = flat[c] * kFlat + up[c] * kLeastRise;
+                sun[c] = flat[c] * kFlat + held[c] * kLeastRise;
             }
         }
+    }
+    if (report) {
+        static constexpr const char* kSources[] = {"none", "the visible sun", "the key", "the row", "overhead"};
+        std::fprintf(stderr, "[rt-inputs] sun: %s%s, world %.3f %.3f %.3f%s, easing %u (stage %08x %s, key %.3f)\n", kSources[source],
+                     follows ? " (latched)" : "", static_cast<double>(sun[0]), static_cast<double>(sun[1]), static_cast<double>(sun[2]),
+                     lifted ? " lifted" : "", rt_sun_ease_, list.stage_hash, row != nullptr ? "row" : "default",
+                     static_cast<double>(key_brightness));
     }
     for (unsigned r = 0; r < 3u; ++r) {
         eye_direction[r] = view[r * 4u] * sun[0] + view[r * 4u + 1u] * sun[1] + view[r * 4u + 2u] * sun[2];
     }
     return unit(eye_direction);
 }
+
+namespace {
+
+// The glow a draw gives now (L-1): the cooked glow, its colour scaled channel by channel by how the game has changed
+// the material's glow-carrying row since cooking (a lamp it dims, tints or turns off), then made 0 to 1 again with
+// the largest channel's change moved into the strength. A draw without live rows, or whose rows are another form's,
+// keeps the cooked glow.
+void live_glow(const NebulaFrameList& list, const NebulaFrameItem& item, const core::GpuMesh& mesh, float out[4]) {
+    std::copy_n(mesh.glow, 4u, out);
+    if (mesh.glow_row == 0xFFFFu || item.constants >= list.constants_count || list.constants == nullptr) {
+        return;
+    }
+    const NebulaFrameConstants& constants = list.constants[item.constants];
+    if (constants.rows == nullptr || constants.vertex_rows + constants.pixel_rows != mesh.glow_row_count) {
+        return;
+    }
+    const float* live = constants.rows[mesh.glow_row];
+    float colour[3], largest = 0.0f;
+    for (unsigned c = 0; c < 3u; ++c) {
+        // A channel cooked black takes the live value against a byte's step: never a division by nothing.
+        const float ratio = std::clamp(live[c], 0.0f, 8.0f) / std::max(mesh.glow_cooked[c], 1.0f / 255.0f);
+        colour[c] = mesh.glow[c] * std::min(ratio, 8.0f);
+        largest = std::max(largest, colour[c]);
+    }
+    if (!std::isfinite(largest) || !(largest > 1.0e-4f)) {
+        out[3] = 0.0f;  // turned off
+        return;
+    }
+    for (unsigned c = 0; c < 3u; ++c) {
+        out[c] = colour[c] / largest;
+    }
+    out[3] = mesh.glow[3] * largest;
+}
+
+}  // namespace
 
 // A glowing mesh's draw as a light: one a block (a model's glowing meshes are one light, the largest of them). Its
 // intensity is the cooker's (candela, or below zero a luminance by the mesh's size); a long thin mesh (a rail of
@@ -1995,13 +2223,21 @@ void RenderCore::rt_emitter(const NebulaFrameItem& item, const core::GpuMesh& me
         return;
     }
     constexpr std::size_t kMost = 4608u;  // past the particles' own 4096: a mesh's light is not crowded out by sparks
+    float glow[4];
+    live_glow(*walk_.now->list, item, mesh, glow);
+    if (glow[3] == 0.0f) {
+        return;  // the game has turned this glow off
+    }
     const auto intensity_of = [&](float r) {
         // A luminance lights by the mesh's size as the light itself stands for it (no wider than 6 m: a glowing
         // plain is not one lamp).
         const float metres = std::min(r, 600.0f) / kUnitsPerMetre;
-        return mesh.glow[3] > 0.0f ? mesh.glow[3] : -mesh.glow[3] * 3.14159265f * metres * metres;
+        return glow[3] > 0.0f ? glow[3] : -glow[3] * 3.14159265f * metres * metres;
     };
     const auto [found, fresh] = rt_emitter_blocks_.try_emplace(item.block, static_cast<std::uint32_t>(rt_emitters_.size()));
+    if (fresh && ::galaxy::diagnosing(::galaxy::kDiagnoseRtInputs)) {
+        ++rt_emitter_sources_[std::uint64_t{1u} << 32u | item.source_hash];
+    }
     if (!fresh) {
         RtEmitter& same = rt_emitters_[found->second];
         if (same.kind == 1u && same.reserved[0] == 0u && radius > same.radius) {
@@ -2009,7 +2245,7 @@ void RenderCore::rt_emitter(const NebulaFrameItem& item, const core::GpuMesh& me
             std::memcpy(same.centre, centre, sizeof(same.centre));
             same.radius = std::clamp(radius, 25.0f, 600.0f);
             for (unsigned c = 0; c < 3u; ++c) {
-                same.colour[c] = mesh.glow[c] * candela;
+                same.colour[c] = glow[c] * candela;
             }
         }
         return;
@@ -2026,6 +2262,17 @@ void RenderCore::rt_emitter(const NebulaFrameItem& item, const core::GpuMesh& me
                 axis[k][r] = place[r][k] * extent;
             }
             half[k] = std::sqrt(axis[k][0] * axis[k][0] + axis[k][1] * axis[k][1] + axis[k][2] * axis[k][2]);
+        }
+        // Over 6 m in two axes: a glowing surface, not a lamp (L-3). Its light comes by the rays that meet it.
+        constexpr float kAreaHalf = 300.0f;
+        if ((half[0] > kAreaHalf ? 1 : 0) + (half[1] > kAreaHalf ? 1 : 0) + (half[2] > kAreaHalf ? 1 : 0) >= 2) {
+            const NebulaFrameList& list = *walk_.now->list;
+            const std::ptrdiff_t index = &item - list.items;
+            if (index >= 0 && static_cast<std::size_t>(index) < rt_emissive_areas_.size()) {
+                rt_emissive_areas_[static_cast<std::size_t>(index)] = 1u;
+            }
+            rt_emitter_blocks_.erase(found);
+            return;
         }
         const unsigned longest = half[0] >= half[1] && half[0] >= half[2] ? 0u : half[1] >= half[2] ? 1u : 2u;
         thick = std::max({half[(longest + 1u) % 3u], half[(longest + 2u) % 3u], 12.0f});
@@ -2047,11 +2294,11 @@ void RenderCore::rt_emitter(const NebulaFrameItem& item, const core::GpuMesh& me
         const float t = count == 1u ? 0.0f : (2.0f * (static_cast<float>(n) + 0.5f) / static_cast<float>(count) - 1.0f);
         const float size = count == 1u ? radius : std::max(thick, piece);
         const float candela = count == 1u ? intensity_of(radius)
-                              : mesh.glow[3] > 0.0f ? mesh.glow[3] * (2.0f * piece / kUnitsPerMetre)
+                              : glow[3] > 0.0f ? glow[3] * (2.0f * piece / kUnitsPerMetre)
                                                     : intensity_of(std::sqrt(thick * piece));
         for (unsigned c = 0; c < 3u; ++c) {
             emitter.centre[c] = centre[c] + along[c] * t;
-            emitter.colour[c] = mesh.glow[c] * candela;
+            emitter.colour[c] = glow[c] * candela;
         }
         emitter.radius = std::clamp(size, 25.0f, 600.0f);
         emitter.reach = 0.0f;
@@ -2110,6 +2357,19 @@ void RenderCore::rt_emitters_finish(float exposure_lux) {
 // Each particle is a light of its own, where it is and in its own colour, its intensity the luminance over what it
 // shows this frame: so a spin's ring lights the ground around the player, a fuse sputters and a fire flickers as the
 // effect itself does, and the thing in the middle of a cloud of sparks throws its shadow outward.
+// A particle draw the light volume lights (FB, rt_pass_volume.cpp): one that is not a light (rt_particle_emitter's rule).
+bool RenderCore::rt_volume_reads(const NebulaFrameItem& item, std::uint32_t state) const {
+    if ((item.flags & (NEBULA_ITEM_INSTANCES | NEBULA_ITEM_PARTICLE)) == 0u) {
+        return false;
+    }
+    const bool added = (state & 3u) == NEBULA_BLEND_ADD && ((state >> 6u) & 15u) == NEBULA_FACTOR_ONE;
+    float luminance = effect_luminance(item.source_hash);
+    if (luminance < 0.0f) {
+        luminance = added ? 200.0f : 0.0f;
+    }
+    return !(luminance > 0.0f);
+}
+
 void RenderCore::rt_particle_emitter(const NebulaFrameItem& item, std::uint32_t state, std::uint32_t camera) {
     constexpr std::size_t kMost = 4096u;
     const bool added = (state & 3u) == NEBULA_BLEND_ADD && ((state >> 6u) & 15u) == NEBULA_FACTOR_ONE;
@@ -2119,6 +2379,9 @@ void RenderCore::rt_particle_emitter(const NebulaFrameItem& item, std::uint32_t 
     }
     if (!(luminance > 0.0f) || rt_emitters_.size() >= kMost || camera >= walk_cameras_.size()) {
         return;
+    }
+    if (::galaxy::diagnosing(::galaxy::kDiagnoseRtInputs)) {
+        ++rt_emitter_sources_[std::uint64_t{2u} << 32u | item.source_hash];
     }
     const NebulaFrameList& list = *walk_.now->list;
     // R << 24 | G << 16 | B << 8 | A. A particle shows its own colour where its map is white and its environment
