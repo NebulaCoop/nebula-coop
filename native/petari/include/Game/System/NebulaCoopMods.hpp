@@ -26,4 +26,6 @@ namespace NebulaCoopMods {
     s32 ping(s32 index);
     // The id of the character they play ("" for nobody).
     const char* characterId(s32 index);
+    // The colour player `index` wears for a part (0xRRGGBB): this player's own as theirs; -1 for nobody or no such part.
+    s32 paletteColor(s32 index, s32 part);
 };  // namespace NebulaCoopMods

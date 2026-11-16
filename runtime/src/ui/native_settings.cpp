@@ -24,6 +24,7 @@
 #include "galaxy/native_settings_pad.h"
 #include "galaxy/platform_time.h"
 #include "galaxy/runtime_settings.h"
+#include <nebula_palette.hpp>
 #include "galaxy/ui/home_menu_model.h"
 #include "galaxy/ui/settings_model.h"
 #include "galaxy/ui/settings_graphics_page.h"
@@ -2992,6 +2993,89 @@ std::vector<SettingsRow> player_page(const RuntimeSettings& runtime) {
                         },
                         "WHO YOU PLAY AS, IN ANY SAVE, MODS' CHARACTERS TOO. CHANGED IN A GALAXY, YOUR SPOT RELOADS AS THEM AT "
                         "ONCE (IN A COMET, AT THE NEXT START), AND OTHER PLAYERS SEE YOU AS THEM"});
+    }
+
+    // The colours worn (sm64coopdx's palettes): the character's own, a set of them, or each part's.
+    {
+        const CoopPalette own = own_palette(coop);
+        const std::optional<CoopPalette> picked = parse_coop_palette(coop.palette);
+        const CoopPalette wearing = picked ? *picked : own;
+        const std::vector<PalettePreset> presets = palette_presets();
+        std::size_t at = presets.size();
+        for (std::size_t i = 0; i < presets.size() && picked; ++i) {
+            if (presets[i].palette == *picked) at = i;
+        }
+        rows.push_back({"COLOURS", {}, nullptr, {}, true});
+        rows.push_back({"SET", !picked ? std::string("OWN") : at < presets.size() ? presets[at].name : std::string("CUSTOM"),
+                        [presets, at, own, has = picked.has_value()](RenderConfig&, int delta) {
+                            // OWN first, then the sets; from CUSTOM, as from OWN.
+                            const unsigned count = static_cast<unsigned>(presets.size()) + 1u;
+                            const unsigned from = has && at < presets.size() ? static_cast<unsigned>(at) + 1u : 0u;
+                            const unsigned next = ui::settings_step(from, count, delta);
+                            s_runtime_draft.coop.palette =
+                                next == 0u || presets[next - 1u].palette == own ? std::string() : format_coop_palette(presets[next - 1u].palette);
+                        },
+                        "THE COLOURS YOU WEAR: YOUR CHARACTER'S OWN, ANOTHER CHARACTER'S OR A SET OF THEM. OTHER PLAYERS SEE "
+                        "THEM TOO"});
+        // Each part, in the order they show on the player.
+        struct PartRow {
+            const char* label;
+            nebula_palette::Part part;
+        };
+        static constexpr PartRow kParts[] = {
+            {"CAP", nebula_palette::Cap},       {"EMBLEM", nebula_palette::Emblem}, {"SHIRT", nebula_palette::Shirt},
+            {"OVERALLS", nebula_palette::Pants}, {"GLOVES", nebula_palette::Gloves}, {"SHOES", nebula_palette::Shoes},
+            {"HAIR", nebula_palette::Hair},     {"SKIN", nebula_palette::Skin},
+        };
+        const std::span<const NamedColor> colors = named_colors();
+        const auto rgb_of = [](const CoopPalette& palette, std::size_t part) {
+            return static_cast<std::uint32_t>(palette[part * 3]) << 16 | static_cast<std::uint32_t>(palette[part * 3 + 1]) << 8 |
+                   palette[part * 3 + 2];
+        };
+        for (const PartRow& row : kParts) {
+            const std::size_t part = row.part;
+            const std::uint32_t now = rgb_of(wearing, part);
+            std::string shown;
+            if (now == rgb_of(own, part)) {
+                shown = "OWN";
+            } else {
+                char hex[8];
+                std::snprintf(hex, sizeof(hex), "#%06X", static_cast<unsigned>(now));
+                shown = hex;
+                for (const NamedColor& color : colors) {
+                    if (color.rgb == now) shown = color.name;
+                }
+            }
+            rows.push_back({row.label, shown,
+                            [part, own, wearing, colors, rgb_of](RenderConfig&, int delta) {
+                                // The part's own colour first, then the named ones; one of neither steps from the
+                                // named colour nearest it.
+                                const std::uint32_t current = rgb_of(wearing, part);
+                                unsigned from = 0u;
+                                if (current != rgb_of(own, part)) {
+                                    std::uint32_t best = ~0u;
+                                    for (std::size_t i = 0; i < colors.size(); ++i) {
+                                        std::uint32_t d = 0u;
+                                        for (int shift = 0; shift <= 16; shift += 8) {
+                                            const int a = static_cast<int>((current >> shift) & 0xffu), b = static_cast<int>((colors[i].rgb >> shift) & 0xffu);
+                                            d += static_cast<std::uint32_t>((a - b) * (a - b));
+                                        }
+                                        if (d < best) {
+                                            best = d;
+                                            from = static_cast<unsigned>(i) + 1u;
+                                        }
+                                    }
+                                }
+                                const unsigned next = ui::settings_step(from, static_cast<unsigned>(colors.size()) + 1u, delta);
+                                const std::uint32_t rgb = next == 0u ? rgb_of(own, part) : colors[next - 1u].rgb;
+                                CoopPalette changed = wearing;
+                                changed[part * 3] = static_cast<std::uint8_t>(rgb >> 16);
+                                changed[part * 3 + 1] = static_cast<std::uint8_t>(rgb >> 8);
+                                changed[part * 3 + 2] = static_cast<std::uint8_t>(rgb);
+                                s_runtime_draft.coop.palette = changed == own ? std::string() : format_coop_palette(changed);
+                            },
+                            "THIS PART'S COLOUR: YOUR CHARACTER'S OWN OR ANOTHER. OTHER PLAYERS SEE IT TOO"});
+        }
     }
 
     // The pop-ups in the screen's top-right corner (galaxy/coop_popups.h), sm64coopdx's: each kind on or off.

@@ -597,6 +597,7 @@ galaxy_test(galaxy_native_calendar_tests SOURCES ${rt}/native_calendar_tests.cpp
     native/petari/src/Game/System/NebulaCalendar.cpp)
 target_include_directories(galaxy_native_calendar_tests PRIVATE native/include native/petari/include)
 galaxy_test(galaxy_runtime_settings_tests SOURCES ${rt}/runtime_settings_tests.cpp LIBS galaxy_runtime_settings)
+galaxy_test(galaxy_palette_tests SOURCES ${rt}/palette_tests.cpp)
 galaxy_test(galaxy_coop_menu_tests SOURCES ${rt}/coop_menu_tests.cpp LIBS galaxy_runtime_settings)
 galaxy_test(galaxy_net_tests SOURCES ${rt}/net/net_tests.cpp LIBS galaxy_net)
 galaxy_test(galaxy_coop_chat_tests SOURCES ${rt}/coop_chat_tests.cpp LIBS galaxy_net)

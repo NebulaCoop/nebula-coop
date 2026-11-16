@@ -46,6 +46,7 @@ A layer's `characters` adds them, and the mod says `"requires": ["characters"]` 
 | `name` | As the Options page shows it; the id in capitals when left out |
 | `like` | `mario` (the default) or `luigi` |
 | `archive` | The model's archive in ObjectData, without `.arc`; the id with a capital first letter when left out (`waluigi` reads `Waluigi.arc`) |
+| `palette` | The colours its model's textures are painted in, by part (see [Colours](#colours)): `{"cap": "5a22a0", "overalls": "202020"}`. A part left out is its base's |
 
 The layer's `files/ObjectData/` holds the archives. An id another mod already took is refused and named in the log. A
 `player_constants` key that isn't `mario`, `luigi` or `both` is a character's id: its numbers are set once the
@@ -66,9 +67,42 @@ character is added (by this mod or another one running).
 | `set_player_constant(i, name, place, value)`, `player_constant(i, name, place)` | a character's numbers by its index |
 | `coop_character_id(i)` | the id of the character the room's player `i` plays; `coop_character(i)` is its base |
 | `registry_value("character", id)` | its index too: the `character` registry lists every character |
+| `character_palette_color(i, part)` | a character's own colour for a part (0xRRGGBB), -1 past the last |
+| `player_palette_color(part)` | the colour the player wears now for a part (theirs with a mod's over it) |
+| `set_player_palette_color(part, color)` | a mod's colour for a part over the player's, as sm64coopdx's `network_player_set_override_palette_color`; a negative colour takes it off. The room sees it. 1 done, 0 no such part |
+| `reset_player_palette()` | takes every mod colour off |
+| `coop_palette_color(i, part)` | the colour the room's player `i` wears for a part, -1 for no such player |
 
 A script reaches these as `nebula.<name>` and `coop.character_id` once LumaCore's toolkit is generated again
 (tools/lumacore/gen_lumacore.py, on Windows).
+
+## Colours
+
+A player's colours work like sm64coopdx's palettes: eight parts, each a colour. `part` numbers and luma.json's names:
+
+| # | Name | |
+|---|---|---|
+| 0 | `pants` (or `overalls`) | the overalls |
+| 1 | `shirt` | |
+| 2 | `gloves` | |
+| 3 | `shoes` | |
+| 4 | `hair` | the hair, moustache and eyebrows |
+| 5 | `skin` | the face, ears and eyelids |
+| 6 | `cap` | |
+| 7 | `emblem` | the letter on the cap |
+
+A player picks theirs on Options' PLAYER page, under COLOURS: SET gives a whole set (OWN for their character's own, any
+character's, or a few more: FIRE MARIO, WARIO, TOAD and others), and a row per part steps through named colours. Each
+player's colours travel with their character, so everyone in a room sees them.
+
+The game's player models carry their colours in their textures, so a palette is drawn by recoloured copies of those
+textures, made as the player's actor is made and remade when the colours change. The material's name says which parts
+its texture may hold: `Cap` the cap and emblem, `Body` the overalls, shirt and shoes, `Hair` the hair, `Face` and
+`EyeLid` the skin, `Hand` the gloves (`Eye` none). Each texel near a part's colour in the character's own palette takes
+the wanted colour at its own lightness; texels near none (the buttons, the eyes, outlines, the white around the
+emblem) stay. The emblem is a patch of the cap's or emblem's colour ringed by light texels, away from the texture's
+edges. A mod character's model works the same when its materials use those names and its `palette` says the colours
+its textures are painted in (a part it leaves out is taken to be its base's).
 
 ## Online co-op
 
@@ -80,5 +114,4 @@ switches to a mod's character mid-stage shows as its base until the next start.
 
 ## Not yet
 
-- Player colours (sm64coopdx's palettes) come in a later change.
 - A character's own animations, voice and life icon: it uses its base's.
