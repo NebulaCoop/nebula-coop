@@ -104,7 +104,7 @@ jobs:
               .github/workflows/build.yml) game=true; installer=true ;;
               # The lumalink submodule's commit carries the built-in mods the host embeds.
               lumalink) game=true ;;
-              *.md | docs/* | LICENSE | .github/* | nebulanet/* | tools/*) ;;
+              *.md | docs/* | LICENSE | .github/* | nebulanet/* | web/* | tools/*) ;;
               installer/assets/* | runtime/include/galaxy/store_version.inc) game=true; installer=true ;;
               installer/*) installer=true ;;
               *) game=true ;;

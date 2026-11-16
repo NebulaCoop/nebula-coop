@@ -15,6 +15,7 @@ on:
       - installer/**
       - native/build.ps1
       - tools/release_check.ps1
+      - tools/release-allow.txt
   workflow_dispatch:
 
 concurrency:
