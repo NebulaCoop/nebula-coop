@@ -58,10 +58,13 @@ introduces players, as sm64coopdx's CoopNet does, so nobody has to forward a por
   an address. `coop_network=direct` and `coop_nebulanet=<url>` (another NebulaNet, to test one's own) are its settings.
 - **NebulaNet as CoopNet.** NebulaNet offers what CoopNet offers sm64coopdx, for Nebula's star of players: a room has
   a name (the Host page's ROOM NAME, `coop_room_name`, else the host's name), a mode (CO-OP, or PVP with friendly
-  fire), a description (its mods) and the room's password, which makes it private. The Join page's ROOMS lists the
-  public rooms, or with a password typed the private ones that have it, as sm64coopdx's lobby list does; pressing one
-  joins it by its code. NebulaNet checks a join's password and protocol first, and a joiner tells it whether it got
-  through (CoopNet's PEER_FAILED, the host always staying). The Host page's NEBULANET SERVER picks another NebulaNet.
+  fire), a description (its mods) and the room's password. The Host page's LOBBY (`coop_public`) makes the room public,
+  in everyone's list (locked when it has a password too), or keeps it friends only (the default): joined by its code,
+  or found by its password. The Join page's ROOMS lists the public rooms (PUBLIC) or, with a password typed, the ones
+  that have it (PRIVATE), as sm64coopdx's public and private lobbies; pressing one joins it by its code. NebulaNet
+  lists at most 4 public rooms per address; a room past that keeps its code and the host's chat says why. NebulaNet
+  checks a join's password and protocol first, and a joiner tells it whether it got through (CoopNet's PEER_FAILED,
+  the host always staying). The Host page's NEBULANET SERVER picks another NebulaNet.
 - **Relay fallback (next).** Where both routers are too strict for punching (carrier NAT, some campus networks),
   the joiner goes through a TURN relay: NebulaNet already hands TURN servers out (`ice` in its answers, as CoopNet's
   STUN_TURN); the game doesn't use them yet.
@@ -149,9 +152,9 @@ front of it, as its own screen.
   | Page | Rows |
   |---|---|
   | Main | Host, Join, Options, Quit; Nebula's version in a corner |
-  | Host | Save (any number, each with its name and Power Stars; New, Rename and Erase), port, password, max players, Player Interaction, Knockback Strength, PvP Mode, Bubble on Death, Cheats, then Host and Back |
-  | Join | Address (`host[:port]`), password, then Join; the last address is remembered. No public or private lobbies: there's no relay |
-  | Options | Nebula's settings pages, with PLAYER in the MODS page's old place: name, character (Mario or Luigi, as sm64coopdx's player options pick a model). MODS is the last page |
+  | Host | Save (any number, each with its name and Power Stars; New, Rename and Erase), network (NebulaNet or Direct), NebulaNet's room name and server or Direct's port, password, NebulaNet's lobby (public or friends only), max players, Player Interaction, Knockback Strength, PvP Mode, Bubble on Death, Cheats, Mods, then Host and Back |
+  | Join | Room code or address (`host[:port]`), password, then Join; the last one is remembered. Rooms: NebulaNet's public rooms, or its private ones by the password |
+  | Options | Nebula's settings pages, with PLAYER in the MODS page's old place: name, character (Mario, Luigi or a mod's, as sm64coopdx's player options pick a model: docs/modding/CHARACTERS.md). MODS is the last page |
   | Quit | "Quit to desktop?" yes or no |
 
 - **Saves: any number, no characters.** The game's own format (`GameData.bin`: six user files, each with a Mario
@@ -167,7 +170,8 @@ front of it, as its own screen.
   copied into each converted save.
 - **Character: the player's, not the save's.** `MR::isPlayerLuigi()` (today `!isDataMario()`, the save's half)
   follows Options' PLAYER page's character (`coop_character`, `mario` or `luigi`) instead, so the same save plays as
-  either. Remote players show each player's own character (`NEBULA_COOP_PLAYER_LUIGI`).
+  either; a mod's character is `coop_character_id`. Remote players show each player's own character
+  (`NEBULA_COOP_PLAYER_LUIGI` its base, NebulaCoopRemotePlayer's `character` its id).
 - **Starting.** Host loads the chosen save through the file select's own path (`FileSelector::exeDemo`) and opens
   the session. With nobody joining it's single player, as in sm64coopdx. Join needs Phase 1: a joining player plays
   the host's save, sent at join (sm64coopdx's `packet_save_file`), so their own saves stay untouched.
@@ -394,6 +398,22 @@ joining makes none. Deaths come from the snapshots of the players in this player
 `coop_popup_take` (`NebulaCoopPopup`) and draws them (`NebulaCoopPopups`, the game's window and message font); the
 galaxy and star names are the game's own. One the game doesn't take within six seconds (a star select is showing) is
 dropped. The chat keeps its own join and leave lines.
+
+## Character Movesets
+
+sm64coopdx's Character Movesets mod (`character-movesets.lua`): without it every character moves as Mario does, and
+with it each moves their own way. NebulaCoop's Luigi plays as Mario by default; the mod gives him Super Mario Galaxy's
+own numbers back (a higher, floatier jump, less grip and a long sliding brake, a stronger stomp bounce, his Boo form's
+handling, a swim spin that costs oxygen).
+
+It's made in LumaLink-coop (`builtin/character-movesets`), as a data-only `.lumacoop`: a layer's `player_constants`
+for `"luigi"`, so it's an ordinary mod. NebulaCoop carries a copy (`runtime/src/builtin_mods.inc`) and writes it into
+the mods folder at every start (`galaxy::mods::install_builtin_mods`), again when it's missing or changed. It's off
+until the player turns it on (a built-in mod with no saved choice is off), then it's in the Host page's Mods like any
+other, and joiners get it with the room's mods; it applies when Nebula starts again, as other mods do.
+
+SMG did part of Luigi's moves in code (`gIsLuigi`): those are numbers of the player's table now, NebulaCoop's own after
+the game's (`mBrakeSlide`, `mSwimSpinOxygen`, 0 for everyone first), so a moveset gives them to any character.
 
 ## Personal Star Counter
 

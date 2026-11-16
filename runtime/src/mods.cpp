@@ -1002,6 +1002,47 @@ void set_mods_folder(const std::filesystem::path& folder, const std::filesystem:
     s.game_id = game_id;
 }
 
+namespace {
+
+struct BuiltinMod {
+    const char* id;
+    const char* manifest;  // luma.json, after a line break
+};
+
+constexpr BuiltinMod kBuiltinMods[] = {
+#include "builtin_mods.inc"
+};
+
+}  // namespace
+
+bool install_builtin_mods() {
+    const fs::path folder = mods_folder();
+    if (folder.empty()) return false;
+    bool all = true;
+    for (const BuiltinMod& mod : kBuiltinMods) {
+        const std::string_view text = std::string_view(mod.manifest).substr(1u);
+        const fs::path file = folder / mod.id / "luma.json";
+        std::ifstream in(file, std::ios::binary);
+        const std::string have{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+        in.close();
+        if (have == text) continue;
+        std::error_code error;
+        fs::create_directories(file.parent_path(), error);
+        if (!io::write_file_atomically(file, text)) {
+            std::fprintf(stderr, "[mods] the built-in mod %s could not be written: %s\n", mod.id, galaxy::path_text(file).c_str());
+            all = false;
+        }
+    }
+    return all;
+}
+
+bool is_builtin_mod(std::string_view id) {
+    for (const BuiltinMod& mod : kBuiltinMods) {
+        if (id == mod.id) return true;
+    }
+    return false;
+}
+
 std::string mods_game_id() {
     Settings& s = settings();
     const std::lock_guard<std::mutex> lock(s.mutex);
@@ -1146,7 +1187,8 @@ std::vector<ModInfo> scan_folders(const std::vector<std::pair<std::string, fs::p
         mod.package = !layout.package.empty();
         const auto it = saved.find(mod.id);
         const SavedMod* s = it != saved.end() ? &it->second : nullptr;
-        mod.enabled = s == nullptr || s->enabled;
+        // A new mod is on, but a built-in one waits for the player.
+        mod.enabled = s != nullptr ? s->enabled : !is_builtin_mod(mod.id);
         mod.own_text = s == nullptr || s->own_text;
         mod.categories_off = s != nullptr ? s->categories_off : 0u;
         if (mod.textures) {
@@ -1872,6 +1914,9 @@ ModPlan plan_mod_changes(const galaxy::assets::AssetStore& store, const std::str
                 for (const luma::StageRule& rule : layer.stages) {
                     plan.rows.stage_rules.push_back({mod.id, rule.stage, rule.scenario, rule.acts_as, rule.own_rules});
                 }
+                for (const luma::Character& character : layer.characters) {
+                    plan.rows.characters.push_back({mod.id, mod.luma->version, character.id, character.name, character.like, character.archive});
+                }
                 for (const luma::PlayerConstant& constant : layer.player_constants) {
                     float value = constant.value;
                     if (!constant.option.empty()) {
@@ -1879,7 +1924,7 @@ ModPlan plan_mod_changes(const galaxy::assets::AssetStore& store, const std::str
                         if (choice == situation.options.end()) continue;
                         value = std::strtof(choice->second.c_str(), nullptr);
                     }
-                    plan.rows.player_constants.push_back({mod.id, constant.character, constant.name, constant.index, value});
+                    plan.rows.player_constants.push_back({mod.id, constant.character, constant.character_id, constant.name, constant.index, value});
                 }
                 for (const luma::Tunable& tunable : layer.tunables) {
                     double value = tunable.value;

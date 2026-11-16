@@ -765,6 +765,25 @@ void test_session() {
     third.set_character(galaxy::CoopCharacter::Mario);
     expect(wait_for([&] { return character_of(joiner, 2u) == kMario && character_of(host_session, 2u) == kMario; }),
            "and switches back");
+    // A mod's character (sm64coopdx's character table) travels by its id, on its base; a bad id reads as the base.
+    const auto character_id_of = [](const Session& session, unsigned index) {
+        for (const SessionPlayer& player : session.players()) {
+            if (player.index == index) return player.character_id;
+        }
+        return std::string();
+    };
+    expect(character_id_of(joiner, 2u) == "mario" && character_id_of(joiner, 0u) == "luigi", "the game's characters by id");
+    third.set_character(galaxy::CoopCharacter::Luigi, "Waluigi");
+    expect(wait_for([&] {
+               return character_id_of(joiner, 2u) == "waluigi" && character_id_of(host_session, 2u) == "waluigi" &&
+                      character_of(joiner, 2u) == kLuigi;
+           }),
+           "a joiner's mod character reaches everyone by id");
+    host_session.set_character(galaxy::CoopCharacter::Mario, "wario");
+    expect(wait_for([&] { return character_id_of(joiner, 0u) == "wario" && character_id_of(third, 0u) == "wario"; }),
+           "and the host's");
+    third.set_character(galaxy::CoopCharacter::Luigi, "no spaces allowed");
+    expect(wait_for([&] { return character_id_of(host_session, 2u) == "luigi"; }), "a bad id is its base's");
 
     // Each player's Power Stars this room (the Personal Star Counter): the host counts them and tells everyone.
     const auto stars_of = [](const Session& session, unsigned index) {
@@ -1165,10 +1184,12 @@ public:
             const auto message = galaxy::net::json::parse(text);
             if (message && message->text("t") == "open") {
                 const std::lock_guard<std::mutex> lock(server_.lock_);
+                const galaxy::net::json::Value* asked = message->find("public");
+                const bool everyone = asked != nullptr && asked->boolean && !server_.refuse_public.load();
                 server_.rooms_["K7QX2M"] = {message->strings("candidates"), this, message->text("password"),
-                                            message->text("name"), message->text("mode")};
+                                            message->text("name"), message->text("mode"), everyone};
                 ++server_.opened;
-                push(R"({"t":"room","code":"K7QX2M"})");
+                push(std::string(R"({"t":"room","code":"K7QX2M","public":)") + (everyone ? "true" : "false") + "}");
             }
             return true;
         }
@@ -1209,11 +1230,12 @@ public:
         const auto request = galaxy::net::json::parse(body);
         const std::lock_guard<std::mutex> lock(lock_);
         if (url.ends_with("/v1/list")) {
-            // The public rooms, or the private ones with the password asked.
+            // The public rooms, or the ones with the password asked.
             std::string answer = R"({"rooms":[)";
             bool first = true;
             for (const auto& [code, room] : rooms_) {
-                if (!request || room.password != request->text("password")) continue;
+                const std::string asked = request ? request->text("password") : std::string();
+                if (!request || (asked.empty() ? !room.everyone : room.password != asked)) continue;
                 answer += std::string(first ? "" : ",") + R"({"code":")" + code + R"(","name":)" +
                           galaxy::net::json::quote(room.name) + R"(,"version":"test 1","mode":)" +
                           galaxy::net::json::quote(room.mode) + R"(,"description":"","players":1,"max":3,"private":)" +
@@ -1231,7 +1253,9 @@ public:
         }
         const auto room = request ? rooms_.find(request->text("code")) : rooms_.end();
         if (!url.ends_with("/v1/join") || room == rooms_.end()) return {404, R"({"error":"not_found"})"};
-        if (request->text("password") != room->second.password) return {403, R"({"error":"wrong_password"})"};
+        if (!room->second.password.empty() && request->text("password") != room->second.password) {
+            return {403, R"({"error":"wrong_password"})"};
+        }
         std::string joiner = R"({"t":"joiner","candidates":[)";
         const auto mine = request->strings("candidates");
         for (std::size_t i = 0; i < mine.size(); ++i) joiner += (i ? "," : "") + galaxy::net::json::quote(mine[i]);
@@ -1248,6 +1272,8 @@ public:
     std::atomic<int> opened{0};
     std::atomic<int> reported_ok{0};
     std::atomic<int> reported_failed{0};
+    // Keeps public rooms off the public list, as NebulaNet does past its limit for one address.
+    std::atomic<bool> refuse_public{false};
 
 private:
     struct Room {
@@ -1256,10 +1282,76 @@ private:
         std::string password;
         std::string name;
         std::string mode;
+        bool everyone = false;
     };
     std::mutex lock_;
     std::map<std::string, Room> rooms_;
 };
+
+// Public rooms (CoopNet's public lobbies): asked for by the host, in everyone's list, locked when they have a
+// password too; a room NebulaNet keeps off its public list says so.
+void test_nebulanet_public() {
+    using namespace galaxy::coop;
+    using Kind = NebulaNetEvent::Kind;
+    const std::string server = "https://nebulanet.test";
+    auto nebulanet = std::make_shared<FakeNebulaNet>();
+    // The events until one of `kind` (and all of them).
+    const auto until = [](NebulaNetLink& link, Kind kind, std::vector<NebulaNetEvent>& got) {
+        got.clear();
+        return wait_for([&] {
+            for (auto& e : link.take_events()) got.push_back(std::move(e));
+            return std::any_of(got.begin(), got.end(), [kind](const NebulaNetEvent& e) { return e.kind == kind; });
+        });
+    };
+    NebulaNetRoom room;
+    room.name = "OPEN";
+    room.version = "test 1";
+    room.max = 4u;
+    room.public_room = true;
+    room.candidates = {"203.0.113.5:61000"};
+    NebulaNetLink host(nebulanet);
+    NebulaNetLink list(nebulanet);
+    std::vector<NebulaNetEvent> got;
+    std::vector<NebulaNetEvent> rooms;
+
+    host.host(server, room);
+    expect(until(host, Kind::RoomCode, got) &&
+               std::none_of(got.begin(), got.end(), [](const NebulaNetEvent& e) { return e.kind == Kind::Failed; }),
+           "a public room opens");
+    list.list(server);
+    expect(until(list, Kind::Rooms, rooms) && rooms[0].rooms.size() == 1u && rooms[0].rooms[0].name == "OPEN" &&
+               !rooms[0].rooms[0].locked,
+           "and is in the public list");
+    list.list(server, "pw");
+    expect(until(list, Kind::Rooms, rooms) && rooms[0].rooms.empty(), "not among a password's");
+
+    room.password = "pw";
+    host.host(server, room);
+    expect(until(host, Kind::RoomCode, got), "a public room with a password opens");
+    list.list(server);
+    expect(until(list, Kind::Rooms, rooms) && rooms[0].rooms.size() == 1u && rooms[0].rooms[0].locked,
+           "and is in the public list, locked");
+    list.list(server, "pw");
+    expect(until(list, Kind::Rooms, rooms) && rooms[0].rooms.size() == 1u, "and among its password's");
+
+    room.password.clear();
+    nebulanet->refuse_public.store(true);
+    host.host(server, room);
+    expect(until(host, Kind::Failed, got) &&
+               std::any_of(got.begin(), got.end(), [](const NebulaNetEvent& e) { return e.kind == Kind::RoomCode; }) &&
+               got.back().text.find("OFF THE PUBLIC LIST") != std::string::npos,
+           "a public room kept off the list gets its code, and the host hears why");
+    list.list(server);
+    expect(until(list, Kind::Rooms, rooms) && rooms[0].rooms.empty(), "it isn't listed");
+
+    room.public_room = false;
+    host.host(server, room);
+    expect(until(host, Kind::RoomCode, got) &&
+               std::none_of(got.begin(), got.end(), [](const NebulaNetEvent& e) { return e.kind == Kind::Failed; }),
+           "a friends-only room hears nothing of the public list");
+    host.stop();
+    list.stop();
+}
 
 void test_session_nebulanet() {
     using namespace galaxy::coop;
@@ -1415,6 +1507,7 @@ int main() {
     test_coop_mods();
     test_session_mods();
     test_web_parts();
+    test_nebulanet_public();
     test_session_nebulanet();
     if (s_failures == 0) std::printf("net tests passed\n");
     return s_failures == 0 ? 0 : 1;
