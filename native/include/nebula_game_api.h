@@ -26,7 +26,7 @@ extern "C" {
 
 /* Upstream Nebula's number for this interface. Co-op changes leave it as it is (docs/COOP_PLAN.md "Versions"): the
    host checks the module against the header's fingerprint (nebula_game_api_fingerprint), which the build works out. */
-#define NEBULA_GAME_API_VERSION 152u
+#define NEBULA_GAME_API_VERSION 153u
 
 /* The game's fixed step: nebula_game_run's loop runs this many steps a second (frame_wait paces them), whatever the
    display's rate; the host presents each or interpolates between them. */
@@ -603,6 +603,15 @@ enum {
                                           menu: no pointer shows under a finger there */
     NEBULA_OPTION_STAR_COUNTER,        /* 1 while the room plays the built-in Personal Star Counter mod (the host's
                                           choice, off by default): NebulaStarCounter's two counters show on the HUD */
+    NEBULA_OPTION_RAY_TRACING,         /* what ray tracing asks of the game now (NEBULA_RAY_TRACING_*); 0: nothing */
+};
+
+/* NEBULA_OPTION_RAY_TRACING's bits. */
+enum {
+    NEBULA_RAY_TRACING_ON = 1u << 0,          /* the renderer traces its shadows and lights */
+    NEBULA_RAY_TRACING_SHADOW_SETS = 1u << 1, /* a zone's shadow light set (the artists' darker lights for actors in a
+                                                 shade) gives way to the lit set it darkens: the traced shadow darkens
+                                                 them, once */
 };
 
 /* The movie player's sound (movie_audio_control). */
