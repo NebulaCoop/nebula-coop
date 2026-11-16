@@ -3050,14 +3050,14 @@ std::vector<SettingsRow> player_page(const RuntimeSettings& runtime) {
                             [part, own, wearing, colors, rgb_of](RenderConfig&, int delta) {
                                 // The part's own colour first, then the named ones; one of neither steps from the
                                 // named colour nearest it.
-                                const std::uint32_t now = rgb_of(wearing, part);
+                                const std::uint32_t current = rgb_of(wearing, part);
                                 unsigned from = 0u;
-                                if (now != rgb_of(own, part)) {
+                                if (current != rgb_of(own, part)) {
                                     std::uint32_t best = ~0u;
                                     for (std::size_t i = 0; i < colors.size(); ++i) {
                                         std::uint32_t d = 0u;
                                         for (int shift = 0; shift <= 16; shift += 8) {
-                                            const int a = static_cast<int>((now >> shift) & 0xffu), b = static_cast<int>((colors[i].rgb >> shift) & 0xffu);
+                                            const int a = static_cast<int>((current >> shift) & 0xffu), b = static_cast<int>((colors[i].rgb >> shift) & 0xffu);
                                             d += static_cast<std::uint32_t>((a - b) * (a - b));
                                         }
                                         if (d < best) {

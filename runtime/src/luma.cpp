@@ -795,8 +795,8 @@ std::optional<Manifest> parse_manifest(std::string_view text) {
                     character.palette.assign(nebula_palette::PartCount, -1);
                     for (const auto& [part, color] : *palette->object()) {
                         const int index = nebula_palette::findPart(part.c_str());
-                        const std::string* text = color.string();
-                        const std::int32_t rgb = text != nullptr ? nebula_palette::parseColor(text->c_str()) : -1;
+                        const std::string* hex = color.string();
+                        const std::int32_t rgb = hex != nullptr ? nebula_palette::parseColor(hex->c_str()) : -1;
                         if (index < 0 || rgb < 0) return std::nullopt;
                         character.palette[static_cast<std::size_t>(index)] = rgb;
                     }
