@@ -560,7 +560,7 @@ void test_mods() {
     menu.select_row(13u);
     menu.press(0u);
     galaxy::coop::MenuView view = menu.view();
-    expect(view.pages[0] == "MODS" && view.rows.size() == 6u && view.rows[0].label == "Textures" &&
+    expect(view.pages[0] == "MODS" && view.rows.size() == 5u && view.rows[0].label == "Textures" &&
                view.rows[0].value == "ON (1)" && view.rows[1].value == "ON (2)" && view.rows[2].value == "OFF" &&
                view.rows[0].label_name,
            "the mods page: the ones on first, numbered");
