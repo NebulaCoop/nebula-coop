@@ -13,10 +13,10 @@ artifact under **Artifacts**. You need to be signed in to GitHub.
 
 | Artifact | Contents |
 |---|---|
-| `nebula-windows-x64` | `NebulaNative.exe` (Direct3D 12), `NebulaNativeVk.exe` (Vulkan), `smg_game.dll`, `nebula-import.exe` |
-| `nebula-linux-x64` | `NebulaNative` (Vulkan, SDL3), `libsmg_game.so`, `libSDL3.so.0`, `nebula-import` |
+| `nebula-windows-x64` | `Nebula.exe` (Direct3D 12), `NebulaVk.exe` (Vulkan), `smg_game.dll`, `nebula-import.exe` |
+| `nebula-linux-x64` | `Nebula` (Vulkan, SDL3), `libsmg_game.so`, `libSDL3.so.0`, `nebula-import` |
 | `nebula-android` | `Nebula.apk` (arm64 and x86_64) |
-| `nebula-macos-arm64` | `Nebula-macOS.zip`: `Nebula.app` (Metal, Apple silicon only), ad-hoc signed (docs/APPLE.md) |
+| `nebula-macos-arm64` | `Nebula-macOS.zip`: `Nebula.app` (Metal, Apple silicon only), ad-hoc signed |
 
 ## Windows and Linux
 
@@ -27,12 +27,12 @@ artifact under **Artifacts**. You need to be signed in to GitHub.
    nebula-import import SMG.rvz --output content
    ```
 
-   Run this in the folder that holds `NebulaNative`, so `content` lands next to it.
+   Run this in the folder that holds `Nebula`, so `content` lands next to it.
 
 2. Run the game from a terminal, so its log shows:
 
    ```
-   NebulaNative
+   Nebula
    ```
 
    With no arguments, Nebula looks for `content/game.pak` (or `game.pak`) next to the program, then in the current
@@ -52,8 +52,8 @@ Online co-op lines in the log start with `[coop]`. `--host [port]` hosts the las
 (port 7777 when none is given) and `--join <address[:port]>` joins, so two copies on one PC are:
 
 ```
-NebulaNative --host
-NebulaNative --join 127.0.0.1
+Nebula --host
+Nebula --join 127.0.0.1
 ```
 
 On Windows up to four games run at once. The first plays as always; each one started while it runs is game 2, 3 or 4
@@ -65,7 +65,7 @@ share the shader cache and the installed mods. The keyboard and Xbox controllers
 ### Windows Defender
 
 Test builds aren't code-signed, and every build is a new file Microsoft has never seen, so Defender's machine-learning
-checks sometimes flag `NebulaNative.exe` or `NebulaNativeVk.exe` (names ending in `!ml`, such as
+checks sometimes flag `Nebula.exe` or `NebulaVk.exe` (names ending in `!ml`, such as
 `Program:Win32/Contebrew.A!ml`). To report one:
 
 1. Open <https://www.microsoft.com/en-us/wdsi/filesubmission>, choose **Home customer**, and upload the flagged `.exe`

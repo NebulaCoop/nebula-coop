@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
 using System.Reflection;
 using Microsoft.Win32;
 
@@ -23,6 +24,20 @@ namespace Nebula.Setup
             using (var input = Open(name))
             using (var output = new FileStream(path, FileMode.Create, FileAccess.Write))
                 input.CopyTo(output);
+        }
+
+        public static bool Has(string name)
+        {
+            return Array.IndexOf(Assembly.GetExecutingAssembly().GetManifestResourceNames(), name) >= 0;
+        }
+
+        /// <summary>An embedded zip unpacked into <paramref name="folder"/>, which must hold nothing yet.</summary>
+        public static void ExtractZip(string name, string folder)
+        {
+            Directory.CreateDirectory(folder);
+            using (var input = Open(name))
+            using (var zip = new ZipArchive(input, ZipArchiveMode.Read))
+                zip.ExtractToDirectory(folder);
         }
     }
 
@@ -53,10 +68,10 @@ namespace Nebula.Setup
 
     internal static class Running
     {
-        /// <summary>The game (recompiled or native), the launcher and Nebula Settings.</summary>
-        public static readonly string[] Programs = { "NebulaRuntime", "NebulaNative", "Nebula", "NebulaSettings" };
+        /// <summary>The game (Nebula; NebulaNative and NebulaRuntime in installs before 2.0), the launcher and Nebula Settings.</summary>
+        public static readonly string[] Programs = { "Nebula", "NebulaNative", "NebulaRuntime", "NebulaLauncher", "NebulaSettings" };
 
-        /// <summary>The first of <paramref name="names"/> running from inside <paramref name="folder"/>, as "Nebula.exe (pid)"; null when none.</summary>
+        /// <summary>The first of <paramref name="names"/> running from inside <paramref name="folder"/>, as "NebulaLauncher.exe (pid)"; null when none.</summary>
         public static string Find(string folder, params string[] names)
         {
             string prefix = Path.GetFullPath(folder).TrimEnd('\\') + "\\";
@@ -310,6 +325,12 @@ namespace Nebula.Setup
         {
             string app = layout.VersionDir(version);
             var failures = new List<string>();
+            // A portable copy changes nothing outside its folder: its launcher goes beside its Setup, to start from.
+            if (NebulaPaths.IsPortableRoot(layout.Root))
+            {
+                PlacePortableLauncher(layout, app, failures);
+                return failures;
+            }
             // A run whose %LOCALAPPDATA% is another folder than the user's (sandboxed, or a test) installs into its own
             // folders: the user's shortcuts and registry stay.
             if (NebulaPaths.LocalAppDataRedirected) return failures;
@@ -319,13 +340,13 @@ namespace Nebula.Setup
                 catch (Exception error) { failures.Add(Path.GetFileName(path) + ": " + error.Message); }
             };
             Directory.CreateDirectory(StartMenuFolder);
-            link(Path.Combine(StartMenuFolder, Name + ".lnk"), Path.Combine(app, "Nebula.exe"), "", app, "Play " + Name);
+            link(Path.Combine(StartMenuFolder, Name + ".lnk"), Path.Combine(app, "NebulaLauncher.exe"), "", app, "Play " + Name);
             link(Path.Combine(StartMenuFolder, Name + " Settings.lnk"), Path.Combine(app, "NebulaSettings.exe"), "", app, "Display, graphics, audio and game files");
             link(Path.Combine(StartMenuFolder, "Update " + Name + ".lnk"), layout.SetupCopy, "--update", layout.Root, "Check for and install " + Name + " updates");
             link(Path.Combine(StartMenuFolder, Name + " Setup.lnk"), layout.SetupCopy, "", layout.Root, "Repair, restore or uninstall " + Name);
             string desktopLink = DesktopLink;
             if (desktop || File.Exists(desktopLink))
-                link(desktopLink, Path.Combine(app, "Nebula.exe"), "", app, "Play " + Name);
+                link(desktopLink, Path.Combine(app, "NebulaLauncher.exe"), "", app, "Play " + Name);
 
             using (var key = Registry.CurrentUser.CreateSubKey(NebulaPaths.RegistryKey)) key.SetValue("InstallRoot", layout.Root);
             // A Join pressed in Discord starts NebulaCoop through this version's launcher (the game writes the same at
@@ -335,7 +356,7 @@ namespace Nebula.Setup
                 key.SetValue("", "URL:Run game " + DiscordLaunchKey.Substring(DiscordLaunchKey.LastIndexOf('-') + 1) + " protocol");
                 key.SetValue("URL Protocol", "");
                 using (var command = key.CreateSubKey(@"shell\open\command"))
-                    command.SetValue("", "\"" + Path.Combine(app, "Nebula.exe") + "\"");
+                    command.SetValue("", "\"" + Path.Combine(app, "NebulaLauncher.exe") + "\"");
             }
             // Mods are added in the game's Mods page now, so a .luma no longer opens the launcher: an earlier
             // install's association goes.
@@ -346,7 +367,7 @@ namespace Nebula.Setup
                 key.SetValue("DisplayVersion", version);
                 key.SetValue("Publisher", Name);
                 key.SetValue("InstallLocation", layout.Root);
-                key.SetValue("DisplayIcon", Path.Combine(app, "Nebula.exe"));
+                key.SetValue("DisplayIcon", Path.Combine(app, "NebulaLauncher.exe"));
                 key.SetValue("UninstallString", "\"" + layout.SetupCopy + "\" --uninstall");
                 key.SetValue("ModifyPath", "\"" + layout.SetupCopy + "\"");
                 key.SetValue("URLInfoAbout", "https://github.com/" + BuildInfo.Repository);
@@ -354,6 +375,65 @@ namespace Nebula.Setup
             }
             return failures;
         }
+
+        /// <summary>Takes Nebula's own entries out of HKCU\Software\Classes\.luma (the default, when it is still Nebula's,
+        /// and Nebula's Open with entry) and leaves the rest, such as LumaLink's: the key goes only once it is empty.</summary>
+        private static void RemoveLumaEntries()
+        {
+            const string extension = @"Software\Classes\.luma";
+            using (var key = Registry.CurrentUser.OpenSubKey(extension, true))
+            {
+                if (key == null) return;
+                if (key.GetValue("") as string == LumaFileType) key.DeleteValue("", false);
+                using (var openWith = key.OpenSubKey("OpenWithProgids", true))
+                {
+                    if (openWith != null)
+                    {
+                        openWith.DeleteValue(LumaFileType, false);
+                        if (openWith.ValueCount == 0 && openWith.SubKeyCount == 0)
+                        {
+                            openWith.Close();
+                            key.DeleteSubKey("OpenWithProgids", false);
+                        }
+                    }
+                }
+                if (key.ValueCount != 0 || key.SubKeyCount != 0) return;
+            }
+            Registry.CurrentUser.DeleteSubKey(extension, false);
+        }
+
+        /// <summary>Takes every lumalink folder of this install (one an earlier Nebula put there) out of the user's PATH
+        /// (HKCU\Environment, never the machine's). Programs started after the change see it (WM_SETTINGCHANGE
+        /// "Environment").</summary>
+        private static void RemoveLumaLinkPath(InstallLayout layout)
+        {
+            string root = Path.GetFullPath(layout.Root).TrimEnd('\\') + "\\";
+            using (var key = Registry.CurrentUser.CreateSubKey("Environment"))
+            {
+                string old = key.GetValue("Path", "", RegistryValueOptions.DoNotExpandEnvironmentNames) as string ?? "";
+                RegistryValueKind kind = RegistryValueKind.ExpandString;
+                if (key.GetValue("Path") != null) kind = key.GetValueKind("Path");
+                var parts = new List<string>();
+                foreach (string part in old.Split(';'))
+                {
+                    if (part.Length == 0) continue;
+                    string full = part;
+                    try { full = Path.GetFullPath(Environment.ExpandEnvironmentVariables(part)).TrimEnd('\\'); }
+                    catch (Exception error) { if (!(error is ArgumentException) && !(error is NotSupportedException) && !(error is PathTooLongException)) throw; }
+                    if (full.StartsWith(root, StringComparison.OrdinalIgnoreCase) && full.EndsWith("\\lumalink", StringComparison.OrdinalIgnoreCase)) continue;
+                    parts.Add(part);
+                }
+                string value = string.Join(";", parts);
+                if (value == old) return;
+                if (value.Length == 0) key.DeleteValue("Path", false);
+                else key.SetValue("Path", value, kind == RegistryValueKind.String ? RegistryValueKind.String : RegistryValueKind.ExpandString);
+            }
+            UIntPtr result;
+            SendMessageTimeout(new IntPtr(0xFFFF), 0x001A, UIntPtr.Zero, "Environment", 0x0002, 5000, out result);
+        }
+
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr wParam, string lParam, uint flags, uint timeout, out UIntPtr result);
 
         private static void Shortcut(string path, string target, string arguments, string workingDirectory, string description)
         {
@@ -419,15 +499,36 @@ namespace Nebula.Setup
             }
         }
 
-        /// <summary>Remove the program. Saves, settings and caches stay unless asked.</summary>
+        /// <summary>A portable copy's launcher in its folder (the launcher there runs the current version's game). A held
+        /// file is a failure: the launcher already there starts this version all the same.</summary>
+        private static void PlacePortableLauncher(InstallLayout layout, string app, List<string> failures)
+        {
+            try { File.Copy(Path.Combine(app, "NebulaLauncher.exe"), Path.Combine(layout.Root, "NebulaLauncher.exe"), true); }
+            catch (Exception error)
+            {
+                if (!(error is IOException) && !(error is UnauthorizedAccessException)) throw;
+                failures.Add("NebulaLauncher.exe: " + error.Message);
+            }
+        }
+
+        /// <summary>Remove the program. Saves, settings and caches stay unless asked. A portable copy keeps its data folder
+        /// (and the file that names it portable) unless asked, and has nothing registered to remove.</summary>
         public static void Uninstall(InstallLayout layout, bool removeUserData)
         {
             Running.RequireClosed(layout.Root);
+            bool portable = NebulaPaths.IsPortableRoot(layout.Root);
+            var kept = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (portable && !removeUserData)
+            {
+                kept.Add(NebulaPaths.PortableData(layout.Root));
+                kept.Add(Path.Combine(layout.Root, NebulaPaths.PortableMarker));
+            }
             // Files first: if one is held, the Add/Remove Programs entry and shortcuts are still there to try again.
             string self = Path.GetFullPath(Assembly.GetExecutingAssembly().Location);
             foreach (var entry in Directory.GetFileSystemEntries(layout.Root))
             {
                 if (string.Equals(Path.GetFullPath(entry), self, StringComparison.OrdinalIgnoreCase)) continue;
+                if (kept.Contains(Path.GetFullPath(entry))) continue;
                 try
                 {
                     if (Directory.Exists(entry)) FileUtil.DeleteTree(entry); else File.Delete(entry);
@@ -441,6 +542,11 @@ namespace Nebula.Setup
                         (holders.Length != 0 ? " " + NebulaText.Of("In use by: {0}.", holders) : "") + " " + NebulaText.Of("Close it and uninstall again."), error);
                 }
             }
+            if (portable)
+            {
+                RemoveSelfAndFolder(layout, self);
+                return;
+            }
             if (Directory.Exists(StartMenuFolder)) FileUtil.DeleteTree(StartMenuFolder);
             if (File.Exists(DesktopLink)) File.Delete(DesktopLink);
             Registry.CurrentUser.DeleteSubKeyTree(UninstallKey, false);
@@ -448,7 +554,12 @@ namespace Nebula.Setup
             Registry.CurrentUser.DeleteSubKeyTree(DiscordLaunchKey, false);
             RemoveLumaAssociation();
             if (removeUserData && Directory.Exists(NebulaPaths.DataRoot)) FileUtil.DeleteTree(NebulaPaths.DataRoot);
-            // The running setup copy deletes itself and the folder after exit.
+            RemoveSelfAndFolder(layout, self);
+        }
+
+        // The running setup copy deletes itself and the folder (when nothing else is left in it) after exit.
+        private static void RemoveSelfAndFolder(InstallLayout layout, string self)
+        {
             if (self.StartsWith(Path.GetFullPath(layout.Root), StringComparison.OrdinalIgnoreCase))
             {
                 string command = "/c ping 127.0.0.1 -n 3 > nul & del /f /q \"" + self + "\" & rmdir \"" + layout.Root + "\"";

@@ -194,8 +194,8 @@ jobs:
         with:
           name: windows-hosts
           path: |
-            build/host/NebulaNative.exe
-            build/host/NebulaNativeVk.exe
+            build/host/Nebula.exe
+            build/host/NebulaVk.exe
           retention-days: 1
           if-no-files-found: error
       # The shader tools the Android build runs on this machine (platform/sdl's NEBULA_HOST_TOOLS).
@@ -305,10 +305,17 @@ jobs:
         run: |
           cmake -S platform/sdl -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release "-DNEBULA_DEPS=$PWD/deps"
           cmake --build build/host --target main
+      - name: LLVM 21
+        # The game module's row generator needs libclang 21 or later (tools/lumacore/instrument.py); Ubuntu 24.04 has 18.
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-21 libclang1-21 libclang-common-21-dev
       - name: Game module
         env:
-          CC: clang
-          CXX: clang++
+          CC: clang-21
+          CXX: clang++-21
         run: |
           cmake -S native -B build/game -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build/game --target smg_game
@@ -318,9 +325,9 @@ jobs:
         # The program finds libSDL3 and the game module beside it.
         run: |
           mkdir -p dist
-          cp build/host/nebula dist/NebulaNative
+          cp build/host/nebula dist/Nebula
           cp -L build/host/SDL3/libSDL3.so.0 build/game/libsmg_game.so target/release/nebula-import dist/
-          patchelf --set-rpath '$ORIGIN' dist/NebulaNative
+          patchelf --set-rpath '$ORIGIN' dist/Nebula
           cp LICENSE THIRD-PARTY-NOTICES.md docs/TEST_BUILDS.md dist/
           # Artifacts drop file modes: a tar keeps the programs executable.
           tar -C dist -czf nebula-linux-x64.tar.gz .
@@ -391,7 +398,7 @@ jobs:
 
   macos:
     name: macOS
-    # Apple silicon only (the runner's own processor), as platform/apple/build_macos.sh builds it (docs/APPLE.md):
+    # Apple silicon only (the runner's own processor), as platform/apple/build_macos.sh builds it:
     # the Metal renderer, Apple's host and the game module, packed as Nebula.app. Not in Build result's needs: the
     # Mac port isn't finished, so it doesn't block a merge.
     # Also needs the game module job: if it doesn't build, the app is useless.
@@ -399,7 +406,7 @@ jobs:
     if: needs.changes.outputs.game == 'true'
     runs-on: macos-15
     env:
-      # docs/APPLE.md, "Toolchain": LLVM 19 (LLVM's own macOS package), and libc++ built from the same release.
+      # LLVM 19 (LLVM's own macOS package), and libc++ built from the same release.
       LLVM_VERSION: 19.1.7
       MOLTENVK_TAG: v1.4.2
     steps:

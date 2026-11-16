@@ -14,8 +14,9 @@
 // kind also keeps what its noise is (Schied et al. 2017, "Spatiotemporal Variance-Guided Filtering"): the first and
 // second moment of the luminance over time, and from them the variance of the average, which the steps over space
 // (rt_lights_space.hlsl) weigh their taps by. A pixel with fewer than four frames behind it takes the variance of
-// this frame's rays around it instead. Two guards of ReSTIR's: the boiling filter (RTXDI's): a pixel whose kept light's
-// weight is over 20 times the mean of its lit neighbours' is a firefly, brought down to that; and a flash stays a
+// this frame's rays around it instead. Two guards of ReSTIR's: the boiling filter (RTXDI's): a pixel whose light is
+// over 20 times the mean of its lit neighbours' (luminance as written, f(y) W: not W, which is large for a weak light)
+// is a firefly, brought down to that; and a flash stays a
 // flash: where this frame is over four times the history, the history holds at most 8 frames.
 #include "rt_bindings.hlsli"
 #include "rt_frame.hlsli"
@@ -36,7 +37,7 @@ static const float3 kLuminance = float3(0.2126f, 0.7152f, 0.0722f);
 #endif
 
 
-// The most frames a history holds: 32 at 60 frames a second, as many seconds at any rate (plan 16.5).
+// The most frames a history holds: 32 at 60 frames a second, as many seconds at any rate.
 float most_frames() {
     return 32.0f * rt_history_scale();
 }
@@ -74,15 +75,16 @@ void main(uint3 id : SV_DispatchThreadID) {
         const float to_right = right.x == pixel.x ? 1e30f : abs(g_guide.Load(int3(right, 0)).r - guide.r);
         raw = g_raw.Load(int3(to_left <= to_right ? left : right, 0)).rba;
     }
-    const float own = g_reservoirs_now.Load(int3(pixel, 0)).b;
-    if (own > 0.0f && !left_out) {
+    const float own = dot(raw, kLuminance);
+    if (g_reservoirs_now.Load(int3(pixel, 0)).b > 0.0f && own > 0.0f && !left_out) {
+        // Its lit neighbours (their kept light seen: weight > 0; not left out by Low): the luminance they wrote.
         float total = 0.0f, lit = 0.0f;
         for (int y = -1; y <= 1; ++y) {
             for (int x = -1; x <= 1; ++x) {
                 const int2 at = clamp(pixel + int2(x, y), int2(0, 0), int2(width, height) - 1);
-                const float w = g_reservoirs_now.Load(int3(at, 0)).b;
-                if ((x != 0 || y != 0) && w > 0.0f) {
-                    total += w;
+                const float4 near = g_raw.Load(int3(at, 0));
+                if ((x != 0 || y != 0) && g_reservoirs_now.Load(int3(at, 0)).b > 0.0f && near.g >= 0.0f) {
+                    total += dot(near.rba, kLuminance);
                     lit += 1.0f;
                 }
             }
@@ -94,7 +96,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 #endif
     if ((g_more.z & 2048u) != 0u) {
-        // Raw signals for an outside denoiser (FB, 22.20): this frame's value as traced (Low's fill and the boiling
+        // Raw signals for an outside denoiser: this frame's value as traced (Low's fill and the boiling
         // filter done), one frame, no history.
         g_out[id.xy] = float4(raw.x, 1.0f / most_frames(), raw.y, raw.z);
 #ifdef RT_LIGHTS
@@ -172,8 +174,11 @@ void main(uint3 id : SV_DispatchThreadID) {
     const float3 history = clamp(sum / weight, low, high);
     float count = min(frames / weight * most_frames() + 1.0f, most_frames());
 #ifdef RT_LIGHTS
-    if (bright > 4.0f * dot(history, kLuminance) + 0.02f) {
-        count = min(count, 8.0f * rt_history_scale());  // a flash
+    // A flash (a lamp lit, a blast): the history is cut short. Asked of the mean of this frame's rays about the pixel,
+    // not of the pixel's own ray: a step that follows the sample being averaged makes the average read high (up to
+    // twice for a light met by few rays).
+    if (dot(mean, kLuminance) > 4.0f * dot(history, kLuminance) + 0.02f) {
+        count = min(count, 8.0f * rt_history_scale());
     }
 #endif
     const float3 now = lerp(history, raw, max(1.0f / count, 0.06f / rt_history_scale()));
@@ -185,7 +190,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 #ifdef RT_LIGHTS
     const float2 both = lerp(moments / weight, float2(bright, bright * bright), max(1.0f / count, 0.06f / rt_history_scale()));
     const float over_time = max(both.y - both.x * both.x, 0.0f);
-    // The upscaler's history lags a light that changed: its reactive mask takes this frame there (plan 16.4). The
+    // The upscaler's history lags a light that changed: its reactive mask takes this frame there. The
     // averages are compared, not this frame's rays (their noise is no change), and the history before its clamp.
     const float changed = abs(dot(now, kLuminance) - dot(sum / weight, kLuminance)) > 0.25f ? 1.0f : 0.0f;
     g_moments[id.xy] = float4(both, (count < 4.0f ? max(over_time, around) : over_time) / min(count, 16.0f), changed);

@@ -94,22 +94,43 @@ jobs:
           key: host-deps-OFF-${{ hashFiles('cmake/**', 'third_party/archive/**') }}
       - name: Configure
         # A release build: cross-file optimization on (NEBULA_HOST_IPO's default). There is one build kind: tests
-        # attach their hooks from outside (tools/release_check.ps1 checks no source names a build kind).
-        run: cmake -S . -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release
+        # attach their hooks from outside (tools/release_check.ps1 checks no source names a build kind). Direct3D 11's
+        # program (NebulaD11.exe) is built beside the game's.
+        run: cmake -S . -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release -DNEBULA_D3D11=ON
       - name: Build
-        # The program Setup ships, not the tests.
-        run: cmake --build build/host --target NebulaNative
+        # The programs Setup ships, not the tests.
+        run: cmake --build build/host --target Nebula NebulaD11
+      - name: Configure (x86-64-v2)
+        # The same two for CPUs without x86-64-v3 (NEBULA_HOST_BASELINE): Nebula-x86-64-v2.exe, NebulaD11-x86-64-v2.exe.
+        run: cmake -S . -B build/host-v2 -G Ninja -DCMAKE_BUILD_TYPE=Release -DNEBULA_D3D11=ON -DNEBULA_HOST_BASELINE=ON
+      - name: Build (x86-64-v2)
+        run: cmake --build build/host-v2 --target Nebula NebulaD11
+      - name: glslang
+        # glslang's compiler, which LumaLink checks a mod's shaders with (cmake/vulkan_deps.cmake nebula_glslang).
+        run: |
+          cmake -S . -B build/host-vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DNEBULA_VULKAN=ON
+          cmake --build build/host-vk --target nebula_glslang
+      - name: Stage
+        shell: pwsh
+        run: |
+          $bin = New-Item -ItemType Directory -Force 'dist/bin'
+          Copy-Item build/host/Nebula.exe, build/host/NebulaD11.exe, build/host-v2/Nebula-x86-64-v2.exe, build/host-v2/NebulaD11-x86-64-v2.exe $bin
+          Copy-Item -Recurse build/host/D3D12 (Join-Path $bin 'D3D12')
+          Copy-Item -Recurse build/host-vk/glslang-tool (Join-Path $bin 'glslang')
+          $symbols = New-Item -ItemType Directory -Force 'dist/symbols'
+          Copy-Item build/host/*.pdb, build/host-v2/*.pdb $symbols -ErrorAction SilentlyContinue
+          Get-ChildItem -Recurse $bin | Select-Object -ExpandProperty FullName
       - uses: actions/upload-artifact@v7
         with:
           name: release-host
-          path: build/host/NebulaNative.exe
+          path: dist/bin
           retention-days: 1
           if-no-files-found: error
       # Kept for reading crash dumps of this release (docs/DIAGNOSTICS.md); not published.
       - uses: actions/upload-artifact@v7
         with:
           name: release-symbols
-          path: build/host/NebulaNative.pdb
+          path: dist/symbols
           retention-days: 90
           if-no-files-found: warn
 
@@ -125,11 +146,27 @@ jobs:
             build/game/archive-deps
           key: game-archive-deps-${{ hashFiles('cmake/**', 'third_party/archive/**') }}
       - name: Build
-        run: .\native\build.ps1 -Petari native\petari -Build build\game
+        # Both modules (smg_game with the mods' rows, smg_game_plain without), for x86-64-v3 and x86-64-v2\.
+        run: .\native\build.ps1 -Petari native\petari -Build build\game -Target "smg_game smg_game_plain"
       - uses: actions/upload-artifact@v7
         with:
           name: release-game
-          path: build/game/smg_game.dll
+          path: |
+            build/game/smg_game.dll
+            build/game/smg_game_plain.dll
+            build/game/x86-64-v2/smg_game.dll
+            build/game/x86-64-v2/smg_game_plain.dll
+          retention-days: 1
+          if-no-files-found: error
+      # The game's self-description LumaLink reads (build-native-setup.ps1 -Names): its rows, types and placement facts.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-names
+          path: |
+            build/game/luma/
+            build/game/luma_types/*.json
+            build/game/smg_game.luma-placement.json
+            build/game/smg_game.luma-self.json
           retention-days: 1
           if-no-files-found: error
 
@@ -155,6 +192,10 @@ jobs:
         with:
           name: release-game
           path: ${{ runner.temp }}/bin
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-names
+          path: ${{ runner.temp }}/names
       - name: DirectX Shader Compiler
         run: |
           $zip = Join-Path $env:RUNNER_TEMP 'dxc.zip'
@@ -162,17 +203,6 @@ jobs:
           $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($hash -ne $env:DXC_SHA256) { throw "dxc.zip is $hash, not the pinned $env:DXC_SHA256" }
           Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'dxc')
-      - name: Ray tracing tables
-        # The tables describe the game's own data, so they are kept outside the repository (docs/RAY_TRACING_STATUS.md)
-        # and nothing traces yet: Setup ships them with a header and no rows, as the test builds run without them.
-        # Not empty: Setup refuses to install an empty file (InstallEngine.Install).
-        run: |
-          $tables = New-Item -ItemType Directory -Force (Join-Path $env:RUNNER_TEMP 'bin\tables')
-          $headers = @{ 'material-names.tsv' = "model`tmaterial`ttexture"; 'rt-materials.tsv' = "hash`tclass"; 'rt-suns.tsv' = "stage`tsource" }
-          foreach ($name in $headers.Keys) {
-              $text = "# No rows: this release ships no ray-tracing tables.`n" + $headers[$name] + "`n"
-              [IO.File]::WriteAllText((Join-Path $tables $name), $text, (New-Object Text.UTF8Encoding $false))
-          }
       - name: Private terms
         # release_check.ps1 expects .nebula-release-key\private-terms.txt (one term per line).
         # An empty file means no personal terms to check — the file just needs to exist.
@@ -195,7 +225,8 @@ jobs:
       - name: Setup
         run: >-
           .\installer\build-native-setup.ps1 -Version $env:VERSION -Bin (Join-Path $env:RUNNER_TEMP 'bin')
-          -Dxc (Join-Path $env:RUNNER_TEMP 'dxc') -OutputDirectory (Join-Path $env:RUNNER_TEMP 'dist')
+          -Names (Join-Path $env:RUNNER_TEMP 'names') -Dxc (Join-Path $env:RUNNER_TEMP 'dxc')
+          -OutputDirectory (Join-Path $env:RUNNER_TEMP 'dist')
           -SetupName $env:SETUP -Repository $env:GITHUB_REPOSITORY
       - name: Release check
         # Defender isn't run here: the runner's definitions say nothing about players' PCs.

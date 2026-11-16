@@ -83,6 +83,10 @@ struct RenderConfig {
     // internal resolution is lower. Off by default: the scene then takes two resamples (to the integer output
     // scale, then to the window) instead of one.
     bool     hud_output_resolution = false;
+    // With an internal height (render_internal_height): the 2D layer drawn into the scene at the internal size, and the
+    // picture enlarged once at present, instead of the scene enlarged into a window-size target the 2D layer is drawn over
+    // (render_hud_at_output). Faster, text softer; hud_output_resolution wins. Off: as without it.
+    bool     hud_internal_resolution = false;
 
     // Presentation image quality (post_process.h), applied to the presented frame on the render thread; false
     // presents with the plain bilinear blit.
@@ -110,6 +114,10 @@ struct RenderConfig {
     // count. Width follows the current content aspect, including a fold or window resize. Ignored with an upscaler on
     // (render_internal_height).
     unsigned internal_height     = 0;
+    // Dynamic resolution (resolution_governor.h): the 3D scene drawn in a part of its targets, from internal_height's size
+    // down to half its lines, as the GPU's measured time asks. Off: every picture as without it. Taken only where the back
+    // end offers it (dynamic_resolution_offered).
+    bool     dynamic_resolution  = false;
     // RCAS strength 0-100; 0 skips the pass.
     unsigned sharpness           = 0;
     // HDR10 output (post_process_settings.h): offered only while the display reports HDR mode, and written only then
@@ -120,7 +128,7 @@ struct RenderConfig {
 
     // Ray tracing, on a device that can trace (rt_caps.h); ignored elsewhere.
     bool     ray_tracing_enabled = false;
-    // The preset (plan 19.1): 0 medium, 1 high, 2 low, 3 reference (path traced, to compare), 4 custom (the parts as
+    // The preset: 0 medium, 1 high, 2 low, 3 reference (path traced, to compare), 4 custom (the parts as
     // set one by one). A preset sets every part (rt_apply_preset).
     unsigned rt_quality          = 0;
     // The parts, each its own setting, in RtPart's order (sun shadows, local lights, sky and bounce light, reflections,
@@ -131,8 +139,14 @@ struct RenderConfig {
     // low) unless the player chose one: rt_chosen, set by the Settings rows.
     float    rt_probe_ms         = 0.0f;
     bool     rt_chosen           = false;
+    // The lighting style: 0 painted (the art's own light, relit by the tracer's ratios), 1 physical (where
+    // a painted mesh's paint is one light, the real sun takes its place).
+    unsigned rt_style            = 1;
     // Light the lens scatters around every bright surface.
     bool     rt_lens_bloom       = true;
+    // A soft shadow under the player while ray tracing, to judge a landing (the game's own drop shadow is left out
+    // then).
+    bool     rt_landing_shadow   = true;
 
     // Texture packs (texture_pack.h): replacements from the mods'
     // textures/ folders. preload loads the whole pack at start instead of each texture at its first
@@ -171,6 +185,12 @@ struct RenderConfig {
     return config.per_pixel_lighting || config.enhanced_lighting || config.ray_tracing_enabled;
 }
 
+// Whether the 3D scene is drawn in the wide (FP16) target with its camera: for the enhanced lighting, or while tracing
+// (the relit scene goes over 1). `tracing`: ray tracing on and the tracer started.
+[[nodiscard]] inline bool scene_wide(const RenderConfig& config, bool tracing) noexcept {
+    return (config.enhanced_lighting || tracing) && config.wide_scene;
+}
+
 // Frames per second the game picture is presented at. The game renders 60; lower rates present the newest frame on
 // their own cadence, higher rates add interpolated frames between game frames. Unlimited (0) is the display rate (at
 // least 60). VSync limits the rate to the display's.
@@ -197,6 +217,11 @@ inline unsigned normalized_internal_height(unsigned height) {
 // scale instead (upscaler_render_fraction), so the two never multiply.
 inline unsigned render_internal_height(const RenderConfig& cfg) {
     return cfg.upscaler == 0u ? normalized_internal_height(cfg.internal_height) : 0u;
+}
+// Whether the 2D layer is drawn at the window's resolution over the enlarged scene (begin_output_scene): asked for
+// (hud_output_resolution), or an internal height without hud_internal_resolution.
+inline bool render_hud_at_output(const RenderConfig& cfg) {
+    return cfg.hud_output_resolution || (render_internal_height(cfg) != 0u && !cfg.hud_internal_resolution);
 }
 // A common sizing rule for both encoders. Bounds preserve aspect and fit `max_dimension`, the device's largest 2D
 // texture (D3D12's required 16384, Vulkan's maxImageDimension2D).
@@ -284,7 +309,7 @@ struct RenderFeatureCaps {
     const char* reason);
 
 // The settings as the renderer runs them, a copy taken under the lock (never a partial update): the player's, except
-// while the tracer runs, when the scene renders single-sampled and is anti-aliased temporally (plan 16.3: the tracer
+// while the tracer runs, when the scene renders single-sampled and is anti-aliased temporally (the tracer
 // reads one depth and one item a pixel): MSAA is set aside and, without a temporal upscaler chosen, FSR 3 runs, in its
 // native anti-aliasing mode or at FSR 1's chosen scale.
 [[nodiscard]] RenderConfig get_render_config();
@@ -315,15 +340,15 @@ void note_camera_water(float depth) noexcept;
 }
 void set_render_config(const RenderConfig& cfg);
 
-// Ray tracing's parts (plan 19.1), in RenderConfig::rt_parts' order; each 0 off, 1 low, 2 medium, 3 high.
+// Ray tracing's parts, in RenderConfig::rt_parts' order; each 0 off, 1 low, 2 medium, 3 high.
 enum class RtPart : std::uint8_t { Sun, Lights, Indirect, Reflect, Transmit, Volume, Count };
 inline constexpr unsigned kRtPresetReference = 3u, kRtPresetCustom = 4u;
 inline unsigned rt_part(const RenderConfig& cfg, RtPart part) noexcept {
     return part < RtPart::Count ? std::min<unsigned>(cfg.rt_parts[static_cast<std::size_t>(part)], 3u) : 0u;
 }
 
-// The presets' parts (plan 19.1): low leaves the painted reflections; reference takes high's parts and the reference
-// path tracer draws the picture (FB's 22.9).
+// The presets' parts: low leaves the painted reflections; reference takes high's parts and the reference
+// path tracer draws the picture.
 inline void rt_apply_preset(RenderConfig& cfg) noexcept {
     constexpr std::uint8_t kParts[4][6] = {
         {2u, 2u, 2u, 2u, 2u, 2u},  // medium
@@ -340,6 +365,10 @@ inline void rt_apply_preset(RenderConfig& cfg) noexcept {
 // RenderConfig::curved_surfaces takes effect.
 void set_curved_surfaces_offered(bool offered) noexcept;
 [[nodiscard]] bool curved_surfaces_offered() noexcept;
+// Whether the renderer draws the scene in a part of its targets: the DYNAMIC RESOLUTION row is offered and
+// RenderConfig::dynamic_resolution takes effect.
+void set_dynamic_resolution_offered(bool offered) noexcept;
+[[nodiscard]] bool dynamic_resolution_offered() noexcept;
 
 // The scene target scale config.ini keeps for the next start. The overlay sets it with the live value so config.ini and the
 // running renderer agree.
@@ -357,6 +386,14 @@ void load_render_config_from_file();
 // Writes the implemented settings to the same config.ini; unimplemented ones are omitted.
 bool save_render_config_to_file();
 
+// load_render_config_from_file found no config.ini: this is the first start, and nothing the player chose exists yet.
+[[nodiscard]] bool render_config_first_start() noexcept;
+// The first start's internal height before it is measured (render_core.cpp's calibration): 480 on a GPU that shares the
+// system's memory, else 1080; 0 (match display) when the output has no more lines than that.
+[[nodiscard]] unsigned first_start_internal_height(bool shared_memory, unsigned output_lines) noexcept;
+// The PERFORMANCE preset: the 3D scene and the 2D layer at 480 lines and one enlarge at present, every optional pass off.
+void apply_performance_preset(RenderConfig& cfg) noexcept;
+
 // A GPU's identity in config.ini's gpu key: PCI vendor, device and subsystem id in lowercase hex,
 // "vvvv:dddd:ssssssss". The subsystem tells two boards of the same chip apart.
 std::string gpu_identity(unsigned vendor_id, unsigned device_id, unsigned subsys_id);
@@ -371,6 +408,13 @@ std::string next_start_gpu();
 // Nebula's ray tracing.
 void record_render_adapter(const char* description, unsigned vendor_id, unsigned device_id,
                            unsigned subsys_id, bool ray_tracing) noexcept;
+// The adapter record_render_adapter was last given (empty before the renderer starts).
+struct RenderAdapter {
+    std::string description;
+    unsigned vendor_id = 0u;
+    unsigned device_id = 0u;
+};
+[[nodiscard]] RenderAdapter render_adapter();
 // When config.ini changed on disk since this process last read or wrote it (Nebula Settings saved it while the game
 // runs), reads it over the live settings, as the in-game menu would apply them, and returns true.
 bool reload_render_config_if_changed();

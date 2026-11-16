@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// The reflections over space (the master plan's 12.3): an a-trous step (5 by 5 taps `step` pixels apart; run with
+// The reflections over space: an a-trous step (5 by 5 taps `step` pixels apart; run with
 // steps 1 and 2). A mirror (roughness under 0.05) stays as it is: it must stay sharp. Otherwise a neighbour counts
 // by the same object, the same plane, the reflection lobe (its normal against the pixel's, sharper the smoother the
 // surface) and a like ray length, so near and far reflections do not mix.
@@ -37,7 +37,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     float weight = kTap[0] * kTap[0];
     for (int y = -2; y <= 2; ++y) {
         for (int x = -2; x <= 2; ++x) {
-            if ((x == 0 && y == 0) || (g_more.z & 2048u) != 0u) {  // raw signals (22.20): the centre alone
+            if ((x == 0 && y == 0) || (g_more.z & 2048u) != 0u) {  // raw signals: the centre alone
                 continue;
             }
             const int2 at = pixel + int2(x, y) * step_;

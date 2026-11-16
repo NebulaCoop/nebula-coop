@@ -1,4 +1,4 @@
-/* The game module's interface to Nebula's host (docs/NATIVE_PORT.md, "Module layout"): plain C, so the game module
+/* The game module's interface to Nebula's host: plain C, so the game module
    (built against the game's own C++ library) and the host (the host's C++ library) share nothing else. The host fills
    NebulaHostServices and calls nebula_game_attach, then runs the game on its game thread with nebula_game_run. Game code
    runs on that thread only, but for nebula_game_sound_frame (the host's audio clock) and nebula_game_mii_valid (any
@@ -26,7 +26,7 @@ extern "C" {
 
 /* Upstream Nebula's number for this interface. Co-op changes leave it as it is (docs/COOP_PLAN.md "Versions"): the
    host checks the module against the header's fingerprint (nebula_game_api_fingerprint), which the build works out. */
-#define NEBULA_GAME_API_VERSION 153u
+#define NEBULA_GAME_API_VERSION 156u
 
 /* The game's fixed step: nebula_game_run's loop runs this many steps a second (frame_wait paces them), whatever the
    display's rate; the host presents each or interpolates between them. */
@@ -340,6 +340,15 @@ enum {
     NEBULA_HOME_MENU_VIEW,
     NEBULA_HOME_MENU_POINT,    /* value: the answer under the pointer, selected */
     NEBULA_HOME_MENU_CHOOSE,   /* value: the answer clicked */
+    /* Launcher mode's home screen (docs/using-nebula/command-line-arguments.md --home), opened at the boot's title hold: 1 when the host opened
+       it. While it is open and the HOME Menu is not, VIEW, POINT and CHOOSE are its own: the view has bit 16 set, bits
+       0-7 the selected answer and bits 8-15 the page (0 the rows Play, Settings, Quit; 1 an update's notice, whose
+       answer is Back). */
+    NEBULA_HOME_MENU_LAUNCHER_OPEN,
+    NEBULA_HOME_MENU_LAUNCHER_POLL, /* its choice: -1 none yet, 0 play (the boot goes on to the title), 1 quit, 2 the
+                                       benchmark (the game quits; the host starts again into it) */
+    NEBULA_HOME_MENU_LAUNCHER_TEXT, /* value: bits 16-31 which (0 the update's version, 1 its notes), bits 0-15 a
+                                       position: its UTF-16 unit there, 0 past the end */
 };
 
 /* What the settings' galaxy select asks of the scene (galaxy_travel). */
@@ -594,7 +603,15 @@ enum {
                                           menu: no pointer shows under a finger there */
     NEBULA_OPTION_STAR_COUNTER,        /* 1 while the room plays the built-in Personal Star Counter mod (the host's
                                           choice, off by default): NebulaStarCounter's two counters show on the HUD */
+    NEBULA_OPTION_GRAPHICS_BACKEND,    /* the renderer's backend, the same all session: 1 D3D12, 2 Vulkan, 3 D3D11 (draw.native) */
     NEBULA_OPTION_RAY_TRACING,         /* what ray tracing asks of the game now (NEBULA_RAY_TRACING_*); 0: nothing */
+};
+
+/* post_register's result (draw.post, docs/modding/reference/services/draw.md). */
+enum {
+    NEBULA_POST_OK = 0,        /* *program is the compiled program (never 0) */
+    NEBULA_POST_COMPILE = 1,   /* the device's compiler refused the text: its first error in `error` */
+    NEBULA_POST_NO_MOTION = 2, /* it reads motion and the frame has no motion vectors (temporal upscaling off) */
 };
 
 /* NEBULA_OPTION_RAY_TRACING's bits. */
@@ -603,6 +620,9 @@ enum {
     NEBULA_RAY_TRACING_SHADOW_SETS = 1u << 1, /* a zone's shadow light set (the artists' darker lights for actors in a
                                                  shade) gives way to the lit set it darkens: the traced shadow darkens
                                                  them, once */
+    NEBULA_RAY_TRACING_MIRROR = 1u << 2,      /* reflections are traced at High: the game draws no mirror pass (a
+                                                 mirror's own view, captured for its surface); the surface's fetch of
+                                                 the capture takes the traced reflection in its place (12.5) */
 };
 
 /* The movie player's sound (movie_audio_control). */
@@ -636,7 +656,8 @@ enum {
 };
 typedef struct NebulaSaveRequest {
     uint32_t op;
-    const char* name;
+    const char* name;          /* a plain file name in the save folder, or "luma/<plain name>": a mod's global file
+                                  (services-save 7) in its luma folder, made at the first write, kept without backups */
     void* buffer;
     uint32_t size;
     uint32_t* length;          /* read: the file's length (may be NULL) */
@@ -816,6 +837,8 @@ enum {
                                                 next: APPLY, before: REVERT, back: CLOSE */
     NEBULA_SETTINGS_STATUS_MOD_REMOVE_ASK,   /* remove the mod whose page is open? `status_number` 1: it goes to the
                                                 recycle bin, 0: it is deleted. yes: APPLY, no: CLOSE */
+    NEBULA_SETTINGS_STATUS_MOD_FORGET_ASK,   /* forget what a removed mod kept (its numbers and saved data)?
+                                                `status_text` its id. yes: APPLY, no: CLOSE */
 };
 /* The Pair Joy-Con screen's halves (NEBULA_SETTINGS_STATUS_JOYCON). */
 enum {
@@ -875,6 +898,8 @@ typedef struct NebulaSettingsView {
     const uint8_t* picture;
     uint32_t picture_width;
     uint32_t picture_height;
+    uint32_t help_as_is; /* 1: `help` is already in the played language (a mod's refusal, as the validator words it):
+                            shown as is, not translated */
 } NebulaSettingsView;
 
 /* The player's input to the settings menu (settings_input); the keyboard and controllers reach it through the host. */
@@ -1280,6 +1305,15 @@ typedef struct NebulaHostServices {
        bytes into `id`; its base is NEBULA_COOP_MENU_CHARACTER's. The game plays a mod's only while it runs that mod's
        character (NebulaCharacters), else the base. Called on the simulation thread. */
     void (*coop_character_wanted)(void* user, char* id, uint32_t capacity);
+    /* draw.post (services/draw.md): a mod's post program compiled for this device. `text` is the cooked program's text
+       (LumaLink's part: its params over post_params, the mod's `float4 post(PostIn i)`), `size` bytes, not NUL-ended;
+       the host adds its prelude (PostIn, scene, scene_texel, depth, motion, post_params, the bindings) and its entry.
+       `reads`: LUMA_DRAW_POST_READS_*. NEBULA_POST_* and *program; `error` holds the compiler's first error, NUL-ended
+       within `error_capacity`. Game thread. */
+    int32_t (*post_register)(void* user, const void* text, uint32_t size, uint32_t reads, uint32_t* program, char* error,
+                             uint32_t error_capacity);
+    /* The program freed, after the lists that name it are released. Game thread. */
+    void (*post_free)(void* user, uint32_t program);
 } NebulaHostServices;
 
 
@@ -1325,6 +1359,10 @@ NEBULA_GAME_API void nebula_game_sound_frame(void);
 NEBULA_GAME_API uint32_t nebula_game_mii_valid(const NebulaMii* mii);
 /* The host's Mii database changed (Miis imported while the game runs): the game reads its slots again. */
 NEBULA_GAME_API void nebula_game_mii_changed(void);
+/* The module's type rows as JSON (language/game-description.md; the host's --luma-describe), given to `write` in
+   pieces in order. Needs no attach; reads only the rows. */
+typedef void (*NebulaDescribeWrite)(void* user, const char* text, uint32_t length);
+NEBULA_GAME_API void nebula_game_luma_describe(NebulaDescribeWrite write, void* user);
 #ifdef __cplusplus
 }
 #endif

@@ -7,12 +7,11 @@
 #include "Game/System/NerveExecutor.hpp"
 #include "Game/Util/DemoUtil.hpp"
 #include "Game/Util/LiveActorUtil.hpp"
-#include "Game/Util/Tunable.hpp"
 
 namespace {
     // How near the boss the local player is to be in its fight (its cutscenes and music his): a boss's planet or
     // arena, not the galaxy's others.
-    NEBULA_TUNABLE(f32, cWatchDistance, 6000.0f);
+    const f32 cWatchDistance = 6000.0f;
 };  // namespace
 
 NebulaCoopBossPhases::NebulaCoopBossPhases() : mBoss(nullptr), mNerves(nullptr), mNum(0), mLocalPhase(0), mMusicPhase(0) {

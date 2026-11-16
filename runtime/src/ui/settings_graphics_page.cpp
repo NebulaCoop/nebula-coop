@@ -17,6 +17,8 @@ std::vector<SettingsRow> graphics_page(const RenderConfig& render, const Graphic
     const GraphicsPageState state = host.query(render);
     std::vector<SettingsRow> rows;
     char text[96]{};
+    rows.push_back(button_row("PRESET", {"PERFORMANCE"}, [](RenderConfig& draft, unsigned) { apply_performance_preset(draft); },
+                              "LOWER RESOLUTION AND EVERY OPTIONAL EFFECT OFF FOR THE STEADIEST FRAME RATE"));
     rows.push_back({"RESOLUTION", {}, nullptr, {}, true});
     const std::vector<unsigned>& choices = state.upscalers;
     const bool offered = std::find(choices.begin(), choices.end(), render.upscaler) != choices.end();
@@ -54,6 +56,11 @@ std::vector<SettingsRow> graphics_page(const RenderConfig& render, const Graphic
                 const auto found = std::find(kInternalHeights.begin(), kInternalHeights.end(), normalized_internal_height(draft.internal_height));
                 draft.internal_height = kInternalHeights[settings_step(unsigned(found - kInternalHeights.begin()), unsigned(kInternalHeights.size()), delta)];
             }, "3D PIXEL HEIGHT. WIDTH FOLLOWS ASPECT. MATCH DISPLAY FOLLOWS WINDOW SIZE AND FOLDING"});
+    }
+    if (state.dynamic_resolution_offered && render.upscaler == 0u) {
+        rows.push_back({"DYNAMIC RESOLUTION", render.dynamic_resolution ? "ON" : "OFF",
+                        [](RenderConfig& draft, int) { draft.dynamic_resolution = !draft.dynamic_resolution; },
+                        "LOWERS THE RESOLUTION WHEN THE GRAPHICS CARD FALLS BEHIND AND RAISES IT AGAIN WHEN IT HAS ROOM"});
     }
     const unsigned render_percent = state.render_percent;
     // Ray tracing replaces MSAA, ambient occlusion and the lighting modes: their rows are hidden while it is on.
@@ -101,7 +108,7 @@ std::vector<SettingsRow> graphics_page(const RenderConfig& render, const Graphic
     // A temporal upscaler antialiases the scene itself: anti-aliasing and MSAA have no part in its picture (the
     // renderers skip both under it), so their rows go while it runs.
     const bool temporal = state.temporal_upscaling;
-    // With ray tracing on and no temporal upscaler chosen, FSR 3 anti-aliases the scene (plan 16.3): the row says so,
+    // With ray tracing on and no temporal upscaler chosen, FSR 3 anti-aliases the scene: the row says so,
     // and MSAA and SMAA have no part in the picture until ray tracing is off again.
     const bool traced_temporal = rt_on && !temporal && state.traced_temporal;
     if (traced_temporal) {
@@ -141,7 +148,7 @@ std::vector<SettingsRow> graphics_page(const RenderConfig& render, const Graphic
                         "TRACED SHADOWS, SKY AND BOUNCE LIGHT, GLOWS THAT LIGHT THE WORLD"});
     }
     if (rt_on) {
-        // The preset sets every part (plan 19.1); a part changed by itself makes it CUSTOM. All switch live.
+        // The preset sets every part; a part changed by itself makes it CUSTOM. All switch live.
         static constexpr unsigned kOrder[] = {2u, 0u, 1u, kRtPresetReference};  // low, medium, high, reference
         static constexpr const char* kNames[] = {"MEDIUM", "HIGH", "LOW", "REFERENCE", "CUSTOM"};
         rows.push_back({"RAY TRACING QUALITY", kNames[std::min(render.rt_quality, kRtPresetCustom)],
@@ -173,6 +180,12 @@ std::vector<SettingsRow> graphics_page(const RenderConfig& render, const Graphic
         rows.push_back({"LENS BLOOM", render.rt_lens_bloom ? "ON" : "OFF",
                         [](RenderConfig& draft, int) { draft.rt_lens_bloom = !draft.rt_lens_bloom; },
                         "LIGHT THE LENS SCATTERS AROUND EVERY BRIGHT SURFACE"});
+        rows.push_back({"LANDING SHADOW", render.rt_landing_shadow ? "ON" : "OFF",
+                        [](RenderConfig& draft, int) { draft.rt_landing_shadow = !draft.rt_landing_shadow; },
+                        "A SOFT SHADOW UNDER THE PLAYER, TO JUDGE A LANDING"});
+        rows.push_back({"LIGHTING STYLE", render.rt_style == 1u ? "PHYSICAL" : "PAINTED",
+                        [](RenderConfig& draft, int) { draft.rt_style = draft.rt_style == 1u ? 0u : 1u; },
+                        "PAINTED: THE ART'S OWN LIGHT. PHYSICAL: THE REAL SUN ON SIMPLY PAINTED SURFACES"});
     }
 
     rows.push_back({"FRAME RATE", {}, nullptr, {}, true});

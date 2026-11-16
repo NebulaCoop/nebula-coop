@@ -29,10 +29,10 @@ An extracted folder works in place of the disc image; `--features folders-only` 
 
 ```powershell
 cmake -S . -B build\host -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build\host --target NebulaNative
+cmake --build build\host --target Nebula
 ```
 
-`-DNEBULA_VULKAN=ON` also builds `NebulaNativeVk.exe`; `-DNEBULA_FSR3=OFF` leaves out FSR 3. DLSS uses NVIDIA's
+`-DNEBULA_VULKAN=ON` also builds `NebulaVk.exe`; `-DNEBULA_FSR3=OFF` leaves out FSR 3. DLSS uses NVIDIA's
 signed Streamline libraries, which the host loads at run time from the vendor folder.
 
 ## 3. Game module
@@ -47,20 +47,20 @@ A build for players adds `-Pgo`: ThinLTO with the profile in `native/pgo` (`tool
 
 ## 4. Run
 
-Put `NebulaNative.exe` and `smg_game.dll` in one folder with the `content` folder from step 1, then:
+Put `Nebula.exe` and `smg_game.dll` in one folder with the `content` folder from step 1, then:
 
 ```powershell
-.\NebulaNative.exe
+.\Nebula.exe
 ```
 
 With no arguments it finds `content\game.pak` next to it (or in the current folder) and uses the launcher's saves,
 `%LOCALAPPDATA%\NebulaCoop\saves`. `--pak <game.pak>` and `--nand <folder>` name others:
 
 ```powershell
-.\NebulaNative.exe --pak D:\nebula\content\game.pak --saves "$env:LOCALAPPDATA\Nebula\saves"
+.\Nebula.exe --pak D:\nebula\content\game.pak --saves "$env:LOCALAPPDATA\Nebula\saves"
 ```
 
-The other arguments are in COMMAND_LINE.md.
+The other arguments are in [using-nebula/command-line-arguments.md](using-nebula/command-line-arguments.md).
 
 ## Tests
 
@@ -84,7 +84,7 @@ the installer tests; the Linux, Android and macOS builds run and show their own 
 ## Setup
 
 ```powershell
-.\installer\build-native-setup.ps1 -Version <version> -Dxc <unpacked DirectX Shader Compiler release> -Bin <folder with NebulaNative.exe and smg_game.dll>
+.\installer\build-native-setup.ps1 -Version <version> -Dxc <unpacked DirectX Shader Compiler release> -Bin <folder with Nebula.exe and smg_game.dll>
 ```
 
 Builds the disc import tool, the launcher and Setup, and writes `Nebula-Setup.exe` with the host and game module
@@ -106,7 +106,7 @@ release as its notes. A tag with `-beta.` in it (`v2.0.0-beta.1`) makes `Nebula-
 to; any tag with a `-` part is a pre-release. When a release for the tag already exists (made by hand on GitHub), its
 notes are kept and only the files are added. Setup's update check reads this repository's releases. Its ray-tracing
 tables have a header and no rows (Setup refuses an empty file): they describe the game's own data and are kept outside
-the repository. `NebulaNative.pdb` is kept as the run's `release-symbols` download for 90 days.
+the repository. `Nebula.pdb` is kept as the run's `release-symbols` download for 90 days.
 
 Setup installs NebulaCoop beside an installed upstream Nebula, never over it: `%LOCALAPPDATA%\Programs\NebulaCoop`,
 data in `%LOCALAPPDATA%\NebulaCoop`, its own Start menu folder, `HKCU\Software\NebulaCoop` and Add/Remove Programs entry
