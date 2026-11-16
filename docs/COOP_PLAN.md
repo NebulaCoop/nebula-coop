@@ -228,8 +228,8 @@ How a join goes (`galaxy/coop_mods.h`, `galaxy/coop_session.h`), as sm64coopdx's
 
 Nebula's in-game settings menu (F1, the pause menu's Settings) keeps its pages, but ADVANCED becomes **ONLINE**:
 
-- **Room.** The session's settings: Player Interaction, Knockback Strength, PvP Mode, Bubble on Death, Cheats, the
-  built-in Personal Star Counter and the player list.
+- **Room.** The session's settings: Player Interaction, Knockback Strength, PvP Mode, Bubble on Death, Cheats and
+  the player list.
   The host changes them for everyone, like sm64coopdx's in-game host settings; other players see them.
 - **No Leave game.** The way out of an online game is the game's own: the pause menu's Quit (in the Observatory, or
   before it opens) returns to the main menu, and back there the session ends (the host closes the room, a joiner
@@ -308,8 +308,9 @@ packets. It has no physics or state machine of its own. It collides with the loc
   the list instead of pausing, and Plus (Start) pauses. Each player tells the room where it plays as that changes
   (the session's own message, sent with the room to who joins later), so the list has every player's place before
   remote players exist; the game names the galaxy and star in the played language (`NebulaPlayerList`,
-  `coop_list`). The round trip to each player shows beside them, and the Power Stars they got in the room before it
-  while the room plays the [Personal Star Counter](#personal-star-counter).
+  `coop_list`). The round trip to each player shows beside them, and before it what a mod sets for them
+  (`coop.set_description`): the Power Stars they got in the room while the room plays the
+  [Personal Star Counter](#personal-star-counter).
 
 ## Chat
 
@@ -340,7 +341,7 @@ options and the room's players' names (each Tab the next match), and a player's 
 | `/permban NAME\|NUMBER` | the host | removes them and refuses them in every room this player hosts |
 | `/moderator NAME\|NUMBER` | the host | lets them `/kick` and `/ban`, in every room this player hosts |
 | `/confirm` | whoever was asked | the four above ask first; `/confirm` does it, any other line drops the question |
-| `/psc [on\|off]` | everyone, in a room made with the Personal Star Counter | shows or hides the counter for this player |
+| `/psc [on\|off]` | everyone, in a room playing the Personal Star Counter | shows or hides its HUD counts for this player |
 | `/tp`, `/teleport` | everyone (themselves), the host and moderators (anyone), only with cheats on | Minecraft's teleport, below |
 | `/pos` | everyone, only with cheats on | where this player is, for `/tp` |
 
@@ -366,9 +367,11 @@ options and the room's players' names (each Tab the next match), and a player's 
   against its own list of moderators. Who is a moderator travels with the player's info (session protocol 7).
 - **Adding one.** A feature registers its own command, as a sm64coopdx mod does: `Chat::commands().add(name,
   description, handler)` (`galaxy/coop_commands.h`); a `[On|Off]` in the description are the options Tab offers.
-  Nebula's mods (Riivolution patches, files) run no code, so the commands are Nebula's own features': the Personal
-  Star Counter's `/psc [on|off]` (the host's `host_main.cpp`) is there only in a room made with the mod (a room's mods
-  never change while it is open), and shows or hides the counter for this player alone, as sm64coopdx's mod does.
+  A co-op mod adds its own as luma.json rows (a layer's `"commands"`: name, description, options), as sm64coopdx's
+  `hook_chat_command`: the host registers each enabled mod's (`add_mod_command`), shown only in a room, and a typed
+  one reaches the mod's scripts as the `chat_command` event (`NEBULA_MOD_EVENT_COOP_COMMAND`: the word's place in the
+  options, 0 for none, and the command), which the game takes with `coop_command_take`. A command the game has, or an
+  earlier mod's, keeps its name. The built-in Personal Star Counter's `/psc [on|off]` is one.
 - **The game.** The host's `coop_chat` gives a command's words as `NEBULA_COOP_CHAT_NOTICE` lines (game API 121):
   a `CoopCmd...` text id with `{name}` filled in, or words as they are.
 
@@ -407,39 +410,48 @@ own numbers back (a higher, floatier jump, less grip and a long sliding brake, a
 handling, a swim spin that costs oxygen).
 
 It's made in LumaLink-coop (`builtin/character-movesets`), as a data-only `.lumacoop`: a layer's `player_constants`
-for `"luigi"`, so it's an ordinary mod. NebulaCoop carries a copy (`runtime/src/builtin_mods.inc`) and writes it into
-the mods folder at every start (`galaxy::mods::install_builtin_mods`), again when it's missing or changed. It's off
-until the player turns it on (a built-in mod with no saved choice is off), then it's in the Host page's Mods like any
-other, and joiners get it with the room's mods; it applies when Nebula starts again, as other mods do.
+for `"luigi"`, so it's an ordinary mod ([Built-in mods](#built-in-mods)).
 
 SMG did part of Luigi's moves in code (`gIsLuigi`): those are numbers of the player's table now, NebulaCoop's own after
 the game's (`mBrakeSlide`, `mSwimSpinOxygen`, 0 for everyone first), so a moveset gives them to any character.
 
+## Built-in mods
+
+NebulaCoop's own mods, as sm64coopdx has its built-in mods: Character Movesets and the Personal Star Counter. They're
+made in LumaLink-coop (`builtin/<id>`), which this repository has as its `lumalink` submodule, and LumaLink-coop
+commits each one packed too (`builtin/<id>.lumacoop`; its tests fail while a package is stale). The build embeds
+every package from the submodule (`cmake/nebula_builtin_mods.cmake`, at configure time, so it needs no LumaLink), and
+NebulaCoop writes each one's files into the mods folder at every start (`galaxy::mods::install_builtin_mods`), again
+when missing or changed. Updating one is a new submodule commit: nothing is copied by hand.
+
+A built-in mod is off until the player turns it on (a built-in mod with no saved choice is off), then it's in the Host
+page's Mods like any other, and joiners get it with the room's mods; it applies when Nebula starts again, as other
+mods do.
+
 ## Personal Star Counter
 
-sm64coopdx's Personal Star Counter mod (`personal-starcount-ex.lua`), built in. Galaxy's HUD shows the save's Power
-Stars when the player stands still (`StarCounter`, with the coins and Star Bits); two more counters come in under it
-with it, the same layout with the star tinted as the mod's (`NebulaStarCounter`, from `CounterLayoutController`):
+sm64coopdx's Personal Star Counter mod (`personal-starcount-ex.lua`), as a built-in LumaScript mod
+(`builtin/personal-star-counter`, [Built-in mods](#built-in-mods)). Galaxy's HUD shows the save's Power Stars when the
+player stands still (`StarCounter`, with the coins and Star Bits); the mod puts two more counters under it, the same
+layout with the star tinted (`nebula.hud_counter`, drawn by `NebulaHudCounter` from `CounterLayoutController`):
 
-- **Red: this room's.** The Power Stars this player got since they hosted or joined. Only in a room.
+- **Red: this room's.** The Power Stars this player got since they hosted or joined (`coop.stars(coop.me())`). Only
+  in a room.
 - **Green: every one.** All the Power Stars this player ever got, kept across saves with Nebula's other all-time
-  counts (`power_stars` in `stats.ini`); the achievement board's stats page lists it too.
+  counts (`nebula.stat("power_stars")`, from `stats.ini`); the achievement board's stats page lists it too.
 
-It's a mod, as in sm64coopdx: a room plays it only when its host turns it on, and it's off by default. Being built
-in, it has nothing to download and needs no restart: it's the last row of the Host page's Mods (and counts with the
-mods on there), and the Online tab's Room has it too, so the host can turn it on or off during a game. It's a room
-setting (`coop_star_counter=1` in `runtime_settings.ini`), sent with the room's other settings, so every player has
-the host's. The game asks with `NEBULA_OPTION_STAR_COUNTER` as the counters come in and once a second while they
-show, so they go at once when the host turns it off; the player list shows the stars only while it's on
-(`NEBULA_COOP_LIST_STARS`).
+The player list shows each player's room count beside their round trip (`coop.set_description`, as the mod's
+`network_player_set_description`), and `/psc [on|off]` shows or hides the HUD counts for this player (`/psc` alone
+turns them over). It's off by default, as in sm64coopdx: a room plays it when its host turns it on in Mods, and like
+any mod it applies when Nebula starts again.
 
-As in the mod, a star counts only when it's new to the save (the mod counts when the save's star count goes up), so a
-star the room already has counts for nobody again; a Grand Star counts too. The host counts them, as it decides the
-save ([Shared world state](#shared-world-state)): a Power Star a player's game puts in its save comes to the host's
+The mod only shows the counts; the game keeps them, whether a room plays the mod or not. As in the mod, a star counts
+only when it's new to the save (the mod counts when the save's star count goes up), so a star the room already has
+counts for nobody again; a Grand Star counts too. The host counts them, as it decides the save
+([Shared world state](#shared-world-state)): a Power Star a player's game puts in its save comes to the host's
 `galaxy::coop::World`, and one that is news to the session's save counts for the player who sent it
 (`Session::credit_star`). The host tells everyone the new count (a session message of ten bytes, only as a count
-changes) and sends everyone's with the room to who joins later; the game reads its own with `coop_star_count`. The
-player list shows each player's beside their round trip, as the mod puts it in sm64coopdx's player list. The green
+changes) and sends everyone's with the room to who joins later; the game reads it with `coop_star_count`. The green
 count is this player's game's own (`NebulaAchievements::onStarGet`, as a star new to its save starts its get sequence).
 
 ## Cutscenes and transitions

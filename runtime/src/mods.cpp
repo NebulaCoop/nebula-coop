@@ -1004,14 +1004,17 @@ void set_mods_folder(const std::filesystem::path& folder, const std::filesystem:
 
 namespace {
 
-struct BuiltinMod {
-    const char* id;
-    const char* manifest;  // luma.json, after a line break
+// A file of a built-in mod's package: the mod's id (its folder in the mods folder), the file's path in the package.
+struct BuiltinFile {
+    const char* mod;
+    const char* path;
+    std::size_t size;
+    const unsigned char* bytes;
 };
 
-constexpr BuiltinMod kBuiltinMods[] = {
-#include "builtin_mods.inc"
-};
+// Every file of LumaLink-coop's packed built-in mods (lumalink/builtin/<id>.lumacoop), written at configure time by
+// cmake/nebula_builtin_mods.cmake.
+#include "nebula_builtin_mods.inc"
 
 }  // namespace
 
@@ -1019,9 +1022,9 @@ bool install_builtin_mods() {
     const fs::path folder = mods_folder();
     if (folder.empty()) return false;
     bool all = true;
-    for (const BuiltinMod& mod : kBuiltinMods) {
-        const std::string_view text = std::string_view(mod.manifest).substr(1u);
-        const fs::path file = folder / mod.id / "luma.json";
+    for (const BuiltinFile& entry : kBuiltinFiles) {
+        const std::string_view text(reinterpret_cast<const char*>(entry.bytes), entry.size);
+        const fs::path file = folder / entry.mod / fs::path(from_utf8(entry.path));
         std::ifstream in(file, std::ios::binary);
         const std::string have{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
         in.close();
@@ -1029,7 +1032,7 @@ bool install_builtin_mods() {
         std::error_code error;
         fs::create_directories(file.parent_path(), error);
         if (!io::write_file_atomically(file, text)) {
-            std::fprintf(stderr, "[mods] the built-in mod %s could not be written: %s\n", mod.id, galaxy::path_text(file).c_str());
+            std::fprintf(stderr, "[mods] the built-in mod %s could not be written: %s\n", entry.mod, galaxy::path_text(file).c_str());
             all = false;
         }
     }
@@ -1037,8 +1040,8 @@ bool install_builtin_mods() {
 }
 
 bool is_builtin_mod(std::string_view id) {
-    for (const BuiltinMod& mod : kBuiltinMods) {
-        if (id == mod.id) return true;
+    for (const BuiltinFile& entry : kBuiltinFiles) {
+        if (id == entry.mod) return true;
     }
     return false;
 }
@@ -1954,6 +1957,9 @@ ModPlan plan_mod_changes(const galaxy::assets::AssetStore& store, const std::str
                 }
                 for (const std::string& script : layer.scripts) {
                     plan.rows.mod_scripts.push_back({mod.id, mod.luma->version, script});
+                }
+                for (const luma::Command& command : layer.commands) {
+                    plan.rows.chat_commands.push_back({mod.id, command.name, command.description, command.options});
                 }
                 for (const auto& [material, file] : layer.materials) {
                     plan.materials.push_back({material, mod.path / fs::path(from_utf8(file))});

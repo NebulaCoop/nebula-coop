@@ -3027,45 +3027,45 @@ int32_t svc_coop_menu(void*, uint32_t what) {
     }
 }
 
-// /psc off hid the Personal Star Counter for this player (sm64coopdx's mod keeps its own the same way): until /psc on,
-// or Nebula starts again.
-std::atomic<bool> gCoopStarCounterHidden{false};
+// The mods' chat commands (luma.json "commands", sm64coopdx's hook_chat_command) this player typed, for the game's
+// next coop_command_take: each one's name and its word's place.
+std::mutex gModCommandLock;
+std::deque<std::pair<std::string, int32_t>> gModCommandsWaiting;
 
-// The room's built-in Personal Star Counter mod (the Host page's Mods, the Online tab): the room's as the host set it,
-// else this player's as they last hosted; never while this player hid it.
-bool coop_star_counter_on() {
-    if (gCoopStarCounterHidden) return false;
-    const galaxy::coop::SessionState state = gCoopSession.state();
-    if (state == galaxy::coop::SessionState::Hosting || state == galaxy::coop::SessionState::Joined) {
-        return gCoopSession.room().star_counter;
+// The mods on at the start's commands, on the chat's: shown in a room, each sent to the mods' scripts (chat_command).
+void add_mod_chat_commands() {
+    const auto in_room = [] {
+        const galaxy::coop::SessionState state = gCoopSession.state();
+        return state == galaxy::coop::SessionState::Hosting || state == galaxy::coop::SessionState::Joined;
+    };
+    for (const galaxy::mods::ChatCommandToAdd& row : gModRows.chat_commands) {
+        const bool added = galaxy::coop::add_mod_command(
+            gCoopChat.commands(), row.name, row.description, row.options,
+            [](const std::string& name, int word) {
+                const std::lock_guard<std::mutex> lock(gModCommandLock);
+                // Never more than a few: one typed line is one command, and the game takes them each frame.
+                if (gModCommandsWaiting.size() < 16u) gModCommandsWaiting.emplace_back(name, static_cast<int32_t>(word));
+            },
+            in_room);
+        if (!added) std::fprintf(stderr, "[mods] %s: the chat command /%s is taken or not a name\n", row.mod_id.c_str(), row.name.c_str());
     }
-    return galaxy::get_runtime_settings().coop.star_counter;
 }
 
-// /psc [on|off] (sm64coopdx's Personal Star Counter mod's command): shows or hides the counter for this player. Only in
-// a room made with the mod (a room's mods never change while it's open); without a word, it flips it.
-void add_coop_star_counter_command() {
-    const auto in_room_with_it = [] {
-        const galaxy::coop::SessionState state = gCoopSession.state();
-        return (state == galaxy::coop::SessionState::Hosting || state == galaxy::coop::SessionState::Joined) &&
-               gCoopSession.room().star_counter;
-    };
-    galaxy::coop::ChatCommand psc;
-    psc.name = "psc";
-    psc.help = "CoopCmdPscHelp";
-    psc.options = {"on", "off"};
-    psc.shown = in_room_with_it;
-    psc.run = [in_room_with_it](std::string_view words) {
-        if (!in_room_with_it()) return false;
-        std::string word(words);
-        for (char& c : word) c = c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
-        if (!word.empty() && word != "on" && word != "off") return false;
-        const bool on = word.empty() ? gCoopStarCounterHidden.load() : word == "on";
-        gCoopStarCounterHidden = !on;
-        gCoopChat.say(on ? "CoopCmdPscOn" : "CoopCmdPscOff");
-        return true;
-    };
-    (void)gCoopChat.commands().add(std::move(psc));
+int svc_coop_command_take(void*, char* command, uint32_t capacity, int32_t* word) {
+    if (command == nullptr || capacity == 0u || word == nullptr) return 0;
+    const std::lock_guard<std::mutex> lock(gModCommandLock);
+    if (gModCommandsWaiting.empty()) return 0;
+    std::snprintf(command, capacity, "%s", gModCommandsWaiting.front().first.c_str());
+    *word = gModCommandsWaiting.front().second;
+    gModCommandsWaiting.pop_front();
+    return 1;
+}
+
+void svc_coop_chat_say(void*, const char* utf8) {
+    if (utf8 == nullptr || utf8[0] == '\0') return;
+    const galaxy::coop::SessionState state = gCoopSession.state();
+    if (state != galaxy::coop::SessionState::Hosting && state != galaxy::coop::SessionState::Joined) return;
+    gCoopChat.say(std::string(utf8));
 }
 
 // A teleport the cheat commands asked for (galaxy/coop_teleport.h), for the game's next coop_world_take.
@@ -3109,7 +3109,6 @@ uint32_t svc_coop_list(void*, NebulaCoopListPlayer* players, uint32_t capacity, 
     const std::vector<galaxy::coop::SessionPlayer> list = gCoopSession.players();
     const galaxy::RuntimeCoopSettings room = gCoopSession.room();
     if (room_size != nullptr) *room_size = room.max_players;
-    const bool stars = room.star_counter;
     const std::size_t count = std::min<std::size_t>(list.size(), players != nullptr ? capacity : 0u);
     for (std::size_t i = 0; i < count; ++i) {
         const galaxy::coop::SessionPlayer& from = list[i];
@@ -3122,8 +3121,7 @@ uint32_t svc_coop_list(void*, NebulaCoopListPlayer* players, uint32_t capacity, 
         to.ping_ms = from.ping_ms;
         to.stars = from.stars;
         to.flags = (from.character == galaxy::CoopCharacter::Luigi ? NEBULA_COOP_LIST_LUIGI : 0u) |
-                   (from.host ? NEBULA_COOP_LIST_HOST : 0u) | (from.local ? NEBULA_COOP_LIST_YOU : 0u) |
-                   (stars ? NEBULA_COOP_LIST_STARS : 0u);
+                   (from.host ? NEBULA_COOP_LIST_HOST : 0u) | (from.local ? NEBULA_COOP_LIST_YOU : 0u);
         std::snprintf(to.character, sizeof(to.character), "%s", from.character_id.c_str());
     }
     return static_cast<uint32_t>(list.size());
@@ -4065,8 +4063,6 @@ uint32_t svc_option(void*, uint32_t what) {
 #else
         return 0;
 #endif
-    case NEBULA_OPTION_STAR_COUNTER:
-        return coop_star_counter_on() ? 1u : 0u;
     case NEBULA_OPTION_PREPARE_KIND:
         return gModsPreparing.load(std::memory_order_acquire) != 0u ? 1u : 2u;
     case NEBULA_OPTION_PREPARATION: {
@@ -5924,8 +5920,8 @@ int main(int argc, char** argv) {
     services.coop_chat = svc_coop_chat;
     gCoopChat.attach(gCoopSession);
     galaxy::coop::add_room_commands(gCoopChat, gCoopSession);
-    add_coop_star_counter_command();
     add_coop_cheat_commands();
+    add_mod_chat_commands();
     services.coop_list = svc_coop_list;
     services.coop_remote = svc_coop_remote;
     services.coop_world_report = svc_coop_world_report;
@@ -5935,6 +5931,8 @@ int main(int argc, char** argv) {
     services.coop_achievement_take = svc_coop_achievement_take;
     services.coop_popup_take = svc_coop_popup_take;
     services.coop_character_wanted = svc_coop_character_wanted;
+    services.coop_command_take = svc_coop_command_take;
+    services.coop_chat_say = svc_coop_chat_say;
     services.coop_objects_report = svc_coop_objects_report;
     services.coop_objects_take = svc_coop_objects_take;
 #if defined(NEBULA_HOST_RENDERER)

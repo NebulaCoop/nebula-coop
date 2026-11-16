@@ -153,6 +153,14 @@ struct ModScriptToAdd {
     std::string script;
 };
 
+// A chat command the mod's scripts answer (luma::Command), for the mod that adds it.
+struct ChatCommandToAdd {
+    std::string mod_id;
+    std::string name;
+    std::string description;
+    std::vector<std::string> options;
+};
+
 // An object a script runs (luma::ScriptObject), for the mod that adds it.
 struct ScriptObjectToAdd {
     std::string mod_id;
@@ -203,12 +211,13 @@ struct ModRows {
     std::vector<FormToAdd> forms;
     std::vector<ScriptObjectToAdd> script_objects;
     std::vector<ModScriptToAdd> mod_scripts;
+    std::vector<ChatCommandToAdd> chat_commands;
     std::vector<SoundEffectToAdd> sound_effects;
     std::vector<PlayerAnimationToAdd> player_animations;
     std::vector<AchievementToAdd> achievements;
     std::map<std::string, std::string> story;
 
-    [[nodiscard]] bool empty() const noexcept { return achievements.empty() && story.empty() && sound_effects.empty() && player_animations.empty() && stage_rules.empty() && characters.empty() && player_constants.empty() && tunables.empty() && object_classes.empty() && forms.empty() && script_objects.empty() && mod_scripts.empty() && object_changes.empty() && comet_limits.empty() && galaxies.empty() && music.empty() && texts.empty() && event_flags.empty() && comets.empty(); }
+    [[nodiscard]] bool empty() const noexcept { return achievements.empty() && story.empty() && sound_effects.empty() && player_animations.empty() && stage_rules.empty() && characters.empty() && player_constants.empty() && tunables.empty() && object_classes.empty() && forms.empty() && script_objects.empty() && mod_scripts.empty() && chat_commands.empty() && object_changes.empty() && comet_limits.empty() && galaxies.empty() && music.empty() && texts.empty() && event_flags.empty() && comets.empty(); }
 };
 
 // Starts the plugins and returns how many started. `game_api` is the game module's nebula_game_mod_api(); `find_symbol`

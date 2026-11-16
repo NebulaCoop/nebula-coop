@@ -2,7 +2,7 @@
 
 Every game function a script or plugin calls by name, generated from the game's headers (tools/lumacore). Letters: a none, b bool, c int, d float, e vec3, g text, h handle (an object, a sensor...); an upper-case letter is a value that comes back after the result (pass one in, or none for zero).
 
-3552 functions.
+3577 functions.
 
 | Name | Takes | Gives |
 |---|---|---|
@@ -3399,6 +3399,22 @@ Every game function a script or plugin calls by name, generated from the game's 
 | `PartsModel::makeActorDead` | h self (PartsModel) |  |
 | `PartsModel::movement` | h self (PartsModel) |  |
 | `PartsModel::offFixedPosNormalizeScale` | h self (PartsModel) |  |
+| `coop.character` | c index | c |
+| `coop.character_id` | c index | g |
+| `coop.chat_say` | g utf8 |  |
+| `coop.connected` | c index | c |
+| `coop.count` |  | c |
+| `coop.in_room` |  | c |
+| `coop.is_host` |  | c |
+| `coop.max_players` |  | c |
+| `coop.me` |  | c |
+| `coop.mission` | c index | c |
+| `coop.name` | c index | g |
+| `coop.ping` | c index | c |
+| `coop.same_place` | c index | c |
+| `coop.set_description` | c index, g utf8, c rgba |  |
+| `coop.stage` | c index | g |
+| `coop.stars` | c index | c |
 | `nebula.actor_name` | h actor | g |
 | `nebula.actor_placed_name` | h actor | g |
 | `nebula.add_hungry_luma` | g galaxy, c slot, c star_bits | c |
@@ -3417,6 +3433,11 @@ Every game function a script or plugin calls by name, generated from the game's 
 | `nebula.camera_position` | E xyz |  |
 | `nebula.camera_target` | E xyz |  |
 | `nebula.change_stage` | g galaxy, c mission |  |
+| `nebula.character_count` |  | c |
+| `nebula.character_find` | g id | c |
+| `nebula.character_id` | c index | g |
+| `nebula.character_like` | c index | c |
+| `nebula.character_name` | c index | g |
 | `nebula.circle_wipe` | c open, c frames | c |
 | `nebula.declare_item` | h actor, c what, c count |  |
 | `nebula.distance_to_player` | h actor | d |
@@ -3446,6 +3467,7 @@ Every game function a script or plugin calls by name, generated from the game's 
 | `nebula.has_switch` | h actor, c which | c |
 | `nebula.hide_message` |  |  |
 | `nebula.hit_player` | h actor, c how | c |
+| `nebula.hud_counter` | c line, c rgba, c number | c |
 | `nebula.is_animation_done` | h actor | c |
 | `nebula.is_cutscene_playing` |  | c |
 | `nebula.is_dead` | h actor | c |
@@ -3485,6 +3507,7 @@ Every game function a script or plugin calls by name, generated from the game's 
 | `nebula.play_music` | g name | c |
 | `nebula.play_system_sound` | g name |  |
 | `nebula.player` |  | h |
+| `nebula.player_character` |  | c |
 | `nebula.player_constant` | c character, g name, c index | d |
 | `nebula.player_front` | E xyz |  |
 | `nebula.pointer` | J xy | c |
@@ -3513,6 +3536,7 @@ Every game function a script or plugin calls by name, generated from the game's 
 | `nebula.set_nerve` | h actor, g nerve | c |
 | `nebula.set_object_change` | c where, g object, g becomes | c |
 | `nebula.set_player_character` | c luigi | c |
+| `nebula.set_player_character_id` | g id | c |
 | `nebula.set_player_constant` | c character, g name, c index, d value | c |
 | `nebula.set_player_control` | c on |  |
 | `nebula.set_position` | h actor, e xyz |  |
@@ -3539,6 +3563,7 @@ Every game function a script or plugin calls by name, generated from the game's 
 | `nebula.stars_won_in_galaxy` | g galaxy | c |
 | `nebula.start_camera` | g name, c frames |  |
 | `nebula.start_cutscene` | h actor, g name | c |
+| `nebula.stat` | g name | c |
 | `nebula.state` | h actor | c |
 | `nebula.state_frames` | h actor | c |
 | `nebula.step_game` | c steps |  |
@@ -3902,6 +3927,7 @@ What the toolkit cannot offer yet, and why.
 | `nebula.actor_data` | result type void* |
 | `nebula.actor_value` | result type NebulaValue |
 | `nebula.actors_near` | parameter type NebulaActor** |
+| `nebula.add_character` | only while plugins start |
 | `nebula.add_form` | only while plugins start |
 | `nebula.add_galaxy` | only while plugins start |
 | `nebula.add_mod_script` | starts a script (luma.json "scripts" does) |

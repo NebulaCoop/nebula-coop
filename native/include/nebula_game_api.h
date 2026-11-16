@@ -461,7 +461,7 @@ typedef struct NebulaCoopListPlayer {
     uint32_t number;   /* 1 the host, then 2, 3... as they joined */
     uint32_t ping_ms;  /* the round trip to them, 0 for this player or when unknown */
     uint32_t flags;    /* NEBULA_COOP_LIST_* */
-    uint32_t stars;    /* the Power Stars they got in this room, new to its save (coop_star_count) */
+    uint32_t stars;    /* the Power Stars they got in this room, new to its save (coop_star_count; mods' coop_stars) */
     char character[32]; /* the character they play (NebulaCoopPlayer's `character`), its base NEBULA_COOP_LIST_LUIGI's */
 } NebulaCoopListPlayer;
 
@@ -469,7 +469,6 @@ enum {
     NEBULA_COOP_LIST_LUIGI = 1u << 0, /* plays Luigi */
     NEBULA_COOP_LIST_HOST = 1u << 1,  /* the room's host */
     NEBULA_COOP_LIST_YOU = 1u << 2,   /* this player */
-    NEBULA_COOP_LIST_STARS = 1u << 3, /* the room plays the Personal Star Counter: `stars` shows */
 };
 
 /* Online co-op's shared world (coop_world_report and coop_world_take, docs/COOP_PLAN.md "Shared world state"): the
@@ -592,8 +591,6 @@ enum {
     NEBULA_OPTION_DIAGNOSE_SCENE_LOADS, /* --diagnostics scene-loads: 1 logs what each scene change loads */
     NEBULA_OPTION_TOUCH_POINTER,       /* 0 no touch screen, 1 one, 2 the finger has the pointer, 3 and the game is on a
                                           menu: no pointer shows under a finger there */
-    NEBULA_OPTION_STAR_COUNTER,        /* 1 while the room plays the built-in Personal Star Counter mod (the host's
-                                          choice, off by default): NebulaStarCounter's two counters show on the HUD */
 };
 
 /* The movie player's sound (movie_audio_control). */
@@ -1247,9 +1244,9 @@ typedef struct NebulaHostServices {
        Called on the simulation thread. */
     void (*coop_world_report)(void* user, const NebulaCoopWorldEvent* event);
     uint32_t (*coop_world_take)(void* user, NebulaCoopWorldEvent* events, uint32_t capacity);
-    /* Online co-op's Personal Star Counter: the Power Stars the local player got in this room, new to its save (the
-       host counts each star coop_world_report brings it for who got it), or -1 when there is no room. Called on the
-       simulation thread. */
+    /* Online co-op: the Power Stars the local player got in this room, new to its save (the host counts each star
+       coop_world_report brings it for who got it; the Personal Star Counter mod's red count), or -1 when there is no
+       room. Called on the simulation thread. */
     int32_t (*coop_star_count)(void* user);
     /* The room's player collision and bubble options (NebulaCoopRules): non-solid, no bubbles outside a room. Called on the simulation
        thread, each game scene frame. */
@@ -1271,6 +1268,13 @@ typedef struct NebulaHostServices {
        bytes into `id`; its base is NEBULA_COOP_MENU_CHARACTER's. The game plays a mod's only while it runs that mod's
        character (NebulaCharacters), else the base. Called on the simulation thread. */
     void (*coop_character_wanted)(void* user, char* id, uint32_t capacity);
+    /* Online co-op: a mod's chat command this player typed (luma.json "commands"), oldest first: 1 with the command's
+       name (at most `capacity` bytes into `command`) and its word's place in its options (1 the first, 0 none) in
+       `word`; 0 when none waits. Called on the simulation thread, each frame. */
+    int (*coop_command_take)(void* user, char* command, uint32_t capacity, int32_t* word);
+    /* Online co-op: a mod's line in the chat for this player alone (the mod API's coop_chat_say). Called on the
+       simulation thread. */
+    void (*coop_chat_say)(void* user, const char* utf8);
 } NebulaHostServices;
 
 

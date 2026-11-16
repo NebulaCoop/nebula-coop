@@ -69,6 +69,32 @@ bool Commands::add(ChatCommand command) {
     return true;
 }
 
+bool add_mod_command(Commands& commands, std::string name, std::string description, std::vector<std::string> options,
+                     std::function<void(const std::string& name, int word)> send, std::function<bool()> shown) {
+    if (!send) return false;
+    ChatCommand command;
+    command.name = name;
+    command.help = std::move(description);
+    command.options = options.empty() ? Commands::options_in(command.help) : std::move(options);
+    command.shown = std::move(shown);
+    command.run = [name = std::move(name), options = command.options, send = std::move(send)](std::string_view words) {
+        while (!words.empty() && words.front() == ' ') words.remove_prefix(1u);
+        while (!words.empty() && words.back() == ' ') words.remove_suffix(1u);
+        if (words.empty()) {
+            send(name, 0);
+            return true;
+        }
+        for (std::size_t i = 0; i < options.size(); ++i) {
+            if (same(words, options[i])) {
+                send(name, static_cast<int>(i) + 1);
+                return true;
+            }
+        }
+        return false;
+    };
+    return commands.add(std::move(command));
+}
+
 bool Commands::describe(std::string_view name, std::string_view description) {
     const std::lock_guard<std::mutex> lock(lock_);
     for (ChatCommand& command : commands_) {

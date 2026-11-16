@@ -78,7 +78,6 @@ void write_room(ByteWriter& out, const RuntimeCoopSettings& room) {
         .u8(static_cast<std::uint8_t>(room.pvp_mode))
         .u8(room.cheats ? 1u : 0u)
         .u8(static_cast<std::uint8_t>(room.max_players))
-        .u8(room.star_counter ? 1u : 0u)
         .u8(room.bubble_death ? 1u : 0u);
 }
 
@@ -90,7 +89,6 @@ void read_room(ByteReader& in, RuntimeCoopSettings& room) {
     room.pvp_mode = static_cast<CoopPvpMode>(std::min<unsigned>(in.u8(), 1u));
     room.cheats = in.u8() != 0u;
     room.max_players = std::clamp<unsigned>(in.u8(), 2u, kCoopMaxPlayersLimit);
-    room.star_counter = in.u8() != 0u;
     room.bubble_death = in.u8() != 0u;
 }
 
@@ -1194,7 +1192,6 @@ void Session::set_room(const RuntimeCoopSettings& room) {
     next.knockback_strength = room.knockback_strength;
     next.pvp_mode = room.pvp_mode;
     next.cheats = room.cheats;
-    next.star_counter = room.star_counter;
     next.bubble_death = room.bubble_death;
     next.max_players = max_players;
     if (next == state_->room) return;

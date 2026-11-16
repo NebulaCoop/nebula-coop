@@ -263,10 +263,6 @@ void MainMenu::show(Screen screen, unsigned row) {
     read_mods();
 }
 
-unsigned MainMenu::star_counter_row() const {
-    return static_cast<unsigned>(std::max<std::size_t>(mods_.size(), 1u));
-}
-
 void MainMenu::read_mods() {
     mods_read_ = mods_source_ ? mods_source_() : std::vector<RoomMod>{};
     // The ones on first, in their order; the others after them.
@@ -278,7 +274,7 @@ unsigned MainMenu::row_count() const {
     switch (screen_) {
     case Screen::Main: return MainRowCount;
     case Screen::Host: return HostRowCount;
-    case Screen::Mods: return star_counter_row() + 2u;
+    case Screen::Mods: return static_cast<unsigned>(std::max<std::size_t>(mods_.size(), 1u)) + 1u;
     case Screen::Join: return JoinRowCount;
     case Screen::Joining: return JoiningRowCount;
     case Screen::Rooms: return static_cast<unsigned>(std::max<std::size_t>(rooms_.size(), 1u)) + 1u;
@@ -375,7 +371,7 @@ std::vector<MenuRow> MainMenu::rows() const {
                            false, true};
         rows[RowCheats] = {"CHEATS", coop.cheats ? "ON" : "OFF",
                            "ON: EVERYONE IN THE ROOM MAY USE THE ONLINE TAB'S CHEATS", false, true};
-        const unsigned on = mods_on(mods_) + (coop.star_counter ? 1u : 0u);
+        const unsigned on = mods_on(mods_);
         rows[RowMods] = {"MODS", on == 0u ? "NONE" : std::to_string(on) + " ON",
                          "THE MODS THE ROOM PLAYS WITH. PLAYERS WHO JOIN GET THEM FROM YOU", true};
         rows[RowStart] = {"HOST", "HOST",
@@ -402,11 +398,6 @@ std::vector<MenuRow> MainMenu::rows() const {
         if (mods_.empty()) {
             rows.push_back({"NO MODS YET", {}, "IMPORT MODS IN OPTIONS, ON THE MODS PAGE"});
         }
-        // Nebula's own mods, after the folder's: nothing to download, and they apply without a restart.
-        rows.push_back({"PERSONAL STAR COUNTER", room_.star_counter ? "ON" : "OFF",
-                        "BUILT IN: EACH PLAYER'S STARS IN THIS ROOM (RED) AND EVER (GREEN) UNDER THE STAR COUNT, AND "
-                        "IN THE PLAYER LIST",
-                        false, true});
         rows.push_back({"", "DONE", "BACK TO THE HOST PAGE. NEW MODS APPLY WHEN NEBULA STARTS AGAIN, WHICH HOST DOES",
                         true});
         return rows;
@@ -604,9 +595,6 @@ void MainMenu::change(int delta) {
         // Off to on and back: left and right both turn it over, as a click does.
         toggle_mod(selected_);
         return;
-    } else if (screen_ == Screen::Mods && selected_ == star_counter_row()) {
-        room_.star_counter = !room_.star_counter;
-        return;
     }
     const unsigned count = button_count(selected_);
     if (count < 2u) return;
@@ -658,10 +646,6 @@ void MainMenu::press(unsigned button) {
     }
     if (screen_ == Screen::Mods && selected_ < mods_.size()) {
         toggle_mod(selected_);
-        return;
-    }
-    if (screen_ == Screen::Mods && selected_ == star_counter_row()) {
-        room_.star_counter = !room_.star_counter;
         return;
     }
     if (screen_ == Screen::Rooms && selected_ + 1u < row_count()) {
@@ -861,8 +845,6 @@ void MainMenu::reset() {
     if (screen_ == Screen::Mods) {
         if (selected_ < mods_.size() && mods_[selected_].on) {
             toggle_mod(selected_);
-        } else if (selected_ == star_counter_row()) {
-            room_.star_counter = defaults.star_counter;
         }
         return;
     }

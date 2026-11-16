@@ -13,6 +13,11 @@ and docs/modding/TOOLKIT.md, FIELDS.md and CLASSES.md (every row, and what was l
 defines inline) is left out, so the toolkit never names a symbol the game lacks. Without it, every declared function
 is offered (a missing one then fails the link, which names it).
 
+--api-only: only the plugin API's rows (nebula.<name> and coop.<name>, read from nebula_mod_api.h alone), put into the
+committed lumacore_toolkit.cpp, toolkit.tsv and TOOLKIT.md in place of the old ones, every other row kept as it is
+(renumbered). No clang: it runs anywhere, for a change that adds API calls. The full run (Windows, LLVM's clang) still
+writes the rest, and gives the same API rows.
+
 No build of the game runs this: the outputs are committed.
 """
 import hashlib
@@ -30,6 +35,7 @@ import gen_fields  # noqa: E402
 
 ROOT = pathlib.Path(sys.argv[1]).resolve()
 CHECK = '--check' in sys.argv
+API_ONLY = '--api-only' in sys.argv
 OBJECTS = None
 if '--objects' in sys.argv:
     OBJECTS = pathlib.Path(sys.argv[sys.argv.index('--objects') + 1])
@@ -844,8 +850,112 @@ def emit_registries(generated):
 CLASS_ROWS = []
 
 
+def finish_rows(rows):
+    """Each row's signature letters, result letter and row name (its name, as no API call is overloaded)."""
+    for r in rows:
+        r['sig'] = ''.join(LETTERS[p.kind].upper() if p.role == 'inout' else LETTERS[p.kind] for p in r['params'])
+        r['res'] = LETTERS[r['rk']] if r['rk'] else ''
+        r['row'] = r['name']
+    return rows
+
+
+def is_api_row(name):
+    return name.startswith('nebula.') or name.startswith('coop.')
+
+
+def api_only():
+    """The plugin API's rows put into the committed toolkit files in place of the old ones (--api-only)."""
+    path = OUT / 'lumacore_toolkit.cpp'
+    raw = path.read_bytes().decode('utf-8')
+    crlf = '\r\n' in raw
+    lines = raw.replace('\r\n', '\n').split('\n')
+    # The opaque handles' tags as the full run gave them, so a layout row's thunk names the same tag.
+    names_at = lines.index('    const char* const kOpaqueNames[] = {')
+    for i, line in enumerate(lines[names_at + 2:]):
+        m = re.match(r'^        "([^"]+)",$', line)
+        if not m:
+            break
+        OPAQUE[m.group(1)] = i + 1
+    known = dict(OPAQUE)
+    start = lines.index('namespace {') + 1
+    end = lines.index('}  // namespace')
+    table_at = lines.index('    const ToolkitRow kToolkitRows[] = {')
+    blocks, at = [], start
+    while at < end:
+        m = re.match(r'^    // (\S+)$', lines[at])
+        if not m or not lines[at + 1].startswith('    void lc'):
+            raise SystemExit(f'lumacore_toolkit.cpp line {at + 1}: not a thunk')
+        stop = at + 1
+        while lines[stop] != '    }':
+            stop += 1
+        blocks.append((m.group(1), lines[at:stop + 1]))
+        at = stop + 1
+    table = {}
+    for line in lines[table_at + 1:]:
+        m = re.match(r'^        \{"([^"]+)", "([^"]*)", "([^"]*)", MR::lc(\d+)\},$', line)
+        if not m:
+            break
+        table[m.group(1)] = (m.group(2), m.group(3), int(m.group(4)))
+    if len(table) != len(blocks):
+        raise SystemExit('lumacore_toolkit.cpp: its table and its thunks differ')
+    api, api_left = api_rows(enum_names())
+    if dict(OPAQUE) != known:
+        raise SystemExit('an API row takes a handle type the full run has not seen: run the full generator')
+    finish_rows(api)
+    kept = [{'row': n, 'sig': table[n][0], 'res': table[n][1], 'old': table[n][2], 'text': text}
+            for n, text in blocks if not is_api_row(n)]
+    rows = kept + [{'row': r['row'], 'sig': r['sig'], 'res': r['res'], 'api_row': r} for r in api]
+    rows.sort(key=lambda r: r['row'].encode('utf-8'))
+    body = []
+    for i, r in enumerate(rows):
+        if 'api_row' in r:
+            body += api_thunk(i, r['api_row'])
+            continue
+        old = r['old']
+        for line in r['text']:
+            line = line.replace(f'void lc{old}(', f'void lc{i}(').replace(f'lumacore::refuse({old}, ', f'lumacore::refuse({i}, ')
+            body.append(line)
+    out = lines[:start] + body + lines[end:table_at + 1]
+    out += [f'        {{"{r["row"]}", "{r["sig"]}", "{r["res"]}", MR::lc{i}}},' for i, r in enumerate(rows)]
+    after = table_at + 1 + len(table)
+    out += lines[after:]
+    out = [f'    const u32 kToolkitRowCount = {len(rows)};' if l.startswith('    const u32 kToolkitRowCount = ') else l
+           for l in out]
+    text = '\n'.join(out)
+    path.write_bytes((text.replace('\n', '\r\n') if crlf else text).encode('utf-8'))
+    (DOCS / 'toolkit.tsv').write_text(''.join(f'{r["row"]}\t{r["sig"]}\t{r["res"]}\n' for r in rows), encoding='utf-8',
+                                      newline='\n')
+    # TOOLKIT.md: its rows and its left-out rows, the API's new.
+    doc = (DOCS / 'TOOLKIT.md').read_text(encoding='utf-8').split('\n')
+    head = doc.index('| Name | Takes | Gives |')
+    left_at = doc.index('## Left out')
+    left_head = doc.index('| Name | Why |', left_at)
+    described = {}
+    for line in doc[head + 2:left_at]:
+        m = re.match(r'^\| `([^`]+)` \|', line)
+        if m:
+            described[m.group(1)] = line
+    for r in api:
+        takes = ', '.join(f"{LETTERS[p.kind].upper() if p.role == 'inout' else LETTERS[p.kind]} {p.name}{'?' if p.has_default else ''}"
+                          for p in r['params'])
+        described[r['row']] = f'| `{r["row"]}` | {takes} | {r["res"]} |'
+    names = {r['row'] for r in rows}
+    left = [l for l in doc[left_head + 2:] if l.startswith('| `') and not is_api_row(re.match(r'^\| `([^`]+)`', l).group(1))]
+    left += [f'| `{n}` | {w} |' for n, w in api_left]
+    left.sort(key=lambda l: re.match(r'^\| `([^`]+)`', l).group(1))
+    new_doc = doc[:head + 2] + [described[r['row']] for r in rows] + [''] + doc[left_at:left_head + 2] + left + ['']
+    new_doc = [f'{len(rows)} functions.' if re.match(r'^\d+ functions\.$', l) else l for l in new_doc]
+    (DOCS / 'TOOLKIT.md').write_text('\n'.join(new_doc), encoding='utf-8')
+    own, game, messages = script_events()
+    emit_events(own, game, messages)
+    print(f'toolkit {len(rows)} rows ({len(api)} of the plugin API, {len(api_left)} of it left out)')
+
+
 def main():
     global CLASS_ROWS
+    if API_ONLY:
+        api_only()
+        return
     inputs = sorted(list(INC.rglob('*.hpp')) + list(INC.rglob('*.h'))) + [NATIVE / 'include' / 'nebula_mod_api.h',
                                                                            PETARI / 'src' / 'Game' / 'System' / 'LumaHost.cpp',
                                                                            PETARI / 'src' / 'Game' / 'System' / 'LumaRegistry.cpp',

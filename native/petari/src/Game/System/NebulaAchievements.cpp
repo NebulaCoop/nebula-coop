@@ -820,4 +820,16 @@ namespace NebulaAchievements {
         }
         return NebulaHost::statGet(cStatNames[stat]) + sStatWaiting[stat];
     }
+
+    s32 findStat(const char* pName) {
+        if (pName == nullptr) {
+            return NebulaStat_Num;
+        }
+        for (s32 i = 0; i < NebulaStat_Num; i++) {
+            if (strcmp(cStatNames[i], pName) == 0) {
+                return i;
+            }
+        }
+        return NebulaStat_Num;
+    }
 };  // namespace NebulaAchievements
