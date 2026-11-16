@@ -1908,11 +1908,14 @@ std::atomic<bool> gCoopLuigi{false};
 // And its id (coop_character_wanted): a mod's character on that base, else the base's own ("mario", "luigi").
 std::mutex gCoopCharacterLock;
 std::string gCoopCharacterId = "mario";
+// And the colours (coop_palette_wanted): Options', or none for the character's own.
+std::optional<galaxy::CoopPalette> gCoopPalette;
 
 void set_coop_character_wanted(const galaxy::RuntimeCoopSettings& coop) {
     gCoopLuigi.store(coop.character == galaxy::CoopCharacter::Luigi, std::memory_order_relaxed);
     const std::lock_guard<std::mutex> lock(gCoopCharacterLock);
     gCoopCharacterId = galaxy::coop_character_id(coop);
+    gCoopPalette = galaxy::parse_coop_palette(coop.palette);
 }
 
 // The room's chat (galaxy/coop_chat.h), over the session below (which goes first, its thread giving the chat lines),
@@ -2342,16 +2345,23 @@ void pump_coop_session() {
     // The character the game plays now (its snapshot's, which changes as a switch reloads the player's spot), not
     // the one wanted: the others' nametags, list and chat follow the model they see.
     {
-        bool valid = false, luigi = false;
+        bool valid = false, luigi = false, has_palette = false;
         char character[sizeof(gCoopLocal.character)] = {};
+        galaxy::CoopPalette palette{};
         {
             const std::lock_guard<std::mutex> lock(gCoopLock);
             valid = gCoopLocalValid;
             luigi = (gCoopLocal.flags & NEBULA_COOP_PLAYER_LUIGI) != 0u;
             std::memcpy(character, gCoopLocal.character, sizeof(character));
+            has_palette = gCoopLocal.has_palette != 0u;
+            std::memcpy(palette.data(), gCoopLocal.palette, palette.size());
         }
         character[sizeof(character) - 1] = '\0';
-        if (valid) gCoopSession.set_character(luigi ? galaxy::CoopCharacter::Luigi : galaxy::CoopCharacter::Mario, character);
+        // With the colours they wear (sm64coopdx's palette), which travel with the character.
+        if (valid) {
+            gCoopSession.set_character(luigi ? galaxy::CoopCharacter::Luigi : galaxy::CoopCharacter::Mario, character,
+                                       has_palette ? &palette : nullptr);
+        }
     }
     handle_coop_session_events();
 }
@@ -2608,13 +2618,16 @@ bool poll_coop_join() {
 void keep_coop_settings() {
 #if defined(NEBULA_HOST_RENDERER)
     galaxy::RuntimeSettings settings = galaxy::get_runtime_settings();
-    // The player's name and character are Options' (its PLAYER page): the menu takes them, never gives them back.
+    // The player's name, character and colours are Options' (its PLAYER page): the menu takes them, never gives them
+    // back.
     if (gCoopMenu.room().player_name != settings.coop.player_name ||
-        gCoopMenu.room().character != settings.coop.character || gCoopMenu.room().character_id != settings.coop.character_id) {
+        gCoopMenu.room().character != settings.coop.character || gCoopMenu.room().character_id != settings.coop.character_id ||
+        gCoopMenu.room().palette != settings.coop.palette) {
         galaxy::RuntimeCoopSettings room = gCoopMenu.room();
         room.player_name = settings.coop.player_name;
         room.character = settings.coop.character;
         room.character_id = settings.coop.character_id;
+        room.palette = settings.coop.palette;
         gCoopMenu.set_room(room);
     }
     if (settings.coop == gCoopMenu.room()) return;
@@ -3125,6 +3138,8 @@ uint32_t svc_coop_list(void*, NebulaCoopListPlayer* players, uint32_t capacity, 
                    (from.host ? NEBULA_COOP_LIST_HOST : 0u) | (from.local ? NEBULA_COOP_LIST_YOU : 0u) |
                    (stars ? NEBULA_COOP_LIST_STARS : 0u);
         std::snprintf(to.character, sizeof(to.character), "%s", from.character_id.c_str());
+        to.has_palette = from.has_palette ? 1u : 0u;
+        std::memcpy(to.palette, from.palette.data(), sizeof(to.palette));
     }
     return static_cast<uint32_t>(list.size());
 }
@@ -3328,6 +3343,25 @@ void svc_coop_character_wanted(void*, char* id, uint32_t capacity) {
     std::snprintf(id, capacity, "%s", gCoopCharacterId.c_str());
 }
 
+// Options' colours for the player (its PLAYER page): 1 with them, 0 for their character's own.
+int svc_coop_palette_wanted(void*, uint8_t* palette) {
+    if (palette == nullptr) return 0;
+#if defined(NEBULA_HOST_RENDERER)
+    // Live, as the character is (svc_coop_menu): Options' PLAYER page may change them mid-game. The game asks a few
+    // times a frame, so the settings are read again at most every quarter second.
+    static std::chrono::steady_clock::time_point read{};
+    const auto now = std::chrono::steady_clock::now();
+    if (!gCoopMenu.is_open() && now - read >= std::chrono::milliseconds(250)) {
+        read = now;
+        set_coop_character_wanted(galaxy::get_runtime_settings().coop);
+    }
+#endif
+    const std::lock_guard<std::mutex> lock(gCoopCharacterLock);
+    if (!gCoopPalette) return 0;
+    std::memcpy(palette, gCoopPalette->data(), gCoopPalette->size());
+    return 1;
+}
+
 int svc_coop_popup_take(void*, NebulaCoopPopup* popup) {
     if (popup == nullptr || !gCoopSession.active()) return 0;
 #if defined(NEBULA_HOST_RENDERER)
@@ -3417,7 +3451,11 @@ uint32_t svc_coop_remote(void*, NebulaCoopRemotePlayer* players, uint32_t capaci
         // character on it by the id the session last told (the game shows the base until the two agree).
         player.flags = snapshot.flags;
         for (const galaxy::coop::SessionPlayer& in : room) {
-            if (in.id == from.id) std::snprintf(player.character, sizeof(player.character), "%s", in.character_id.c_str());
+            if (in.id != from.id) continue;
+            std::snprintf(player.character, sizeof(player.character), "%s", in.character_id.c_str());
+            // Their colours, as the session last told them.
+            player.has_palette = in.has_palette ? 1u : 0u;
+            std::memcpy(player.palette, in.palette.data(), sizeof(player.palette));
         }
         player.area = snapshot.area;
         player.platform = snapshot.platform;
@@ -5029,8 +5067,17 @@ void svc_mods_start(void*) {
             const char* id = api->character_id(i);
             const char* name = api->character_name(i);
             if (id == nullptr) continue;
-            characters.push_back({id, name != nullptr ? name : id,
-                                  api->character_like(i) == 1 ? galaxy::CoopCharacter::Luigi : galaxy::CoopCharacter::Mario});
+            galaxy::PlayableCharacter character{id, name != nullptr ? name : id,
+                                                api->character_like(i) == 1 ? galaxy::CoopCharacter::Luigi : galaxy::CoopCharacter::Mario};
+            // Its own colours, for the page's COLOURS rows.
+            for (int32_t part = 0; part < NEBULA_PALETTE_PARTS && NEBULA_MOD_API_HAS(api, character_palette_color); ++part) {
+                const int32_t rgb = api->character_palette_color(i, part);
+                if (rgb < 0) continue;
+                character.palette[static_cast<std::size_t>(part) * 3] = static_cast<std::uint8_t>(rgb >> 16);
+                character.palette[static_cast<std::size_t>(part) * 3 + 1] = static_cast<std::uint8_t>(rgb >> 8);
+                character.palette[static_cast<std::size_t>(part) * 3 + 2] = static_cast<std::uint8_t>(rgb);
+            }
+            characters.push_back(std::move(character));
         }
         galaxy::set_playable_characters(std::move(characters));
     }
@@ -5935,6 +5982,7 @@ int main(int argc, char** argv) {
     services.coop_achievement_take = svc_coop_achievement_take;
     services.coop_popup_take = svc_coop_popup_take;
     services.coop_character_wanted = svc_coop_character_wanted;
+    services.coop_palette_wanted = svc_coop_palette_wanted;
     services.coop_objects_report = svc_coop_objects_report;
     services.coop_objects_take = svc_coop_objects_take;
 #if defined(NEBULA_HOST_RENDERER)

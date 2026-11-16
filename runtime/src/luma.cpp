@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "galaxy/luma.h"
 
+#include <nebula_palette.hpp>
+
 #include <cstdio>
 
 #if defined(__APPLE__)
@@ -787,6 +789,18 @@ std::optional<Manifest> parse_manifest(std::string_view text) {
                 character.name = text_field(row, "name");
                 character.archive = text_field(row, "archive");
                 if (const std::string like = text_field(row, "like"); !like.empty()) character.like = like;
+                // {"cap": "e8b000", "emblem": "1040c0", ...}: the model's own colours (sm64coopdx's character palette).
+                if (const Value* palette = row.get("palette"); palette != nullptr) {
+                    if (palette->object() == nullptr) return std::nullopt;
+                    character.palette.assign(nebula_palette::PartCount, -1);
+                    for (const auto& [part, color] : *palette->object()) {
+                        const int index = nebula_palette::findPart(part.c_str());
+                        const std::string* text = color.string();
+                        const std::int32_t rgb = text != nullptr ? nebula_palette::parseColor(text->c_str()) : -1;
+                        if (index < 0 || rgb < 0) return std::nullopt;
+                        character.palette[static_cast<std::size_t>(index)] = rgb;
+                    }
+                }
                 const bool archive_ok = std::all_of(character.archive.begin(), character.archive.end(), [](char c) {
                     return c > ' ' && c <= '~' && c != '/' && c != '\\' && c != '.';
                 });

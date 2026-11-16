@@ -1915,7 +1915,8 @@ ModPlan plan_mod_changes(const galaxy::assets::AssetStore& store, const std::str
                     plan.rows.stage_rules.push_back({mod.id, rule.stage, rule.scenario, rule.acts_as, rule.own_rules});
                 }
                 for (const luma::Character& character : layer.characters) {
-                    plan.rows.characters.push_back({mod.id, mod.luma->version, character.id, character.name, character.like, character.archive});
+                    plan.rows.characters.push_back(
+                        {mod.id, mod.luma->version, character.id, character.name, character.like, character.archive, character.palette});
                 }
                 for (const luma::PlayerConstant& constant : layer.player_constants) {
                     float value = constant.value;
