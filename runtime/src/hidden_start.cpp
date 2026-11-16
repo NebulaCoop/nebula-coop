@@ -3,22 +3,41 @@
 #include "galaxy/hidden_start.h"
 #include "galaxy/platform_paths.h"
 
+#if defined(_WIN32)
 #include "galaxy/windows_api.h"
 #include <Shlobj.h>
-
-#include <cwchar>
+#else
+#include <pwd.h>
+#include <unistd.h>
+#endif
 
 namespace galaxy::host {
 
 std::filesystem::path player_data_folder() {
+#if defined(_WIN32)
     wchar_t local[MAX_PATH]{};
     if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, local))) {
         return {};
     }
+<<<<<<< HEAD
     return std::filesystem::path(local) / ::galaxy::kDataFolderNameWide;
+=======
+    return std::filesystem::path(local) / L"Nebula";
+#else
+    const passwd* const account = getpwuid(getuid());
+    if (account == nullptr || account->pw_dir == nullptr || account->pw_dir[0] != '/') {
+        return {};
+    }
+#if defined(__APPLE__)
+    return std::filesystem::path(account->pw_dir) / "Library" / "Application Support" / "Nebula";
+#else
+    return std::filesystem::path(account->pw_dir) / ".local" / "share" / "Nebula";
+#endif
+#endif
+>>>>>>> upstream/main
 }
 
-const char* hidden_start_error(bool hidden, int argc, const wchar_t* const* argv) {
+const char* hidden_start_error(bool hidden, int argc, const ArgChar* const* argv) {
     if (!hidden) {
         return nullptr;
     }
@@ -29,9 +48,9 @@ const char* hidden_start_error(bool hidden, int argc, const wchar_t* const* argv
     bool settings = false;
     bool crash_dumps = false;
     for (int i = 1; i + 1 < argc; ++i) {
-        const wchar_t* const name = argv[i];
-        const bool folder = std::wcscmp(name, L"--saves") == 0 || std::wcscmp(name, L"--data") == 0 ||
-                            std::wcscmp(name, L"--settings") == 0 || std::wcscmp(name, L"--crash-dumps") == 0;
+        const ArgChar* const name = argv[i];
+        const bool folder = same_arg(name, NEBULA_ARG_TEXT("--saves")) || same_arg(name, NEBULA_ARG_TEXT("--data")) ||
+                            same_arg(name, NEBULA_ARG_TEXT("--settings")) || same_arg(name, NEBULA_ARG_TEXT("--crash-dumps"));
         if (!folder) {
             continue;
         }
@@ -40,8 +59,8 @@ const char* hidden_start_error(bool hidden, int argc, const wchar_t* const* argv
             return "a hidden start names its folders (--saves, --data, --settings, --crash-dumps) absolute and away "
                    "from the player's data folder";
         }
-        settings |= std::wcscmp(name, L"--settings") == 0;
-        crash_dumps |= std::wcscmp(name, L"--crash-dumps") == 0;
+        settings |= same_arg(name, NEBULA_ARG_TEXT("--settings"));
+        crash_dumps |= same_arg(name, NEBULA_ARG_TEXT("--crash-dumps"));
     }
     if (!settings || !crash_dumps) {
         return "a hidden start names its own --settings and --crash-dumps folders";

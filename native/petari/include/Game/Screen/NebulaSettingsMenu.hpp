@@ -11,5 +11,11 @@ namespace NebulaSettingsMenu {
     bool isHoldingInput();   // open or opening or closing: the game plays on without the player's input
     bool isShown();          // drawn this frame (the pointer is drawn over it)
     void requestOpen();      // the pause menu's Settings
+<<<<<<< HEAD
     void setMainMenuActive(bool active);  // the file select shows the online co-op main menu (FileSelector)
+=======
+    // A host text (English capitals, as the host's rows give it) in the played language as the menu shows it, into pDst
+    // (at most `capacity` units with the terminator); its length. The mod log's host sentences (LumaModLog).
+    s32 translateHost(char16_t* pDst, s32 capacity, const char* pText);
+>>>>>>> upstream/main
 };  // namespace NebulaSettingsMenu

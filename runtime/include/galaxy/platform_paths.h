@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Nebula's data folder and file opening on every platform. The folder is the one --data names (launch_args.h; the
+<<<<<<< HEAD
 // Android app passes its private files folder), else %LOCALAPPDATA%\NebulaCoop on Windows (the variable, so a test's
 // private one holds everything; the shell's folder without it), ~/Library/Application Support/NebulaCoop on Apple's
 // systems, else $XDG_DATA_HOME/NebulaCoop, else ~/.local/share/NebulaCoop. NebulaCoop, not upstream Nebula's "Nebula":
 // the co-op fork keeps its own saves, settings and mods, and never touches an installed Nebula's.
+=======
+// Android app passes its private files folder), else %LOCALAPPDATA%\Nebula on Windows (the variable, so a test's
+// private one holds everything; the shell's folder without it), ~/Library/Application Support/Nebula on Apple's
+// systems, else $XDG_DATA_HOME/Nebula, else ~/.local/share/Nebula. A portable copy (Nebula Setup's portable choice:
+// portable.txt in its folder, the program in it or in versions/<version> inside it) keeps everything in its data folder.
+>>>>>>> upstream/main
 #pragma once
 
 #include "galaxy/launch_args.h"
@@ -28,14 +35,36 @@
 
 namespace galaxy {
 
+<<<<<<< HEAD
 // The data folder's name (installer/src/Common/NebulaPaths.cs, ProductName, is the same).
 inline constexpr char kDataFolderName[] = "NebulaCoop";
 inline constexpr wchar_t kDataFolderNameWide[] = L"NebulaCoop";
+=======
+[[nodiscard]] inline std::filesystem::path program_directory();
+
+// A portable copy's data folder: <copy>/data beside portable.txt; empty when this program is not in one.
+[[nodiscard]] inline std::filesystem::path portable_data_directory() {
+    const std::filesystem::path program = program_directory();
+    if (program.empty()) {
+        return {};
+    }
+    for (const std::filesystem::path& root : {program, program.parent_path().parent_path()}) {
+        std::error_code error;
+        if (!root.empty() && std::filesystem::is_regular_file(root / "portable.txt", error)) {
+            return root / "data";
+        }
+    }
+    return {};
+}
+>>>>>>> upstream/main
 
 // Empty when the platform gives no folder.
 [[nodiscard]] inline std::filesystem::path nebula_data_directory() {
     if (!launch_args().data.empty()) {
         return launch_args().data;
+    }
+    if (std::filesystem::path portable = portable_data_directory(); !portable.empty()) {
+        return portable;
     }
 #if defined(_WIN32)
     const std::wstring local = windows::environment_text(L"LOCALAPPDATA");

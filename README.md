@@ -5,6 +5,7 @@
 
 You need your own copy of the game. Not affiliated with or endorsed by Nintendo. (Please don't hurt me Nintendo.)
 
+<<<<<<< HEAD
 [Download](https://github.com/NebulaCoop/nebula-coop/releases/latest) ·
 [Playing online](#playing-online) ·
 [Building from source](docs/BUILDING.md) ·
@@ -14,15 +15,48 @@ You need your own copy of the game. Not affiliated with or endorsed by Nintendo.
 [Security](SECURITY.md) ·
 [Discord](https://discord.gg/hNbgFtaRHv) ·
 [Discord (Nebula)](https://discord.gg/2fJEdhAw2f)
+=======
+[Download](https://github.com/keepvaibin/nebula/releases/latest) ·
+[Controls](docs/using-nebula/keyboard-and-controller-controls.md) ·
+[Building from source](#building-from-source)
+>>>>>>> upstream/main
 
 ## Credits
 
+<<<<<<< HEAD
 - **[Nebula](https://github.com/keepvaibin/nebula), by [keepvaibin](https://github.com/keepvaibin).** Everything that makes the game run on a PC is Nebula's: the host, the renderers, Setup and the launcher, controller and Wii Remote support, mods, achievements and the settings menu. Nebula Co-Op follows it closely and merges its changes in regularly. ([Discord](https://discord.gg/2fJEdhAw2f))
 - **[sm64coopdx](https://github.com/coop-deluxe/sm64coopdx)** and its [CoopNet](https://github.com/coop-deluxe/coopnet) are the model for how co-op plays here: rooms, instances, player interaction, the bubble on death, chat commands, pop-ups and the Personal Star Counter. Its code is not used; only its design.
 - **[Petari](https://github.com/SMGCommunity/Petari)**, the Super Mario Galaxy decompilation by SMGCommunity, is the
   game code Nebula builds natively.
 - Other third-party code and its licenses are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) and
   [docs/PROVENANCE.md](docs/PROVENANCE.md).
+=======
+## Project status
+
+- **Released: [Nebula 1.0.2](https://github.com/keepvaibin/nebula/releases/latest).** Playable from start to finish
+  with the North American disc (RMGE01). Setup translates the game's PowerPC code to C++ and compiles it on your PC.
+- **In development: Nebula 2** (this branch). The game is built as native code from the
+  [Petari](https://github.com/SMGCommunity/Petari) decompilation, with more discs, controllers and features (below).
+  It is not released; you can build it from source. Bugs remain; see [Known issues](#known-issues).
+
+## How Nebula was made
+
+Nebula's host, renderer, installer, tests and documentation were written with AI coding agents (Anthropic's
+Claude), directed, reviewed and tested by the project's author. The game's own logic, Mario's physics included, is
+the Petari decompilation by SMGCommunity, compiled for the PC with the changes a 64-bit, little-endian host needs.
+
+## How it works
+
+Nebula 2 (this branch; 1.0.2 works differently, see [Project status](#project-status)):
+
+1. **Game module** (`native/`). Petari's game code and the engine code under it (layouts, sound, models, Miis), compiled with clang into
+   `smg_game.dll`.
+2. **Host** (`runtime/`, `native/host`). `Nebula.exe` loads the module and gives it its services:
+   typed records drawn with Direct3D 12 or Vulkan, voices mixed and played, controllers and a real Wii Remote, the
+   game's files from the store, saves, and the frame clock.
+3. **Setup and launcher** (`installer/`, C#; `crates/nebula-import`, Rust). `Nebula-Setup.exe` reads your disc
+   image, checks that it is the supported release and packs its files for Nebula; `NebulaLauncher.exe` opens the launcher and `Nebula.exe` is the game.
+>>>>>>> upstream/main
 
 ## Features
 
@@ -57,6 +91,7 @@ You need your own copy of the game. Not affiliated with or endorsed by Nintendo.
   keeps you in the room.
 - **Achievements** unlocked in a save are every player's who plays in it.
 
+<<<<<<< HEAD
 ### Room options
 
 Set on the Host page, and changed by the host from the in-game ONLINE tab:
@@ -83,14 +118,44 @@ dedicated server.
 Everything Nebula itself offers is here too: keyboard and mouse, Xbox, PlayStation, Switch and Steam controllers and
 a real Wii Remote; Direct3D 12 and Vulkan; upscalers and anti-aliasing; `.luma` mods; and more. See
 [Nebula's README](https://github.com/keepvaibin/nebula#readme) for the full list.
+=======
+- The European (RMGP01) and Japanese (RMGJ01) discs and all their languages ([Languages](#languages)).
+- The game built natively from the Petari decompilation: no compiling during install; a Vulkan renderer beside
+  Direct3D 12.
+- More controllers: PlayStation (DualShock 4, DualSense, DualSense Edge), the Steam Controller and generic HID
+  controllers; gyro pointing and tilt on any controller with motion sensors.
+- MSAA, AMD FSR 3, ambient occlusion.
+- Skippable cutscenes (+ during a cutscene) and Quit on the file select.
+- 34 achievements, each with a pop-up when it is reached. From the Gateway's Grand Star on, a Luma near Mario's start
+  in the Comet Observatory shows them all: tabs, filters and play stats.
+- Instant text speed.
+- Mii import for the file icons from a Wii, DS, 3DS, Wii U, Switch, Mii Studio or Mii Creator. Settings > GENERAL
+  > IMPORT MIIS, or put the files in the `miis` folder next to the settings; imported files are kept there and read
+  at every start.
+- Mods: one `.luma` file for a mod, on every version of the game. A mod brings files, table patches, models, textures,
+  sound, stages and code (LumaScript or C, built to native code). [LumaLink](https://github.com/keepvaibin/lumalink)
+  makes, checks, packs and runs mods and converts Riivolution mods and texture packs; the modding documentation starts
+  at [docs/modding/index.md](docs/modding/index.md). Import from Settings > MODS or drop a file on the game window. Among enabled mods the higher one wins a file or texture. Raw mods, disc files and texture packs in the `mods` folder still work.
+- Nebula's own text (its buttons, questions and achievements) in all 14 of the game's languages, changeable or
+  translatable by a mod: [docs/modding/how-tos/changing-nebulas-text.md](docs/modding/how-tos/changing-nebulas-text.md).
+- When Nebula stops, an error code ([docs/using-nebula/error-codes.md](docs/using-nebula/error-codes.md)) naming the cause and a report in
+  `%LOCALAPPDATA%\Nebula\crashes`.
+>>>>>>> upstream/main
 
 ## Requirements
 
 - Your own copy of **Super Mario Galaxy**, revision 0, as an ISO, RVZ or extracted folder: North America (RMGE01), Europe (RMGP01) or Japan (RMGJ01). Everyone in a room needs the same game build and a supported disc.
 - Windows 10 (version 1803 or newer) or Windows 11, 64-bit
+<<<<<<< HEAD
 - A GPU with Direct3D 12 support and a CPU with AVX2
 - 8 GB of RAM
 - An internet connection to play online
+=======
+- A GPU with Direct3D 12 support
+- A CPU with SSE4.2 (2.0; AVX2 CPUs run a build for them)
+- 8 GB of RAM; for 1.0.2, 16 GB of free disk space and an internet connection during installation, about 5.5 GB
+  afterwards
+>>>>>>> upstream/main
 
 ## Install
 
@@ -111,8 +176,88 @@ To leave, use the pause menu's **Quit**. Only the host's Quit saves the room's g
 
 ## Building from source
 
+<<<<<<< HEAD
 [docs/BUILDING.md](docs/BUILDING.md) covers the tools, the game module, the host, Setup and the tests. On Windows,
 [`setup.ps1`](setup.ps1) checks the tools and builds everything in one go:
+=======
+You need these tools:
+
+* CMake 3.24 or later, and Ninja
+* LLVM 21 or later, for the game module
+* Rust stable with the MSVC target, for the disc importer and LumaLink
+* The .NET 8 SDK, for Setup and the launcher
+* Visual Studio 2022 C++ tools and the Windows SDK, for the Windows host
+
+In PowerShell, run `. .\tools\enter_msvc_environment.ps1` first. CMake downloads the other dependencies when it
+configures, from pinned archives it checks by SHA-256.
+
+### Importing the game
+
+```powershell
+cargo build --release --locked -p nebula-import
+.\target\release\nebula-import.exe --key common.key identify D:\Games\SMG.rvz
+.\target\release\nebula-import.exe --key common.key import D:\Games\SMG.rvz --output D:\nebula\content
+```
+
+`identify` must report RMGE01, RMGP01 or RMGJ01. An extracted game folder works in place of the disc image. The
+content folder then holds `game.pak`.
+
+### Building the host
+
+```powershell
+cmake -S . -B build\host -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build\host --target Nebula
+```
+
+`-DNEBULA_VULKAN=ON` also builds `NebulaVk.exe`. The host is built for AVX2. For processors without AVX2,
+configure a second folder with `-DNEBULA_HOST_BASELINE=ON`: it builds `Nebula-x86-64-v2.exe`, which goes
+beside `Nebula.exe` and is started in its place on those processors.
+
+### Building the game module
+
+```powershell
+.\native\build.ps1 -Petari native\petari -Build build\game
+```
+
+This builds `build\game\smg_game.dll`, and `build\game\x86-64-v2\smg_game.dll` for processors without AVX2. Add
+`-Pgo` for a player build: it links with ThinLTO and the profile in `native/pgo`.
+
+On Linux, configure `native` with clang from LLVM 21 or later. It builds `libsmg_game.so` and
+`libsmg_game_plain.so`.
+
+### Running
+
+Put `Nebula.exe` and `smg_game.dll` in one folder, then run:
+
+```powershell
+.\Nebula.exe --pak D:\nebula\content\game.pak --saves "$env:LOCALAPPDATA\Nebula\saves"
+```
+
+### Running the tests
+
+The test runs' parts (the test extension and its tests) are built only when the configure asks for them:
+
+```powershell
+cmake -S . -B build\host -DNEBULA_EXTRA_CMAKE=tools/test_driver/test_driver.cmake
+cmake --build build\host
+ctest --test-dir build\host --output-on-failure
+cargo test -p nebula-import
+sh native/tests/run_tests.sh
+.\tools\audit_repo.ps1
+```
+
+### Building Setup and the Android app
+
+`installer\build-native-setup.ps1` builds the launcher and Setup and writes `Nebula-Setup.exe`.
+`platform\android\build_apk.ps1` builds the Android app. Each script lists its arguments at the top. Both take
+`-ShippedMods`, a folder holding `lumakit.luma`, which LumaLink builds and packs from its `lumakit` folder.
+
+### Packaging for Linux and macOS
+
+`installer/package-linux.sh --bin <build folder> --version <version> --shipped <folder>` packs a Linux build as
+`Nebula-<version>-linux-<arch>.tar.gz`. Players unpack it and run `./install.sh`, which reads their disc image and
+installs Nebula for the user or as a portable folder. `platform/apple/build_macos.sh` builds `Nebula.app` for macOS.
+>>>>>>> upstream/main
 
 ```powershell
 .\setup.ps1
@@ -142,6 +287,14 @@ logic is the Petari decompilation, compiled for the PC.
 
 ## License
 
+<<<<<<< HEAD
 Nebula Co-Op, like Nebula, is licensed under the GNU General Public License v3.0 only ([LICENSE](LICENSE)).
+=======
+Nebula is licensed under the GNU General Public License v3.0 only ([LICENSE](LICENSE)). Third-party code and its
+licenses are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+Nebula builds on the Petari decompilation (SMGCommunity), Aurora, Dusklight, SMAA, AMD FidelityFX, NVIDIA
+Streamline and the `nod` disc library.
+>>>>>>> upstream/main
 
 "Super Mario Galaxy", "Wii" and "Nintendo" are trademarks of Nintendo.

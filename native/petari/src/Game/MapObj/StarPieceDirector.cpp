@@ -10,24 +10,7 @@
 #include "Game/System/NebulaAchievements.hpp"
 #include "Game/System/NebulaCoopWorld.hpp"
 #include "Game/System/NebulaFrameClock.hpp"
-#include "Game/Util/Tunable.hpp"
 #include "Game/System/LumaCore.hpp"
-
-NEBULA_TUNABLE_NAMED(f32, cNum_calcPosCameraShoot_f1, "calcPosCameraShoot.f1", 300.0f);
-NEBULA_TUNABLE_NAMED(f32, cNum_calcPosCameraShoot_f2, "calcPosCameraShoot.f2", 300.0f);
-NEBULA_TUNABLE_NAMED(f32, cNum_calcPosCameraShoot_f3, "calcPosCameraShoot.f3", 30.0f);
-NEBULA_TUNABLE_NAMED(f32, cNum_init_f1, "init.f1", 5.0f);
-NEBULA_TUNABLE_NAMED(f32, cNum_control_f1, "control.f1", 160.0f);
-NEBULA_TUNABLE_NAMED(f32, cNum_control_f2, "control.f2", 7.0f);
-NEBULA_TUNABLE_NAMED(f32, cNum_control_f3, "control.f3", 0.25f);
-NEBULA_TUNABLE_NAMED(f32, cNum_control_f4, "control.f4", 0.125f);
-NEBULA_TUNABLE_NAMED(f32, cNum_tryShoot_f1, "tryShoot.f1", 999999.9f);
-NEBULA_TUNABLE_NAMED(f32, cNum_tryShoot_f2, "tryShoot.f2", 999999.9f);
-NEBULA_TUNABLE_NAMED(f32, cNum_calcShootGoalUsingPointingDepth_f1, "calcShootGoalUsingPointingDepth.f1", 16000000.0f);
-NEBULA_TUNABLE_NAMED(f32, cNum_calcShootGoalUsingPointingDepth_f2, "calcShootGoalUsingPointingDepth.f2", 3000.0f);
-NEBULA_TUNABLE_NAMED(f32, cNum_calcShootGoalUsingPointingDepth_f3, "calcShootGoalUsingPointingDepth.f3", 9000000.0f);
-NEBULA_TUNABLE_NAMED(f32, cNum_calcShootGoalUsingPointingDepth_f4, "calcShootGoalUsingPointingDepth.f4", 3000.0f);
-NEBULA_TUNABLE_NAMED(f32, cNum_calcShootGoalUsingPointingDepth_f5, "calcShootGoalUsingPointingDepth.f5", 400.0f);
 
 namespace NrvStarPieceShooter {
     NEW_NERVE(HostTypeNrvWait, StarPieceShooter, Wait);
@@ -309,13 +292,13 @@ Vec3f StarPieceDirector::calcPosCameraShoot(s32 addOrSubXDir) {
     Vec3f camZDir(MR::getCamZdir());
 
     if (addOrSubXDir == 0) {
-        returnVec.add(camXDir * cNum_calcPosCameraShoot_f1);
+        returnVec.add(camXDir * 300.0f);
     } else {
-        returnVec.sub(camXDir * cNum_calcPosCameraShoot_f2);
+        returnVec.sub(camXDir * 300.0f);
     }
 
     returnVec.add(camYDir * 0.0f);
-    returnVec.add(camZDir * cNum_calcPosCameraShoot_f3);
+    returnVec.add(camZDir * 30.0f);
     return returnVec;
 }
 
@@ -373,7 +356,7 @@ void StarPieceShooter::init(const TableIter& /*rIter*/) {
     MR::setEffectHostSRT(this, "Charge", &mEffectPos, &mEffectRot, nullptr);
 
     initHitSensor(1);
-    MR::addHitSensorEye(this, "search", 64, cNum_init_f1, Vec3f(0.0f, 0.0f, 0.0f));
+    MR::addHitSensorEye(this, "search", 64, 5.0f, Vec3f(0.0f, 0.0f, 0.0f));
     makeActorAppeared();
 }
 
@@ -420,11 +403,11 @@ void StarPieceShooter::control() {
     MR::getPlayerUpVec(&playerUpVec);
 
     mEffectPos.set(playerCenterPos);
-    mEffectPos.sub(playerUpVec * -cNum_control_f1);
+    mEffectPos.sub(playerUpVec * -160.0f);
 
-    f32 scale = mChargeStep / cNum_control_f2;
-    scale *= cNum_control_f3;
-    scale += cNum_control_f4;
+    f32 scale = mChargeStep / 7.0f;
+    scale *= 0.25f;
+    scale += 0.125f;
     MR::setEffectBaseScale(this, "Charge", scale);
 }
 
@@ -474,7 +457,7 @@ bool StarPieceShooter::tryShoot() {
           MR::isStarPointerValid(mPort) && MR::getStarPieceNum() > 0 && MR::isEnableStarPointerShootStarPiece(mPort) &&
           (mPort != 0 || !MR::isStarPointer1PInvalid2PValidMode()))) {
         mSearchSensor = nullptr;
-        mSearchDist = cNum_tryShoot_f1;
+        mSearchDist = 999999.9f;
         mChargeStep = -1;
         MR::deleteEffect(this, "Charge");
 
@@ -540,7 +523,7 @@ bool StarPieceShooter::tryShoot() {
     }
 
     mSearchSensor = nullptr;
-    mSearchDist = cNum_tryShoot_f2;
+    mSearchDist = 999999.9f;
     return true;
 }
 
@@ -555,7 +538,7 @@ void StarPieceShooter::calcShootGoalUsingPointingDepth() {
 
     f32 dirsquared = dir.squared();
 
-    if (cNum_calcShootGoalUsingPointingDepth_f1 < dirsquared) {
+    if (16000000.0f < dirsquared) {
         Vec3f camPos(MR::getCamPos());
         Vec3f dirToPlayer(playerPos);
         dirToPlayer.sub(camPos);
@@ -570,13 +553,13 @@ void StarPieceShooter::calcShootGoalUsingPointingDepth() {
 
         starPointerWorldPos.set(camPos);
 
-        starPointerWorldPos.add(worldPos * (cNum_calcShootGoalUsingPointingDepth_f2 + dirToPlayer.length()));
-    } else if (cNum_calcShootGoalUsingPointingDepth_f3 < dirsquared) {
-        dir.setLength(cNum_calcShootGoalUsingPointingDepth_f4);
+        starPointerWorldPos.add(worldPos * (3000.0f + dirToPlayer.length()));
+    } else if (9000000.0f < dirsquared) {
+        dir.setLength(3000.0f);
         starPointerWorldPos.set(playerPos);
         starPointerWorldPos.add(dir);
     }
 
     mPosition.set(starPointerWorldPos);
-    mShootSpeed = cNum_calcShootGoalUsingPointingDepth_f5;
+    mShootSpeed = 400.0f;
 }

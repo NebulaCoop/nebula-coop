@@ -1,7 +1,6 @@
 #pragma once
 
 #include "Game/LiveActor/Spine.hpp"
-#include "Game/Util/Tunable.hpp"
 
 /// @brief Used for executing states of a LiveActor.
 class Nerve {
@@ -12,6 +11,7 @@ public:
     /// @brief Executes after the last iteration of a state before it executes another state.
     /// @param pSpine The spine that contains the host LiveActor to execute the state for.
     virtual void executeOnEnd(Spine* pSpine) const;
+<<<<<<< HEAD
     /// @brief Online co-op (docs/COOP_PLAN.md "Shared objects"): the nerve's id, its executor's class and its name
     /// hashed, the same in every player's game (0 for none), and its executor's class alone.
     virtual u32 nebulaId() const { return 0; }
@@ -123,6 +123,10 @@ namespace nebula {
     NEBULA_NERVE_SECTION NEBULA_TUNABLE_KEEP static const ::nebula::NerveRecord name##_nebula_nerve = {                                            \
         &name::sInstance, #parent_class, #name, &::nebula::nerveActorOf< parent_class >};
 
+=======
+};
+
+>>>>>>> upstream/main
 #define NEW_NERVE(name, parent_class, executor_name)                                                                                                 \
     class name : public Nerve {                                                                                                                      \
     public:                                                                                                                                          \
@@ -133,9 +137,13 @@ namespace nebula {
         NEBULA_NERVE_ID(name, parent_class)                                                                                                          \
         static name sInstance;                                                                                                                       \
     };                                                                                                                                               \
+<<<<<<< HEAD
     ATTRIBUTE_WEAK_DEF(name name::sInstance);                                                                                                        \
     NEBULA_NERVE_RECORD(name, parent_class)                                                                                                      \
     NEBULA_NERVE_ADD(name, parent_class)
+=======
+    ATTRIBUTE_WEAK_DEF(name name::sInstance);
+>>>>>>> upstream/main
 
 #define NEW_NERVE_ONEND(name, parent_class, executor_name, executorOnEnd_name)                                                                       \
     class name : public Nerve {                                                                                                                      \
@@ -151,9 +159,13 @@ namespace nebula {
         NEBULA_NERVE_ID(name, parent_class)                                                                                                          \
         static name sInstance;                                                                                                                       \
     };                                                                                                                                               \
+<<<<<<< HEAD
     ATTRIBUTE_WEAK_DEF(name name::sInstance);                                                                                                        \
     NEBULA_NERVE_RECORD(name, parent_class)                                                                                                      \
     NEBULA_NERVE_ADD(name, parent_class)
+=======
+    ATTRIBUTE_WEAK_DEF(name name::sInstance);
+>>>>>>> upstream/main
 
 /* easy alternative to get a nerve instance (in the standard format) */
 #define GET_NERVE(cls, nerve) (&Nrv##cls::nerve::sInstance)

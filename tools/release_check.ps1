@@ -40,10 +40,16 @@ $repo = Split-Path -Parent $PSScriptRoot
 foreach ($folder in @("native", "runtime", "platform")) {
     $root = Join-Path $repo $folder
     if (-not (Test-Path -LiteralPath $root)) { $failures.Add("$folder is missing"); continue }
+<<<<<<< HEAD
     # Filtered by extension, not -Include: Windows PowerShell (which runs this script) ignores -Include with -LiteralPath
     # and would read every file (native\tools\*.py among them).
     foreach ($source in Get-ChildItem -LiteralPath $root -Recurse -File |
                         Where-Object { @(".cpp", ".h", ".hpp", ".c", ".inc", ".mm", ".kt", ".java") -contains $_.Extension.ToLowerInvariant() }) {
+=======
+    # Filtered by Where-Object: Windows PowerShell 5.1 ignores -Include together with -LiteralPath and lists every file.
+    foreach ($source in Get-ChildItem -LiteralPath $root -Recurse -File |
+                        Where-Object { $_.Extension -in ".cpp", ".h", ".hpp", ".c", ".inc", ".mm", ".kt", ".java" }) {
+>>>>>>> upstream/main
         if ($source.BaseName -like "*_tests" -or $source.FullName -like "*\third_party\*") { continue }
         $text = [IO.File]::ReadAllText($source.FullName)
         $relative = $source.FullName.Substring($repo.Length + 1)

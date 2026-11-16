@@ -1,5 +1,6 @@
 #include "Game/LiveActor/HitSensor.hpp"
 #include "Game/Player/MarioActor.hpp"
+#include "Game/System/GameRules.hpp"
 #include "Game/System/NebulaMods.hpp"
 #include "Game/Player/MarioAnimator.hpp"
 #include "Game/Player/MarioFpView.hpp"
@@ -9,16 +10,79 @@
 #include "Game/Util/CameraUtil.hpp"
 #include "Game/Util/EventUtil.hpp"
 #include "Game/Util/LiveActorUtil.hpp"
+#include "Game/Util/MotionSignal.hpp"
 #include "Game/Util/PlayerUtil.hpp"
 #include "Game/Util/ScreenUtil.hpp"
 #include "Game/Util/SoundUtil.hpp"
 #include "Game/Util/StarPointerUtil.hpp"
+<<<<<<< HEAD
 #include "Game/Player/NebulaCoopBubble.hpp"
 #include "Game/Util/Tunable.hpp"
+=======
+>>>>>>> upstream/main
 
-NEBULA_TUNABLE_NAMED(f32, cNum_exeGameOverAbyss_f1, "exeGameOverAbyss.f1", 0.99f);
-NEBULA_TUNABLE_NAMED(f32, cNum_exeGameOverAbyss_f2, "exeGameOverAbyss.f2", 35.0f);
-NEBULA_TUNABLE_NAMED(f32, cNum_exeGameOverAbyss_f3, "exeGameOverAbyss.f3", 0.01f);
+bool MarioActor::respawnExtra() {
+    if (!mExtra) {
+        return false;
+    }
+    // What it holds or rides goes, as forceKill lets it go.
+    if (mInRush) {
+        if (mRushSensor != nullptr && !mRushSensor->receiveMessage(ACTMES_RUSH_CANCEL, getSensor("body"))) {
+            mRushSensor->receiveMessage(ACTMES_RUSH_FORCE_CANCEL, getSensor("body"));
+        }
+        if (mInRush) {
+            RushEndInfo endInfo(nullptr, RushEndInfo::Mode_Release, Vec3f(0.0f, 0.0f, 0.0f), false, 0);
+            endRush(&endInfo);
+        }
+        mInRush = false;
+    }
+    if (!MR::isDead(mSpinTico)) {
+        mSpinTico->kill();
+    }
+    mMario->closeStatus(nullptr);
+    mMario->stopJump();
+    mVelocity.zero();
+    mLastMove.zero();
+    mControlVelocity.zero();
+    mPosition.set(mExtraHome);
+    mRotation.set(mExtraHomeRotate);
+    mMario->mPosition = mExtraHome;
+    mMario->setHeadAndFrontVecFromRotate(mRotation);
+    mPrevControlPos = mPosition;
+    mBaseMtxSet = true;
+    mCameraTrans = mExtraHome;
+    const u32 startingHealth = static_cast< u32 >(GameRules::playerHealth());
+    mMaxHealth = startingHealth;
+    mHealth = startingHealth;
+    resetWaterLife();
+    mLifeDamageQueue = 0;
+    mPressTimer = 0;
+    mWaitNextNerve = nullptr;
+    mWaitTimer = 0;
+    mGameOverKind = 0;
+    mAnimationFrozen = false;
+    mForceKilled = false;
+    mHidden = false;
+    mBindOn = true;
+    mBlurState = 0;
+    MR::releaseAnimFrame(this);
+    mMario->changeAnimation("基本");
+    // A new life: its draws are not blended from where it fell.
+    MotionSignal::newLife(this);
+    MR::updateHitSensorsAll(this);
+    setNerve(GET_NERVE(MarioActor, MarioActorNrvWait));
+    return true;
+}
+
+void MarioActor::endExtra() {
+    if (!respawnExtra()) {
+        return;
+    }
+    kill();
+    // Its shadow and silhouette drawers stay in the scene's lists after kill: hidden, they draw nothing. Without it
+    // they draw a pose made before the kill, or none when the player is removed in the frame it was made (a crash).
+    mHidden = true;
+}
 
 void MarioActor::forceKill(u32 type) {
     if (mMario->getMovementStates().invincible) {
@@ -26,6 +90,11 @@ void MarioActor::forceKill(u32 type) {
     }
 
     if (!isEnableNerveChange()) {
+        return;
+    }
+
+    // An extra player's death ends nothing: it stands again at its home.
+    if (respawnExtra()) {
         return;
     }
 
@@ -98,10 +167,17 @@ void MarioActor::forceKill(u32 type) {
 }
 
 void MarioActor::exeGameOver() {
+<<<<<<< HEAD
     // Online co-op: with another player alive here, the miss becomes a bubble (sm64coopdx's bubble on death).
     if (MR::isFirstStep(this) && NebulaCoopBubble::tryStart(this)) {
         return;
     }
+=======
+    if (respawnExtra()) {
+        return;
+    }
+
+>>>>>>> upstream/main
     mVelocity.zero();
     calcHeadPos();
     updateRealMtx();
@@ -151,11 +227,19 @@ void MarioActor::exeGameOver() {
 }
 
 void MarioActor::exeGameOverAbyss() {
+<<<<<<< HEAD
     // Online co-op: with another player alive here, the miss becomes a bubble (sm64coopdx's bubble on death).
     if (MR::isFirstStep(this) && NebulaCoopBubble::tryStart(this)) {
         return;
     }
     mVelocity = getLastMove() * cNum_exeGameOverAbyss_f1 + mCamDirZ * cNum_exeGameOverAbyss_f2 * cNum_exeGameOverAbyss_f3;
+=======
+    if (respawnExtra()) {
+        return;
+    }
+
+    mVelocity = getLastMove() * 0.99f + mCamDirZ * 35.0f * 0.01f;
+>>>>>>> upstream/main
     mLastMove = mVelocity;
 
     if (!MR::isFirstStep(this)) {
@@ -181,10 +265,17 @@ void MarioActor::exeGameOverAbyss() {
 }
 
 void MarioActor::exeGameOverFire() {
+<<<<<<< HEAD
     // Online co-op: with another player alive here, the miss becomes a bubble (sm64coopdx's bubble on death).
     if (MR::isFirstStep(this) && NebulaCoopBubble::tryStart(this)) {
         return;
     }
+=======
+    if (respawnExtra()) {
+        return;
+    }
+
+>>>>>>> upstream/main
     mVelocity.zero();
     calcHeadPos();
     updateRealMtx();
@@ -212,10 +303,17 @@ void MarioActor::exeGameOverFire() {
 }
 
 void MarioActor::exeGameOverSink() {
+<<<<<<< HEAD
     // Online co-op: with another player alive here, the miss becomes a bubble (sm64coopdx's bubble on death).
     if (MR::isFirstStep(this) && NebulaCoopBubble::tryStart(this)) {
         return;
     }
+=======
+    if (respawnExtra()) {
+        return;
+    }
+
+>>>>>>> upstream/main
     mVelocity.zero();
     calcHeadPos();
     updateRealMtx();
@@ -266,10 +364,17 @@ void MarioActor::exeGameOverSink() {
 }
 
 void MarioActor::exeGameOverNonStop() {
+<<<<<<< HEAD
     // Online co-op: with another player alive here, the miss becomes a bubble (sm64coopdx's bubble on death).
     if (MR::isFirstStep(this) && NebulaCoopBubble::tryStart(this)) {
         return;
     }
+=======
+    if (respawnExtra()) {
+        return;
+    }
+
+>>>>>>> upstream/main
     if (!MR::isFirstStep(this)) {
         return;
     }

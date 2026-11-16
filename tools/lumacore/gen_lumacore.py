@@ -1,52 +1,35 @@
-"""gen_lumacore.py NEBULA_ROOT [--objects GAME_BUILD_DIR] [--check]: LumaCore's generated layers, from the game's headers.
+"""gen_lumacore.py NEBULA_ROOT [--check]: LumaCore's class rows, from the game's headers.
 
-Writes, under native/petari/src/Game/System/generated/:
-  lumacore_class_ids.hpp  (in include/Game/System/generated) kClassId<T> for every class deriving from NameObj (the factory's createNameObj<T> reads it)
-  lumacore_classes.cpp    the class rows (name, parent, size, cast); the compiler checks every parent
-  lumacore_fields.cpp     each class's own fields (names and types from clang's record layouts, offsets from offsetof)
-  lumacore_toolkit.cpp    a thunk for every MR:: utility, the listed classes' public methods and the plugin API whose
-                          types map to LumaCore values, and the table of them, sorted by name
-  lumacore_hash.txt       the hash of what was read; --check compares it, so the generated files can't drift
-and docs/modding/TOOLKIT.md, FIELDS.md and CLASSES.md (every row, and what was left out and why).
-
---objects: the game module's build folder. A function the headers declare but no object defines (and no header
-defines inline) is left out, so the toolkit never names a symbol the game lacks. Without it, every declared function
-is offered (a missing one then fails the link, which names it).
+Writes:
+  include/Game/System/generated/lumacore_class_ids.hpp  kClassId<T> for every class deriving from NameObj (the
+                                                       factory's createNameObj<T> reads it)
+  src/Game/System/generated/lumacore_classes.cpp        the class rows (name, parent, size, cast); the compiler checks
+                                                       every parent
+  src/Game/System/generated/lumacore_hash.txt           the hash of what was read; --check compares it, so the
+                                                       generated files can't drift
+and docs/modding/reference/classes.md (every row; tools/modding/reference_pages.py adds its frontmatter).
 
 No build of the game runs this: the outputs are committed.
 """
 import hashlib
-import json
-import os
 import pathlib
-import re
-import subprocess
 import sys
-import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import gen_classes  # noqa: E402
-import gen_fields  # noqa: E402
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / 'modding'))
+import reference_pages  # noqa: E402
 
 ROOT = pathlib.Path(sys.argv[1]).resolve()
 CHECK = '--check' in sys.argv
-OBJECTS = None
-if '--objects' in sys.argv:
-    OBJECTS = pathlib.Path(sys.argv[sys.argv.index('--objects') + 1])
-NATIVE = ROOT / 'native'
-PETARI = NATIVE / 'petari'
+PETARI = ROOT / 'native' / 'petari'
 INC = PETARI / 'include'
 OUT = PETARI / 'src' / 'Game' / 'System' / 'generated'
-DOCS = ROOT / 'docs' / 'modding'
-LLVM = pathlib.Path(os.environ.get('LUMACORE_LLVM', r'C:\Program Files\LLVM\bin'))
-CLANG = str(LLVM / 'clang++.exe') if (LLVM / 'clang++.exe').exists() else str(LLVM / 'clang++')
-NM = str(LLVM / 'llvm-nm.exe') if (LLVM / 'llvm-nm.exe').exists() else str(LLVM / 'llvm-nm')
-HEADER = gen_classes.HEADER
+IDS = INC / 'Game' / 'System' / 'generated'
+DOCS = ROOT / 'docs' / 'modding' / 'reference'
 
-# Classes whose public methods are offered beside MR:: (the ones mods meet most). Grown with the domains.
-METHOD_CLASSES = ['NameObj', 'LiveActor', 'HitSensor', 'NPCActor', 'MarioActor', 'LayoutActor', 'AreaObj',
-                  'MapObjActor', 'PartsModel', 'ModelObj']
 
+<<<<<<< HEAD
 # Value kinds (nebula_mod_api.h NebulaKind) and their letters in a row's signature.
 K_NONE, K_BOOL, K_INT, K_FLOAT, K_VEC3, K_MATRIX, K_TEXT, K_HANDLE, K_VEC4, K_VEC2 = range(10)
 KIND_NAME = ['none', 'bool', 'int', 'float', 'vec3', 'matrix', 'text', 'handle', 'vec4', 'vec2']
@@ -842,20 +825,20 @@ def emit_registries(generated):
 
 
 CLASS_ROWS = []
+=======
+def write(path, text):
+    # CRLF, as the tree keeps these files.
+    path.write_bytes(text.replace('\r\n', '\n').replace('\n', '\r\n').encode('utf-8'))
+>>>>>>> upstream/main
 
 
 def main():
-    global CLASS_ROWS
-    inputs = sorted(list(INC.rglob('*.hpp')) + list(INC.rglob('*.h'))) + [NATIVE / 'include' / 'nebula_mod_api.h',
-                                                                           PETARI / 'src' / 'Game' / 'System' / 'LumaHost.cpp',
-                                                                           PETARI / 'src' / 'Game' / 'System' / 'LumaRegistry.cpp',
-                                                                           PETARI / 'src' / 'Game' / 'NameObj' / 'NameObjFactory.cpp',
-                                                                           PETARI / 'src' / 'Game' / 'AreaObj' / 'AreaObjContainer.cpp',
-                                                                           PETARI / 'src' / 'Game' / 'Camera' / 'CameraHolder.cpp',
-                                                                           pathlib.Path(__file__)]
+    here = pathlib.Path(__file__).resolve().parent
+    inputs = sorted(list(INC.rglob('*.hpp')) + list(INC.rglob('*.h')))
+    inputs = [h for h in inputs if IDS not in h.parents] + [here / 'gen_lumacore.py', here / 'gen_classes.py']
     digest = hashlib.sha256()
     for h in inputs:
-        digest.update(h.as_posix().split('/native/')[-1].encode())
+        digest.update(h.as_posix().split('/native/')[-1].split('/tools/')[-1].encode())
         digest.update(h.read_bytes().replace(b'\r\n', b'\n'))
     digest = digest.hexdigest()
     hash_file = OUT / 'lumacore_hash.txt'
@@ -865,29 +848,18 @@ def main():
             raise SystemExit('LumaCore generated files are out of date: run tools/lumacore/gen_lumacore.py')
         print('LumaCore generated files current')
         return
-    CLASS_ROWS, dupes = gen_classes.classes(INC)
-    class_names = {q for (q, _, _, _) in CLASS_ROWS}
+    rows, dupes = gen_classes.classes(INC)
     OUT.mkdir(parents=True, exist_ok=True)
-    ids = INC / 'Game' / 'System' / 'generated'
-    ids.mkdir(parents=True, exist_ok=True)
-    (ids / 'lumacore_class_ids.hpp').write_text(gen_classes.emit_class_ids(CLASS_ROWS), encoding='utf-8')
-    classes_cpp = gen_classes.emit_class_rows(CLASS_ROWS)
-    (OUT / 'lumacore_classes.cpp').write_text(classes_cpp, encoding='utf-8')
-    # The record layouts (field names and types): from the classes file, whose sizeof rows lay out every class.
-    layout_text = run_clang(['-Xclang', '-fdump-record-layouts-complete', '-Xclang', '-fdump-record-layouts'],
-                            OUT / 'lumacore_classes.cpp')
-    layouts = gen_fields.parse_layouts(layout_text)
-    fields_cpp, field_count = gen_fields.emit_field_rows(CLASS_ROWS, layouts)
-    (OUT / 'lumacore_fields.cpp').write_text(fields_cpp, encoding='utf-8')
-    rows, left = toolkit_rows(enum_names(), class_names, defined_symbols())
-    (OUT / 'lumacore_toolkit.cpp').write_text(emit_toolkit(rows), encoding='utf-8')
-    hash_file.write_text(digest + '\n')
-    emit_docs(rows, left, CLASS_ROWS, field_count, layouts)
-    own, game, messages = script_events()
-    emit_events(own, game, messages)
-    emit_registries(emit_names(messages))
-    print(f'classes {len(CLASS_ROWS)} ({len(dupes)} names in two headers: {", ".join(dupes)}); fields {field_count}; '
-          f'toolkit {len(rows)} rows, {len(left)} left out')
+    IDS.mkdir(parents=True, exist_ok=True)
+    write(IDS / 'lumacore_class_ids.hpp', gen_classes.emit_class_ids(rows))
+    write(OUT / 'lumacore_classes.cpp', gen_classes.emit_class_rows(rows))
+    write(hash_file, digest + '\n')
+    doc = [f'{len(rows)} classes derive from NameObj. A luma.json `object_classes` row\'s `like` names '
+           'one of them; a mod\'s code reads the same rows through LumaCore (class count, row, is-a).', '',
+'', '## Classes', '', '| Class | Parent | Header |', '|---|---|---|']
+    doc += [f'| {q} | {p or ""} | {rel} |' for (q, p, rel, _) in rows]
+    reference_pages.write_page('classes', '\n'.join(doc), DOCS)
+    print(f'classes {len(rows)} ({len(dupes)} names in two headers: {", ".join(dupes)})')
 
 
 if __name__ == '__main__':

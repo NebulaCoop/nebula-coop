@@ -17,14 +17,16 @@
 #include "Game/Util/SoundUtil.hpp"
 #include "Game/Screen/NebulaPauseSettingsButton.hpp"
 #include "Game/Screen/NebulaSettingsMenu.hpp"
-#include "Game/Util/Tunable.hpp"
 #include "Game/System/LumaCore.hpp"
 
+<<<<<<< HEAD
 NEBULA_TUNABLE_NAMED(f32, cNum_control_f1, "control.f1", 39.0f);
 
 
+=======
+>>>>>>> upstream/main
 namespace {
-    NEBULA_TUNABLE(s32, cBackSequenceFadeFrame, 90);
+    const s32 cBackSequenceFadeFrame = 90;
 
     bool isInvalidBackAstroDome() {
         return !MR::isOnGameEventFlagUseAstroDome() || (MR::isStageAstroLocation() && !MR::isEqualStageName("HeavensDoorGalaxy"));
@@ -220,7 +222,7 @@ void PauseMenu::control() {
         mLetterButton->update();
     }
 
-    mStageTitleOffset.y = cNum_control_f1;
+    mStageTitleOffset.y = 39.0f;
 }
 
 void PauseMenu::updateStarPane() {

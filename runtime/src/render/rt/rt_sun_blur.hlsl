@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// The sun filter's blur (plan 7.3), run twice (g_pass.y 0, then 1: the disc turned a quarter and half as wide): V
+// The sun filter's blur, run twice (g_pass.y 0, then 1: the disc turned a quarter and half as wide): V
 // spread over a disc as wide as the penumbra really is at the pixel. The sun's disc seen from the surface is
 // 2 * tan(its half angle) wide a unit of way, so a shadow whose caster stands d away has a penumbra
 // w = 2 * g_sun.w * d wide: sharp where the caster touches the ground, wide under a high branch (the method of
@@ -57,13 +57,16 @@ void main(uint3 id : SV_DispatchThreadID) {
     const int2 pixel = int2(id.xy);
     const float4 centre = g_in.Load(int3(pixel, 0));
     const float4 guide = g_guide.Load(int3(pixel, 0));
-    if (guide.a == 0.0f || !in_penumbra(id.xy) || (g_more.z & 2048u) != 0u) {  // raw signals (FB, 22.20): copied through
+    if (guide.a == 0.0f || !in_penumbra(id.xy) || (g_more.z & 2048u) != 0u) {  // raw signals: copied through
         g_out[id.xy] = centre;
         return;
     }
     const float away = guide.r;
     const float pixel_wide = abs(g_ray.x) * away;  // a pixel's width at the surface
-    const float penumbra = 2.0f * g_sun.w * g_distance.Load(int3(pixel, 0));
+    const float3 n = unoct(g_normals.Load(int3(pixel, 0)).rg);
+    // The penumbra on the surface: 2 tan(d) x the caster's distance, over how squarely the sun meets the surface (B4;
+    // a sheet lit from behind by |n.s|).
+    const float penumbra = 2.0f * g_sun.w * g_distance.Load(int3(pixel, 0)) / max(abs(dot(n, g_sun.xyz)), 0.2f);
     float radius = clamp(penumbra / (2.0f * pixel_wide), 1.0f, 24.0f);
     if (centre.a < 4.0f / 16.0f) {
         radius *= 2.0f;
@@ -73,7 +76,6 @@ void main(uint3 id : SV_DispatchThreadID) {
         radius *= 0.5f;
     }
     // The disc in the surface's plane, turned by the noise (a quarter more on the second run).
-    const float3 n = unoct(g_normals.Load(int3(pixel, 0)).rg);
     const float3 side = normalize(abs(n.y) < 0.9f ? cross(n, float3(0.0f, 1.0f, 0.0f)) : cross(n, float3(1.0f, 0.0f, 0.0f)));
     const float3 up = cross(n, side);
     const float turn = 6.2831853f * rt_sample(id.xy, g_more.y, kSampleBlur).x + (second ? 1.5707963f : 0.0f);

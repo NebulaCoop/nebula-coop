@@ -2,8 +2,11 @@
 #include "Game/System/NebulaMods.hpp"
 #include "Game/LiveActor/LiveActor.hpp"
 #include "Game/LiveActor/SensorHitChecker.hpp"
+<<<<<<< HEAD
 #include "Game/System/NebulaCoopWorld.hpp"
 #include "Game/System/LumaClass.hpp"
+=======
+>>>>>>> upstream/main
 
 HitSensor::HitSensor(u32 type, u32 groupSize, f32 radius, LiveActor* pHost)
     : mType(type), mPosition(0.0f, 0.0f, 0.0f), mRadius(radius), mSensorCount(0), mGroupSize(groupSize), mSensors(nullptr), mSensorGroup(nullptr),
@@ -21,6 +24,7 @@ bool HitSensor::receiveMessage(u32 msg, HitSensor* pSender) {
         NebulaMods::dispatch(NEBULA_MOD_EVENT_ACTOR_MESSAGE, static_cast< s32 >(msg), mHost, mHost->mName) < 0) {
         return false;
     }
+<<<<<<< HEAD
     // A mod's class may answer it in the class's place.
     if (mHost->mModActor != nullptr) [[unlikely]] {
         const s32 answer = lumacore::classMessage(mHost, msg, pSender);
@@ -32,6 +36,8 @@ bool HitSensor::receiveMessage(u32 msg, HitSensor* pSender) {
     if (NebulaCoopWorld::sObjectsActive) {
         return NebulaCoopWorld::deliverMessage(msg, pSender, this);
     }
+=======
+>>>>>>> upstream/main
     return mHost->receiveMessage(msg, pSender, this);
 }
 
