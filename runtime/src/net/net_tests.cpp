@@ -783,6 +783,22 @@ void test_session() {
            "and the host's");
     third.set_character(galaxy::CoopCharacter::Luigi, "no spaces allowed");
     expect(wait_for([&] { return character_id_of(host_session, 2u) == "luigi"; }), "a bad id is its base's");
+    // The player's colours (sm64coopdx's palette) travel with their character; a switch without them keeps the last.
+    const auto palette_of = [](const Session& session, unsigned index) {
+        for (const SessionPlayer& player : session.players()) {
+            if (player.index == index) return player.has_palette ? static_cast<int>(player.palette[3]) : -1;
+        }
+        return -2;
+    };
+    expect(palette_of(joiner, 2u) == -1, "no colours until a game tells them");
+    std::array<std::uint8_t, 24> colours{};
+    colours[3] = 0x42;
+    third.set_character(galaxy::CoopCharacter::Luigi, {}, &colours);
+    expect(wait_for([&] { return palette_of(joiner, 2u) == 0x42 && palette_of(host_session, 2u) == 0x42; }),
+           "a joiner's colours reach everyone");
+    third.set_character(galaxy::CoopCharacter::Mario);
+    expect(wait_for([&] { return character_of(joiner, 2u) == kMario; }) && palette_of(joiner, 2u) == 0x42,
+           "a character switch keeps the colours");
 
     // Each player's Power Stars this room (the Personal Star Counter): the host counts them and tells everyone.
     const auto stars_of = [](const Session& session, unsigned index) {

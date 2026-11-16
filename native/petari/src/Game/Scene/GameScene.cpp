@@ -94,6 +94,7 @@
 #include "Game/Player/NebulaCoopBubble.hpp"
 #include "Game/Player/NebulaCharacter.hpp"
 #include "Game/Player/NebulaCharacters.hpp"
+#include "Game/Player/NebulaPalette.hpp"
 #include "Game/System/NebulaCoopDemos.hpp"
 #include "Game/System/NebulaCoopWorld.hpp"
 #include "Game/Util/MessageUtil.hpp"
@@ -352,6 +353,10 @@ namespace {
         player.mode = pActor->mPlayerMode;
         player.flags = (MR::isPlayerLuigi() ? NEBULA_COOP_PLAYER_LUIGI : 0u) | (MR::isPlayerDead() ? NEBULA_COOP_PLAYER_DEAD : 0u);
         nebula_snprintf(player.character, sizeof(player.character), "%s", NebulaCharacters::id(NebulaCharacter::index()));
+        // The colours they wear (NebulaPalette), sent with the character when they change.
+        const nebula_palette::Palette colors = NebulaPalette::local();
+        memcpy(player.palette, &colors, sizeof(player.palette));
+        player.has_palette = 1;
         // What the others' games need for player collisions: the attacks, and when nothing touches this player.
         if (MR::isPlayerSwingAction()) {
             player.flags |= NEBULA_COOP_PLAYER_SPIN;

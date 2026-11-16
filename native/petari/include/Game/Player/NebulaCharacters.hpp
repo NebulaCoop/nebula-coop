@@ -1,5 +1,6 @@
 #pragma once
 
+#include <nebula_palette.hpp>
 #include <nebula_types.h>
 
 struct NebulaPlugin;
@@ -18,6 +19,10 @@ struct MarioConstTable;
 //
 // Characters are added while mods start, and stay for the run: an index names the same character until Nebula quits.
 // In online co-op a character travels by its id (NebulaCoopPlayer::character), as a room's players run its mods.
+//
+// Each has its own colours (sm64coopdx's character palettes): its model's as its textures have them, which a player's
+// colours (NebulaPalette) are drawn against. Mario's and Luigi's are the game's; a mod's are luma.json's "palette", else
+// its base's.
 namespace NebulaCharacters {
     const s32 cMario = 0;
     const s32 cLuigi = 1;
@@ -33,6 +38,7 @@ namespace NebulaCharacters {
         bool mLuigi;            // its base: Luigi's animations, voice and code, else Mario's
         MarioConstTable* mTable;
         const NebulaPlugin* mMod;  // null: the game's
+        nebula_palette::Palette mPalette;  // its own colours
     };
 
     // How many characters there are (2 before any mod's), and one by index (null past the last).
@@ -42,7 +48,9 @@ namespace NebulaCharacters {
     s32 find(const char* pId);
     // A mod's character: its index, or -1 when it can't be added (a bad id, one already taken, a base that isn't
     // "mario" or "luigi", no room). `pName` null: its id in capitals. `pArchive` null: its id with a capital first letter.
-    s32 add(const NebulaPlugin* pMod, const char* pId, const char* pName, const char* pLike, const char* pArchive);
+    // `pPalette` null: its base's colours.
+    s32 add(const NebulaPlugin* pMod, const char* pId, const char* pName, const char* pLike, const char* pArchive,
+            const nebula_palette::Palette* pPalette = nullptr);
 
     // Its base is Luigi (1 for Luigi and Luigi-based characters); Mario's for an index past the last.
     bool isLuigi(s32 index);
@@ -50,6 +58,8 @@ namespace NebulaCharacters {
     MarioConstTable* constTable(s32 index);
     // Its id; "mario" past the last.
     const char* id(s32 index);
+    // Its own colours; Mario's past the last.
+    const nebula_palette::Palette& palette(s32 index);
 
     // One of the base's model or archive names as the character has it: `pGameName` ("MarioFace", "BeeLuigi") with the
     // base's name swapped for its archive's, when ObjectData holds that archive; else `pGameName`. The text lasts for

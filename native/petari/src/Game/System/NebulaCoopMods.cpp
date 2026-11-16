@@ -1,6 +1,7 @@
 #include "Game/System/NebulaCoopMods.hpp"
 #include "Game/Player/NebulaCharacter.hpp"
 #include "Game/Player/NebulaCharacters.hpp"
+#include "Game/Player/NebulaPalette.hpp"
 #include "Game/System/NebulaHost.hpp"
 #include "Game/System/NebulaMods.hpp"
 #include "Game/Util/EventUtil.hpp"
@@ -205,6 +206,32 @@ namespace NebulaCoopMods {
             return (rPlayer.flags & NEBULA_COOP_LIST_LUIGI) != 0 ? "luigi" : "mario";
         }
         return rPlayer.character;
+    }
+
+    s32 paletteColor(s32 index, s32 part) {
+        if (part < 0 || part >= static_cast< s32 >(nebula_palette::PartCount)) {
+            return -1;
+        }
+        // This player: what they wear now, a moment ahead of what the room was told.
+        if (!sNow.mIn ? index == 0 : (valid(index) && index == sNow.mMe)) {
+            return static_cast< s32 >(nebula_palette::color(NebulaPalette::local(), static_cast< u32 >(part)));
+        }
+        if (!sNow.mIn || !valid(index)) {
+            return -1;
+        }
+        const NebulaCoopListPlayer& rPlayer = sNow.mPlayers[index];
+        nebula_palette::Palette palette;
+        if (rPlayer.has_palette != 0) {
+            memcpy(&palette, rPlayer.palette, sizeof(palette));
+        } else {
+            // Not told yet: their character's own (its base's when this game hasn't it).
+            s32 character = NebulaCharacters::find(characterId(index));
+            if (character < 0) {
+                character = (rPlayer.flags & NEBULA_COOP_LIST_LUIGI) != 0 ? NebulaCharacters::cLuigi : NebulaCharacters::cMario;
+            }
+            palette = NebulaCharacters::palette(character);
+        }
+        return static_cast< s32 >(nebula_palette::color(palette, static_cast< u32 >(part)));
     }
 
     s32 ping(s32 index) {

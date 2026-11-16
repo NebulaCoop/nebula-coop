@@ -118,6 +118,8 @@ void write_player(ByteWriter& out, const SessionPlayer& player) {
         .str(player.name)
         .u8(static_cast<std::uint8_t>(player.character))
         .str(player.character_id)
+        .u8(player.has_palette ? 1u : 0u)
+        .raw(player.palette)
         .u8((player.host ? 1u : 0u) | (player.moderator ? 2u : 0u))
         .str(player.stage)
         .u8(static_cast<std::uint8_t>(std::clamp(player.scenario, 0, 255)))
@@ -131,6 +133,8 @@ SessionPlayer read_player(ByteReader& in) {
     player.name = in.str(kPlayerNameLimit);
     player.character = in.u8() == 1u ? CoopCharacter::Luigi : CoopCharacter::Mario;
     player.character_id = character_id_of(player.character, in.str(64u));
+    player.has_palette = in.u8() != 0u;
+    for (std::uint8_t& byte : player.palette) byte = in.u8();
     const unsigned flags = in.u8();
     player.host = (flags & 1u) != 0u;
     player.moderator = (flags & 2u) != 0u;
@@ -727,13 +731,22 @@ struct Session::State {
     void host_receive_character(PeerId from, ByteReader& in) {
         const auto got = in.u8() == 1u ? CoopCharacter::Luigi : CoopCharacter::Mario;
         const std::string got_id = character_id_of(got, in.str(64u));
+        // Their colours with it.
+        const bool has_palette = in.u8() != 0u;
+        std::array<std::uint8_t, 24> palette{};
+        if (has_palette) {
+            for (std::uint8_t& byte : palette) byte = in.u8();
+        }
         SessionPlayer* switched = player(from);
         if (!in.ok() || switched == nullptr || switched->local ||
-            (switched->character == got && switched->character_id == got_id)) {
+            (switched->character == got && switched->character_id == got_id && switched->has_palette == has_palette &&
+             switched->palette == palette)) {
             return;
         }
         switched->character = got;
         switched->character_id = got_id;
+        switched->has_palette = has_palette;
+        switched->palette = palette;
         send_info(*switched);
     }
 
@@ -1245,21 +1258,29 @@ void Session::set_name(const std::string& name) {
     state_->send(state_->transport->owner(), kPlayerName, body);
 }
 
-void Session::set_character(CoopCharacter character, const std::string& id) {
+void Session::set_character(CoopCharacter character, const std::string& id, const std::array<std::uint8_t, 24>* palette) {
     const std::lock_guard<std::recursive_mutex> lock(lock_);
     if (state_->state != SessionState::Hosting && state_->state != SessionState::Joined) return;
     auto& list = state_->players;
     const auto self = std::find_if(list.begin(), list.end(), [](const auto& p) { return p.local; });
     const std::string cleaned = character_id_of(character, id);
-    if (self == list.end() || (self->character == character && self->character_id == cleaned)) return;
+    if (self == list.end()) return;
+    // Colours once told stay until told again.
+    const bool has_palette = palette != nullptr || self->has_palette;
+    const std::array<std::uint8_t, 24> colors = palette != nullptr ? *palette : self->palette;
+    if (self->character == character && self->character_id == cleaned && self->has_palette == has_palette && self->palette == colors) {
+        return;
+    }
     self->character = character;
     self->character_id = cleaned;
+    self->has_palette = has_palette;
+    self->palette = colors;
     if (state_->state == SessionState::Hosting) {
         state_->send_info(*self);
         return;
     }
     ByteWriter body;
-    body.u8(static_cast<std::uint8_t>(character)).str(cleaned);
+    body.u8(static_cast<std::uint8_t>(character)).str(cleaned).u8(has_palette ? 1u : 0u).raw(colors);
     state_->send(state_->transport->owner(), kPlayerCharacter, body);
 }
 

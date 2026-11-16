@@ -35,4 +35,6 @@ namespace NebulaCoopMods {
     const char* description(s32 index, u32* pColor);
     // A line in the chat for this player alone (coop_chat_say); nothing outside a room.
     void chatSay(const char* pUtf8);
+    // The colour player `index` wears for a part (0xRRGGBB): this player's own as theirs; -1 for nobody or no such part.
+    s32 paletteColor(s32 index, s32 part);
 };  // namespace NebulaCoopMods

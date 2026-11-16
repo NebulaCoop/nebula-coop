@@ -197,6 +197,13 @@ namespace NebulaHost {
         nebula_host()->coop_chat_say(nebula_host()->user, pUtf8);
     }
 
+    // The colours the player wants (24 bytes into `pPalette`): true with the Options page's, false for their character's
+    // own.
+    inline bool coopPaletteWanted(u8* pPalette) {
+        const NebulaHostServices* pHost = nebula_host();
+        return pHost->coop_palette_wanted != nullptr && pHost->coop_palette_wanted(pHost->user, pPalette) != 0;
+    }
+
     // Shared objects (docs/COOP_PLAN.md "Shared objects"): the states of the enemies this game moves, and the ones
     // the other players' games move.
     inline void coopObjectsReport(const NebulaCoopObjectState* pStates, u32 count) {

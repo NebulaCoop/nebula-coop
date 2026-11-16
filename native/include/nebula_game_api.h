@@ -402,7 +402,13 @@ typedef struct NebulaCoopPlayer {
     char character[32];         /* the character played (NebulaCharacters' id: "mario", "luigi", a mod's "wario"), its
                                    base NEBULA_COOP_PLAYER_LUIGI's. The host sends it when it changes (the session's
                                    player record), not in the snapshot: the others read it in NebulaCoopRemotePlayer */
+    uint8_t palette[24];        /* the player's colours (sm64coopdx's palette): its eight parts in order (nebula_mod_api.h's
+                                   NEBULA_PALETTE_*, nebula_palette.hpp), red, green and blue each. Sent as `character` is,
+                                   with it */
+    uint8_t has_palette;        /* 0: not told yet (a copy shows its character's own colours) */
+    uint8_t reserved_palette[3];
 } NebulaCoopPlayer;
+
 
 enum {
     NEBULA_COOP_PLAYER_LUIGI = 1u << 0, /* the file plays Luigi */
@@ -463,6 +469,9 @@ typedef struct NebulaCoopListPlayer {
     uint32_t flags;    /* NEBULA_COOP_LIST_* */
     uint32_t stars;    /* the Power Stars they got in this room, new to its save (coop_star_count; mods' coop_stars) */
     char character[32]; /* the character they play (NebulaCoopPlayer's `character`), its base NEBULA_COOP_LIST_LUIGI's */
+    uint8_t palette[24]; /* their colours (NebulaCoopPlayer's `palette`) */
+    uint8_t has_palette; /* 0: not told yet */
+    uint8_t reserved_palette[3];
 } NebulaCoopListPlayer;
 
 enum {
@@ -1284,6 +1293,9 @@ typedef struct NebulaHostServices {
     /* Online co-op: a mod's line in the chat for this player alone (the mod API's coop_chat_say). Called on the
        simulation thread. */
     void (*coop_chat_say)(void* user, const char* utf8);
+    /* The colours the player wants (Options' PLAYER page, sm64coopdx's palette): 1 with them in `palette` (24 bytes, as
+       NebulaCoopPlayer's), 0 for their character's own. Called on the simulation thread. */
+    int (*coop_palette_wanted)(void* user, uint8_t* palette);
 } NebulaHostServices;
 
 

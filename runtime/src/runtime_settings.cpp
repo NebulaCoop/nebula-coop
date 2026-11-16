@@ -1,5 +1,7 @@
 #include "galaxy/portable.h"
 #include "galaxy/runtime_settings.h"
+
+#include <nebula_palette.hpp>
 #include "galaxy/atomic_file.h"
 #include "galaxy/input_bindings.h"
 #include "galaxy/launch_args.h"
@@ -169,6 +171,11 @@ RuntimeSettings sanitize_settings(RuntimeSettings settings) {
         settings.coop.character = CoopCharacter::Mario;
     }
     settings.coop.character_id = clean_character_id(settings.coop.character_id);
+    if (const auto palette = parse_coop_palette(settings.coop.palette)) {
+        settings.coop.palette = format_coop_palette(*palette);
+    } else {
+        settings.coop.palette.clear();
+    }
     if (settings.coop.character_id == "mario" || settings.coop.character_id == "luigi") settings.coop.character_id.clear();
     settings.coop.join_address = sanitize_coop_text(settings.coop.join_address, kCoopAddressLimit);
     // Only a web address: it is only ever connected to, never shown.
@@ -316,6 +323,8 @@ void apply_kv(RuntimeSettings& settings, const char* key, const char* value) {
         }
     } else if (std::strcmp(key, "coop_character_id") == 0) {
         settings.coop.character_id = value;
+    } else if (std::strcmp(key, "coop_palette") == 0) {
+        settings.coop.palette = value;
     } else if (std::strcmp(key, "coop_join_address") == 0) {
         settings.coop.join_address = value;
     } else if (std::strcmp(key, "coop_network") == 0) {
@@ -731,6 +740,7 @@ bool save_runtime_settings_to_file() {
             contents << "coop_character=" << coop_character_key(settings.coop.character) << '\n';
         }
         if (!settings.coop.character_id.empty()) contents << "coop_character_id=" << settings.coop.character_id << '\n';
+        if (!settings.coop.palette.empty()) contents << "coop_palette=" << settings.coop.palette << '\n';
         if (!settings.coop.join_address.empty()) {
             contents << "coop_join_address=" << settings.coop.join_address << '\n';
         }
@@ -849,9 +859,52 @@ std::string coop_character_id(const RuntimeCoopSettings& coop) {
     return coop.character_id.empty() ? std::string(coop_character_key(coop.character)) : coop.character_id;
 }
 
+std::optional<CoopPalette> parse_coop_palette(std::string_view text) {
+    CoopPalette palette{};
+    std::size_t part = 0, start = 0;
+    while (true) {
+        const std::size_t comma = text.find(',', start);
+        std::string piece(text.substr(start, comma == std::string_view::npos ? std::string_view::npos : comma - start));
+        while (!piece.empty() && piece.front() == ' ') piece.erase(piece.begin());
+        while (!piece.empty() && piece.back() == ' ') piece.pop_back();
+        const std::int32_t color = nebula_palette::parseColor(piece.c_str());
+        if (color < 0 || part >= nebula_palette::PartCount) return std::nullopt;
+        palette[part * 3] = static_cast<std::uint8_t>(color >> 16);
+        palette[part * 3 + 1] = static_cast<std::uint8_t>(color >> 8);
+        palette[part * 3 + 2] = static_cast<std::uint8_t>(color);
+        ++part;
+        if (comma == std::string_view::npos) break;
+        start = comma + 1;
+    }
+    if (part != nebula_palette::PartCount) return std::nullopt;
+    return palette;
+}
+
+std::string format_coop_palette(const CoopPalette& palette) {
+    std::string out;
+    char piece[8];
+    for (std::size_t part = 0; part < nebula_palette::PartCount; ++part) {
+        std::snprintf(piece, sizeof(piece), "%02x%02x%02x", palette[part * 3], palette[part * 3 + 1], palette[part * 3 + 2]);
+        if (!out.empty()) out += ',';
+        out += piece;
+    }
+    return out;
+}
+
 namespace {
 std::mutex g_playable_lock;
 std::vector<PlayableCharacter> g_playable;
+
+CoopPalette palette_bytes(const nebula_palette::Palette& palette) {
+    CoopPalette out{};
+    std::memcpy(out.data(), &palette, out.size());
+    return out;
+}
+
+std::string upper_text(std::string text) {
+    for (char& c : text) c = (c >= 'a' && c <= 'z') ? static_cast<char>(c - 'a' + 'A') : c;
+    return text;
+}
 }  // namespace
 
 std::vector<PlayableCharacter> playable_characters() {
@@ -859,7 +912,60 @@ std::vector<PlayableCharacter> playable_characters() {
         const std::lock_guard<std::mutex> lock(g_playable_lock);
         if (!g_playable.empty()) return g_playable;
     }
-    return {{"mario", "MARIO", CoopCharacter::Mario}, {"luigi", "LUIGI", CoopCharacter::Luigi}};
+    return {{"mario", "MARIO", CoopCharacter::Mario, palette_bytes(nebula_palette::cMario)},
+            {"luigi", "LUIGI", CoopCharacter::Luigi, palette_bytes(nebula_palette::cLuigi)}};
+}
+
+std::vector<PalettePreset> palette_presets() {
+    std::vector<PalettePreset> presets;
+    for (const PlayableCharacter& character : playable_characters()) presets.push_back({upper_text(character.name), character.palette});
+    // sm64coopdx's other presets in the game's tones, and its look with a Fire Flower; one a character already names is
+    // that character's own.
+    struct Extra {
+        const char* name;
+        std::uint32_t parts[nebula_palette::PartCount];
+    };
+    static constexpr Extra kExtras[] = {
+        {"FIRE MARIO", {0xc80000, 0xf0f0f0, 0xffffff, 0x6e3214, 0x4a1400, 0xffaa84, 0xf0f0f0, 0xc40000}},
+        {"FIRE LUIGI", {0x289418, 0xf0f0f0, 0xffffff, 0x6e3214, 0x421300, 0xffaa84, 0xf0f0f0, 0x219639}},
+        {"WARIO", {0x5c1a78, 0xe8b000, 0xffffff, 0x0e6a1c, 0x5a3c00, 0xf0b080, 0xe8b000, 0x1040c0}},
+        {"WALUIGI", {0x1c1c30, 0x5a22a0, 0xffffff, 0xe86a00, 0x5a3c00, 0xffaa84, 0x5a22a0, 0xf0d000}},
+        {"TOAD", {0xf0f0f0, 0x3a28b0, 0xffffff, 0x68401b, 0x4a1400, 0xffcca0, 0xdc0000, 0xdc0000}},
+        {"CLASSIC", {0x0000ff, 0xff0000, 0xffffff, 0x721c0e, 0x730600, 0xfec179, 0xff0000, 0xff0000}},
+    };
+    for (const Extra& extra : kExtras) {
+        if (std::any_of(presets.begin(), presets.end(), [&](const PalettePreset& p) { return p.name == extra.name; })) continue;
+        PalettePreset preset{extra.name, {}};
+        for (std::size_t part = 0; part < nebula_palette::PartCount; ++part) {
+            preset.palette[part * 3] = static_cast<std::uint8_t>(extra.parts[part] >> 16);
+            preset.palette[part * 3 + 1] = static_cast<std::uint8_t>(extra.parts[part] >> 8);
+            preset.palette[part * 3 + 2] = static_cast<std::uint8_t>(extra.parts[part]);
+        }
+        presets.push_back(std::move(preset));
+    }
+    return presets;
+}
+
+std::span<const NamedColor> named_colors() {
+    static constexpr NamedColor kColors[] = {
+        {"RED", 0xdc0000},       {"DARK RED", 0x800000},    {"PINK", 0xff70b0},      {"ORANGE", 0xff8000},
+        {"YELLOW", 0xf0d000},    {"GOLD", 0xe8b000},        {"LIME", 0x80e020},      {"GREEN", 0x289418},
+        {"DARK GREEN", 0x106010}, {"TEAL", 0x00a0a0},       {"CYAN", 0x40e0ff},      {"SKY BLUE", 0x60a0ff},
+        {"BLUE", 0x1040c0},      {"NAVY", 0x083084},        {"PURPLE", 0x5a22a0},    {"VIOLET", 0x9040e0},
+        {"MAGENTA", 0xe020c0},   {"WHITE", 0xffffff},       {"LIGHT GREY", 0xc0c0c0}, {"GREY", 0x808080},
+        {"DARK GREY", 0x404040}, {"BLACK", 0x181818},       {"TAN", 0xd0a060},       {"BROWN", 0x6e3214},
+        {"DARK BROWN", 0x4a1400}, {"PALE SKIN", 0xffd0b0},  {"SKIN", 0xffaa84},      {"DARK SKIN", 0xa06040},
+    };
+    return kColors;
+}
+
+CoopPalette own_palette(const RuntimeCoopSettings& coop) {
+    const std::vector<PlayableCharacter> characters = playable_characters();
+    const std::string wanted = coop_character_id(coop);
+    for (const PlayableCharacter& character : characters) {
+        if (character.id == wanted) return character.palette;
+    }
+    return palette_bytes(coop.character == CoopCharacter::Luigi ? nebula_palette::cLuigi : nebula_palette::cMario);
 }
 
 void set_playable_characters(std::vector<PlayableCharacter> characters) {

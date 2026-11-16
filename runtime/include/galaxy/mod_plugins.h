@@ -130,6 +130,7 @@ struct CharacterToAdd {
     std::string name;
     std::string like;
     std::string archive;
+    std::vector<int> palette;  // luma::Character's
 };
 
 // A power-up from data (luma::Form), for the mod that adds it.
