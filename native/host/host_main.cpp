@@ -93,6 +93,7 @@
 #endif
 #include <nebula_frame_list.h>
 #include "galaxy/render/rt_materials.h"
+#include "galaxy/render/rt_caps.h"
 #include "galaxy/render/texture_pack.h"
 #if defined(NEBULA_HOST_D3D12)
 #endif
@@ -1578,6 +1579,13 @@ void submit_frame(bool present, bool black) {
 void svc_game_stage(void*, const char* name) {
     if (name != nullptr && gSceneStage != name) {
         gSceneStage = name;
+#if defined(NEBULA_HOST_RENDERER)
+        if (::galaxy::diagnosing(::galaxy::kDiagnoseRtInputs)) {
+            const std::uint32_t hash = galaxy::render::rt_stage_hash(gSceneStage);
+            std::fprintf(stderr, "[rt-inputs] stage %s: %08x, %s\n", name, hash,
+                         galaxy::render::rt_stage(hash) != nullptr ? "a row of its own" : "the defaults");
+        }
+#endif
     }
 }
 
@@ -3808,6 +3816,25 @@ const galaxy::assets::AssetStore& asset_table() {
     return gPak.store;
 }
 
+#if defined(NEBULA_HOST_RENDERER)
+// Ray tracing's tables in the pak (nebula-import: each stage's numbers, the particle effects' light), read once before
+// the renderer starts; a pak without them leaves the defaults.
+void load_rt_tables() {
+    const auto text_of = [](const char* path) {
+        std::string text;
+        const std::optional<galaxy::assets::Entry> entry = asset_table().find(path);
+        if (entry && !entry->folder) {
+            text.resize(static_cast<std::size_t>(entry->length));
+            if (!gPak.store.read(entry->position, text.size(), text.data())) {
+                text.clear();
+            }
+        }
+        return text;
+    };
+    galaxy::render::set_rt_tables(text_of(galaxy::render::kRtStagesPath), text_of(galaxy::render::kRtEffectsPath));
+}
+#endif
+
 int asset_entry_out(const std::optional<galaxy::assets::Entry>& entry, NebulaAssetEntry* out) {
     if (!entry) {
         return 0;
@@ -4109,6 +4136,19 @@ uint32_t svc_option(void*, uint32_t what) {
         return galaxy::host::touch_pointer_state();
 #else
         return 0;
+#endif
+    case NEBULA_OPTION_RAY_TRACING:
+#if defined(NEBULA_HOST_RENDERER)
+    {
+        if (!galaxy::render::get_render_config().ray_tracing_enabled || !galaxy::render::rt_capable(galaxy::render::rt_caps())) {
+            return 0u;
+        }
+        // A stage's row may keep its shadow light sets as the artists made them (rt_stages.tsv `shadow sets`).
+        const galaxy::render::RtStage* stage = galaxy::render::rt_stage(galaxy::render::rt_stage_hash(gSceneStage));
+        return NEBULA_RAY_TRACING_ON | (stage != nullptr && stage->shadow_sets_kept ? 0u : NEBULA_RAY_TRACING_SHADOW_SETS);
+    }
+#else
+        return 0u;
 #endif
     default:
         return 0;
@@ -5801,6 +5841,11 @@ int main(int argc, char** argv) {
             galaxy::render::set_movie_mod_folders(galaxy::mods::movie_folders(mods));
             prepare_mod_files(settings_folder, game_id, std::move(mods));
         }
+#if defined(NEBULA_HOST_RENDERER)
+        // Ray tracing's tables, with the mods' rows (their merge/NebulaData/RtStages.tsv and RtEffects.tsv) now that
+        // their store is attached.
+        load_rt_tables();
+#endif
         {
             // The session's mods, for crash reports: one line each, and whether one changes the game itself.
             std::string lines;
