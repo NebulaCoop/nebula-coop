@@ -7,6 +7,6 @@
 # patterns that look like email addresses.
 @C.pa
 
-# User paths baked into third-party compiled binaries (DXC DLLs, Rust binary metadata, etc.).
-# Nebula's own source code has no hardcoded user paths, so this is safe.
-C:\Users\
+# The build machine's user folder, baked into compiled binaries (Rust binary metadata and the like). Only GitHub's
+# runner account is let through, so a release built on, or carrying a path from, anyone's own PC still fails the check.
+C:\Users\runneradmin\
