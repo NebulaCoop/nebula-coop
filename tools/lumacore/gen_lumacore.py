@@ -939,7 +939,6 @@ def api_only():
         takes = ', '.join(f"{LETTERS[p.kind].upper() if p.role == 'inout' else LETTERS[p.kind]} {p.name}{'?' if p.has_default else ''}"
                           for p in r['params'])
         described[r['row']] = f'| `{r["row"]}` | {takes} | {r["res"]} |'
-    names = {r['row'] for r in rows}
     left = [l for l in doc[left_head + 2:] if l.startswith('| `') and not is_api_row(re.match(r'^\| `([^`]+)`', l).group(1))]
     left += [f'| `{n}` | {w} |' for n, w in api_left]
     left.sort(key=lambda l: re.match(r'^\| `([^`]+)`', l).group(1))
