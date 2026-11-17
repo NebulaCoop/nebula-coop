@@ -52,10 +52,13 @@ jobs:
             version=${REF_NAME#v}
             publish=true
           else
-            version=0.0.0-test.$GITHUB_RUN_NUMBER
+            # A dry run's Setup is never published. 0.0.<run> is a version build-native-setup.ps1 and
+            # tools/release_manifest.py accept (X.Y.Z or X.Y.Z-beta.N), and no install would take it as an update.
+            version=0.0.$GITHUB_RUN_NUMBER
             publish=false
           fi
-          if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+          # The versions build-native-setup.ps1 and the updaters take: a bad tag fails here, before the builds.
+          if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$'; then
             echo "::error::$REF_NAME is not a version tag (v1.2.3, or v1.2.3-beta.1)"
             exit 1
           fi
@@ -263,13 +266,9 @@ jobs:
         # The in-game updater (runtime/src/update/update.cpp) offers a release only when it carries
         # <Setup>.manifest and <Setup>.manifest.sig: the signed name, size and SHA-256 it installs.
         # tools/release_manifest.py writes it; the release key signs it as build-native-setup.ps1 signs Setup.
-        # A dry run's version (0.0.0-test.N) isn't a release version, so its manifest says 0.0.0 and is never published.
-        env:
-          PUBLISH: ${{ needs.version.outputs.publish }}
         run: |
           $setup = Join-Path $env:RUNNER_TEMP "dist\$env:SETUP"
-          $version = if ($env:PUBLISH -eq 'true') { $env:VERSION } else { '0.0.0' }
-          python tools/release_manifest.py $setup $version
+          python tools/release_manifest.py $setup $env:VERSION
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $key = Join-Path $env:USERPROFILE '.nebula-release-key\nebula-release-private.xml'
           if (-not (Test-Path -LiteralPath $key)) {
