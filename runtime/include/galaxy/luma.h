@@ -232,6 +232,8 @@ struct Rows {
 // Any new field here must also be counted in layer_sets_game.
 struct Layer {
     std::string path;
+    // Listed with pre_standard rows: a layer made of them alone has no folder (a .luma holds no empty folders).
+    bool old_rows = false;
     Rows rows;
     std::map<std::string, std::string> materials;  // material name -> its shader
     std::vector<ObjectChange> object_changes;

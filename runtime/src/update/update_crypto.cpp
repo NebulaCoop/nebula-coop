@@ -13,11 +13,12 @@ namespace {
 
 // installer/release-public-key.xml's modulus (the key the Windows setups are signed with; update_tests checks the copy).
 constexpr std::string_view kReleaseModulus =
-    "rUk5e121s2AdrxlsfX2k8jjcuGmiMrgQ2vqzUq3k0ed5/VjFko4leTGUpcCtDSjlR+UToFHSdmubvhB4yPFMRptscbBzEyNyKYHO6EBp+RY7iBldBN0piup"
-    "FpxTWiXHPklRiBIZHDjERcWFY/PrwyYS5SMnJ7eWL7AvFCVSU97+xJBJgQ9G3ZEaxqQyHD6OBSpwGyHuI8t9m8yx63fsmA53JdDCFPIf1PuDp6BBACfsMBq47W1"
-    "TMH61UxjLC4m9ToLgsCe1qVfwLAt3KZS8SCGTI0txejW2kydWdo5dsRhqP5TJpSy289S3pjQYjIB1wHvNyafifyikS6D8BN2z1crP9lGykOD2vBy+e5vfR5BYu/"
-    "ziXlCVKBfA95833NxFfGoWyZZhZGNV3gzkX5gEdfJe4kb5bQnGYfAKcw5lhdMufv6QLjlKVD5RTgORobOa0ivKzt3JdIb0jpX/xVwgHe2aNVo+LlyjgMc1eOy4I"
-    "JnMYfdtzDctbUVjQPiuZv5PN";
+    "x0FTvuir5ejd/RBdkkvw90KGN/S2qTLAE7maA22W2zmkv1ATdmKoKg+IAjv75qe003seLK/M3QdqGeAOWuKZcDxSrzJ1i3HITTLa40XynxmFWGLc+ie8CRbVQ"
+    "MfCKxGz7Df+k0U/N9UjJxar+3gXUX+6g1LbQ4oVRWLU3Qc9LDGOEBl6aKCSKQ3fmbjj1E2oIA73w7vw/KWu7qiOYpnDya4PNbYI3lxJ7c5xa0cCWqPdQI/r8H"
+    "3IoaLF/w2p0N8f9jfy0vnxKxbotBwSsENnr6MgkOU/XPfZnW/euovkNh/kZmoXzbMRp5n5QkCIbOrLhOYAw9BVvde2eTJ9d2+PlR3ypYzw2yUA0SXI+Q+0Stz"
+    "pIgMnBe3AwCfkgEMEJT6YKvUttRzWyUZmE+HAZKEZQNSK1OJd+RbTQjFO/FSwKYCq3YPqqWXx8OesbkWjcP0MpyHQd9jPlst59MDCc29D9I8+MDSu/jIjq0qK"
+    "sD06NRdS5iZrbVJPQb8VjgsJTt8GjW8LLDV0KRW9xNRrT5FWbyikWcn9QjKkYsPsbIc7f1fM34nL+Hz37ex9y8KKd2hRtWASZzwFbcSteYmEWrEygObzgEEhk"
+    "ERvpGLVIuo3vH8z0Ow5wEoUwG4qTRamap3bT/LcSbcW8UaaIs5Nc7M42VRdydeq3xI3q4W1bUFmSb0=";
 constexpr std::uint32_t kReleaseExponent = 65537u;  // AQAB
 // Tests: a key of their own (set before any check runs).
 std::string_view g_modulus = kReleaseModulus;

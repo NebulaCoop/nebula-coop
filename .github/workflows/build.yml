@@ -350,7 +350,7 @@ jobs:
         run: |
           mkdir -p dist
           cp build/host/nebula dist/Nebula
-          cp -L build/host/SDL3/libSDL3.so.0 build/game/libsmg_game.so target/release/nebula-import dist/
+          cp -L build/host/libSDL3.so.0 build/game/libsmg_game.so target/release/nebula-import dist/
           patchelf --set-rpath '$ORIGIN' dist/Nebula
           cp LICENSE THIRD-PARTY-NOTICES.md docs/TEST_BUILDS.md dist/
           # Artifacts drop file modes: a tar keeps the programs executable.

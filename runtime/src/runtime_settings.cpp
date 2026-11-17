@@ -171,11 +171,11 @@ RuntimeSettings sanitize_settings(RuntimeSettings settings) {
     settings.coop.password = sanitize_coop_text(settings.coop.password);
     if (settings.coop.character > CoopCharacter::Luigi) {
         settings.coop.character = CoopCharacter::Mario;
+    }
     if (const auto palette = parse_coop_palette(settings.coop.palette)) {
         settings.coop.palette = format_coop_palette(*palette);
     } else {
         settings.coop.palette.clear();
-    }
     }
     settings.coop.character_id = clean_character_id(settings.coop.character_id);
     if (settings.coop.character_id == "mario" || settings.coop.character_id == "luigi") settings.coop.character_id.clear();

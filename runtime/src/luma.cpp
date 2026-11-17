@@ -1092,6 +1092,7 @@ std::optional<Manifest> parse_manifest(std::string_view text) {
             layer.when = read_form_when(entry.get("when"));
             if (const Value* old = pre_layers != nullptr ? pre_layers->get(name) : nullptr) {
                 if (!read_old_layer(*old, layer)) return std::nullopt;
+                layer.old_rows = true;
                 // The old `when` (mods, version, not, any) and-ed with the form's: one any_of entry.
                 if (const Value* old_when = old->get("when"); old_when != nullptr) {
                     layer.when.any_of.push_back(read_when(old_when));
@@ -1155,6 +1156,13 @@ std::optional<Manifest> read_manifest(const std::filesystem::path& folder) {
     if (!in) return std::nullopt;
     const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     std::optional<Manifest> manifest = parse_manifest(text);
+    // A listed layer of pre_standard rows alone has no folder: nothing to read from one (luma-validate's L300 allows it).
+    if (manifest) {
+        for (Layer& layer : manifest->layers) {
+            std::error_code folder_error;
+            if (layer.old_rows && !layer.path.empty() && !std::filesystem::exists(folder / layer.path, folder_error)) layer.path.clear();
+        }
+    }
     // No "layers": the one layer "base" when layers/base is there (luma.md 4).
     std::error_code base_error;
     if (manifest && !manifest->layers_listed && std::filesystem::is_directory(folder / "layers" / "base", base_error)) {

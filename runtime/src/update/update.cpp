@@ -34,7 +34,7 @@ constexpr std::size_t kMaxSignatureBytes = 65536u;
 constexpr std::uint64_t kMaxPackageBytes = 2ull << 30;  // a release without a size in the listing
 constexpr std::size_t kNotesLimit = 1500u;
 // As Nebula Setup reads it (installer/native/setup_engine.cpp, updater::FindNewer).
-constexpr const char* kReleasesUrl = "https://api.github.com/repos/keepvaibin/nebula/releases?per_page=30";
+constexpr const char* kReleasesUrl = "https://api.github.com/repos/NebulaCoop/nebula-coop/releases?per_page=30";
 
 // ---- JSON: the subset a release listing and update-check.json use ----
 
