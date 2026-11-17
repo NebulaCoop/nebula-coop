@@ -7,7 +7,9 @@
 #include "Game/Screen/NebulaAchievementBoard.hpp"
 #include "Game/Screen/NebulaPaneKit.hpp"
 #include "Game/Screen/NebulaUi.hpp"
+#include "Game/System/NebulaCoopMods.hpp"
 #include "Game/System/NebulaText.hpp"
+#include "nebula_text_tags.h"
 #include "Game/Util/PlayerInputUtil.hpp"
 #include "Game/Util/LayoutUtil.hpp"
 #include "Game/Util/MessageUtil.hpp"
@@ -34,7 +36,7 @@ namespace {
     const f32 cRowInset = 8.0f;      // a row's text from its frame's sides
     const f32 cNumberWidth = 22.0f;  // the player's number, before the name
     const f32 cPingWidth = 52.0f;    // the round trip, at the row's right
-    const f32 cStarsWidth = 44.0f;   // the Power Stars they got in this room, before it
+    const f32 cDescriptionMax = 160.0f;  // a mod's text beside them (coop_set_description), before it, at its widest
     const f32 cColumnGap = 10.0f;
     const f32 cTitleSize = 17.0f;
     const f32 cTextSize = 14.0f;
@@ -61,7 +63,7 @@ namespace {
     const u32 cPingGood = 0x9CE6A4FF;
     const u32 cPingFair = 0xFFD860FF;
     const u32 cPingPoor = 0xFF8A7AFF;
-    const s32 cGlyphPowerStar = '7';  // the picture font's Power Star (MR::addPictureFontTag)
+    const u32 cDescriptionBytes = 96;  // NebulaCoopMods' longest description
 
     struct Row {
         Pane* mRoot;
@@ -70,11 +72,15 @@ namespace {
         TextBox* mName;
         TextBox* mTag;  // Host
         TextBox* mPlace;
-        TextBox* mStars;
+        TextBox* mDescription;  // the mods' text beside them (coop_set_description), as sm64coopdx's list has it
         TextBox* mPing;
         f32 mNameWidth;
         f32 mTagWidth;
         f32 mPlaceWidth;
+        f32 mDescriptionWidth;
+        // The description it shows, and its colour.
+        char mShownDescription[cDescriptionBytes];
+        u32 mShownColor;
     };
 
     char16_t* appendAscii(char16_t* pDst, char16_t* pEnd, const char* pSrc) {
@@ -114,7 +120,15 @@ namespace {
 
     bool isSamePlayer(const NebulaCoopListPlayer& rA, const NebulaCoopListPlayer& rB) {
         return strcmp(rA.name, rB.name) == 0 && strcmp(rA.stage, rB.stage) == 0 && rA.scenario == rB.scenario &&
-               rA.number == rB.number && rA.flags == rB.flags && rA.stars == rB.stars;
+               rA.number == rB.number && rA.flags == rB.flags;
+    }
+
+    // Whether the row's description is the mods' one for its player now.
+    bool isSameDescription(const Row& rRow, const char* pText, u32 color) {
+        if (pText == nullptr) {
+            return rRow.mShownDescription[0] == '\0';
+        }
+        return rRow.mShownColor == color && strcmp(rRow.mShownDescription, pText) == 0;
     }
 };  // namespace
 
@@ -153,11 +167,14 @@ namespace {
         bool changed = p->mShownCount != p->mCount || p->mShownRoomSize != p->mRoomSize;
         for (s32 i = 0; i < p->mCount; i++) {
             const NebulaCoopListPlayer& rPlayer = p->mPlayers[i];
-            if (i < p->mShownCount && isSamePlayer(p->mShown[i], rPlayer)) {
+            Row& rRow = p->mRows[i];
+            u32 descriptionColor = cWhite;
+            const char* pDescription = NebulaCoopMods::description(static_cast< s32 >(rPlayer.number) - 1, &descriptionColor);
+            if (i < p->mShownCount && isSamePlayer(p->mShown[i], rPlayer) &&
+                isSameDescription(rRow, pDescription, descriptionColor)) {
                 continue;
             }
             changed = true;
-            Row& rRow = p->mRows[i];
             char16_t text[160];
             char number[12];
             nebula_snprintf(number, sizeof(number), "%u", rPlayer.number);
@@ -177,14 +194,17 @@ namespace {
             setText(rRow.mPlace, text);
             const u32 placeColor = rPlayer.stage[0] != 0 ? cSubText : cDimText;
             setTextColor(rRow.mPlace, placeColor, placeColor);
-            // The Personal Star Counter: a Power Star and how many they got here, as sm64coopdx's list shows them; only
-            // while the room plays the mod.
-            char stars[12];
-            nebula_snprintf(stars, sizeof(stars), "%u", rPlayer.stars > 9999u ? 9999u : rPlayer.stars);
-            appendAscii(MR::addPictureFontTag(text, cGlyphPowerStar), text + 16, stars);
-            setText(rRow.mStars, text);
-            setTextColor(rRow.mStars, rPlayer.stars != 0 ? cWhite : cDimText, rPlayer.stars != 0 ? cWhite : cDimText);
-            rRow.mStars->SetVisible((rPlayer.flags & NEBULA_COOP_LIST_STARS) != 0);
+            // What a mod says of them (the Personal Star Counter's Power Stars got here), message tags and all.
+            text[0] = 0;
+            rRow.mShownDescription[0] = '\0';
+            rRow.mShownColor = descriptionColor;
+            if (pDescription != nullptr) {
+                nebula_snprintf(rRow.mShownDescription, sizeof(rRow.mShownDescription), "%s", pDescription);
+                nebula_text::encode(pDescription, text, 64);
+            }
+            setText(rRow.mDescription, text);
+            setTextColor(rRow.mDescription, descriptionColor, descriptionColor);
+            rRow.mDescription->SetVisible(text[0] != 0);
 
             f32 width, height;
             rRow.mPlace->mScale = Vec2f(1.0f, 1.0f);
@@ -192,7 +212,10 @@ namespace {
             measure(rRow.mName, 4000.0f, &rRow.mNameWidth, &height);
             measure(rRow.mTag, 4000.0f, &rRow.mTagWidth, &height);
             measure(rRow.mPlace, 4000.0f, &rRow.mPlaceWidth, &height);
-            measure(rRow.mStars, 4000.0f, &width, &height);
+            rRow.mDescriptionWidth = 0.0f;
+            if (rRow.mDescription->IsVisible()) {
+                measure(rRow.mDescription, 4000.0f, &rRow.mDescriptionWidth, &height);
+            }
             if (!rRow.mTag->IsVisible()) {
                 rRow.mTagWidth = 0.0f;
             }
@@ -272,8 +295,8 @@ namespace {
             shape(rRow.mFrame, 0.0f, 0.0f, right - left, cRowHeight, cRowRadius);
             paint(rRow.mFrame, you ? cYouFill : cRowFill, you ? cYouRing : cRowRing);
 
-            // Number, name and Host from the left; the round trip at the right, the stars and the place before it,
-            // the place narrowed to fit.
+            // Number, name and Host from the left; the round trip at the right, the description and the place before
+            // it, the place narrowed to fit.
             f32 x = left + cRowInset;
             rRow.mNumber->mTranslate = Vec3f(x, textCentre(0.0f, cSmallSize), 0.0f);
             x += cNumberWidth;
@@ -286,10 +309,20 @@ namespace {
             }
             const f32 pingRight = right - cRowInset;
             rRow.mPing->mTranslate = Vec3f(pingRight, textCentre(0.0f, cSmallSize), 0.0f);
-            const f32 starsRight = pingRight - cPingWidth - cColumnGap;
-            rRow.mStars->mTranslate = Vec3f(starsRight, textCentre(0.0f, cSmallSize), 0.0f);
-            // Without the room's Personal Star Counter the place takes the stars' column.
-            const f32 placeRight = rRow.mStars->IsVisible() ? starsRight - cStarsWidth - cColumnGap : starsRight;
+            const f32 descriptionRight = pingRight - cPingWidth - cColumnGap;
+            rRow.mDescription->mTranslate = Vec3f(descriptionRight, textCentre(0.0f, cSmallSize), 0.0f);
+            // The descriptions line up as one column, as wide as the widest (to cDescriptionMax); without any, the
+            // place takes it.
+            f32 column = 0.0f;
+            for (s32 j = 0; j < p->mCount; j++) {
+                const f32 width = p->mRows[j].mDescriptionWidth;
+                column = width > column ? width : column;
+            }
+            column = column > cDescriptionMax ? cDescriptionMax : column;
+            const f32 squeezeText =
+                rRow.mDescriptionWidth > column && rRow.mDescriptionWidth > 0.0f ? column / rRow.mDescriptionWidth : 1.0f;
+            rRow.mDescription->mScale = Vec2f(squeezeText, 1.0f);
+            const f32 placeRight = column > 0.0f ? descriptionRight - column - cColumnGap : descriptionRight;
             const f32 room = placeRight - (x + cColumnGap);
             const f32 squeeze = rRow.mPlaceWidth > room && rRow.mPlaceWidth > 0.0f ? (room > 0.0f ? room : 0.0f) / rRow.mPlaceWidth : 1.0f;
             rRow.mPlace->mScale = Vec2f(squeeze, 1.0f);
@@ -365,12 +398,12 @@ void NebulaPlayerList::init(const TableIter& rIter) {
         rRow.mTag = makeText(kits, rRow.mRoot, name, 32);
         nebula_snprintf(name, sizeof(name), "NbPlPlace%d", i);
         rRow.mPlace = makeText(kits, rRow.mRoot, name, 160);
-        nebula_snprintf(name, sizeof(name), "NbPlStar%d", i);
-        rRow.mStars = makeText(kits, rRow.mRoot, name, 16);
+        nebula_snprintf(name, sizeof(name), "NbPlDesc%d", i);
+        rRow.mDescription = makeText(kits, rRow.mRoot, name, 64);
         nebula_snprintf(name, sizeof(name), "NbPlPing%d", i);
         rRow.mPing = makeText(kits, rRow.mRoot, name, 16);
         if (rRow.mFrame == nullptr || rRow.mNumber == nullptr || rRow.mName == nullptr || rRow.mTag == nullptr ||
-            rRow.mPlace == nullptr || rRow.mStars == nullptr || rRow.mPing == nullptr) {
+            rRow.mPlace == nullptr || rRow.mDescription == nullptr || rRow.mPing == nullptr) {
             rRow.mRoot = nullptr;
             return;
         }
@@ -378,7 +411,7 @@ void NebulaPlayerList::init(const TableIter& rIter) {
         setTextStyle(rRow.mName, cTextSize, cMario, cMario, 3);
         setTextStyle(rRow.mTag, cSmallSize, cGold, cGold, 3);
         setTextStyle(rRow.mPlace, cSmallSize, cSubText, cSubText, 5);
-        setTextStyle(rRow.mStars, cSmallSize, cWhite, cWhite, 5);
+        setTextStyle(rRow.mDescription, cSmallSize, cWhite, cWhite, 5);
         setTextStyle(rRow.mPing, cSmallSize, cPingGood, cPingGood, 5);
         rRow.mRoot->SetVisible(false);
     }

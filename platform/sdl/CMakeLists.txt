@@ -369,6 +369,9 @@ target_sources(main PRIVATE ${galaxy_programs_spirv})
 # The game API's and online play's fingerprints (cmake/nebula_fingerprint.cmake): no version to bump by hand.
 include("${nebula_root}/cmake/nebula_fingerprint.cmake")
 nebula_fingerprint("${nebula_root}" "${nebula_root}/native/petari" "${CMAKE_CURRENT_BINARY_DIR}/generated")
+# The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake), for mods.cpp.
+include("${nebula_root}/cmake/nebula_builtin_mods.cmake")
+nebula_builtin_mods("${nebula_root}" "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_include_directories(main PRIVATE "${nebula_root}/native/include" "${nebula_root}/runtime/include"
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_compile_definitions(main PRIVATE NEBULA_HOST_RENDERER=1 NEBULA_HOST_SDL=1)

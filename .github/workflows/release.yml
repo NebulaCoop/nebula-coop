@@ -92,6 +92,9 @@ jobs:
             baseline: 'ON'
     steps:
       - uses: actions/Checkout@v7
+      # The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake).
+      - name: Built-in mods
+        run: git submodule update --init --depth 1 lumalink
       - name: Build Nebula, NebulaVk and NebulaD11
         # A release build: cross-file optimization on (NEBULA_HOST_IPO's default). There is one build kind: tests
         # attach their hooks from outside (tools/release_check.ps1 checks no source names a build kind).
@@ -131,6 +134,9 @@ jobs:
     timeout-minutes: 300
     steps:
       - uses: actions/Checkout@v7
+      # The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake).
+      - name: Built-in mods
+        run: git submodule update --init --depth 1 lumalink
       - name: LLVM
         # The row generator needs libclang 21 or later (tools/lumacore/instrument.py), the runner's may be older.
         shell: bash

@@ -369,8 +369,9 @@ bool layer_only_mods() {
     return ok;
 }
 
-// NebulaCoop's built-in Character Movesets: written into the mods folder, off until turned on, a working .luma that
-// gives Luigi his numbers alone, written again when changed, and kept on once the player turns it on.
+// NebulaCoop's built-in mods (lumalink/builtin/*.lumacoop): written into the mods folder, off until turned on;
+// Character Movesets a working .luma that gives Luigi his numbers alone, written again when changed, and kept on once
+// the player turns it on.
 bool builtin_mods() {
     bool ok = true;
     const fs::path root = galaxy::test_temp_path("nebula_mods_builtin");
@@ -404,6 +405,14 @@ bool builtin_mods() {
         brake = brake || (constant.name == "mBrakeSlide" && constant.value == 1.0f);
     }
     ok &= expect(luigi_only && brake, "on, it sets Luigi's numbers alone, his long brake among them");
+    // The Personal Star Counter: its luma.json and its compiled script, as the package in LumaLink-coop has them.
+    const fs::path psc = root / "mods" / "personal-star-counter";
+    ok &= expect(galaxy::mods::is_builtin_mod("personal-star-counter") && fs::is_regular_file(psc / "luma.json") &&
+                     read_all(psc / "layers/base/files/LumaScripts/personal-star-counter/psc.lumascript").size() > 0u,
+                 "the Personal Star Counter is one, with its script");
+    const auto counter = std::find_if(mods.begin(), mods.end(), [](const galaxy::mods::ModInfo& m) { return m.id == "personal-star-counter"; });
+    ok &= expect(counter != mods.end() && !counter->enabled && counter->package && counter->problem.empty(),
+                 "it is listed, usable and off");
     ok &= expect(galaxy::mods::save_mod_settings(mods), "the player's choice saved");
     write(manifest, "{}");
     ok &= expect(galaxy::mods::install_builtin_mods() && read_all(manifest) == first, "a changed copy written again");

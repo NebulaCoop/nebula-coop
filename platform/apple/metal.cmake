@@ -57,6 +57,10 @@ if(TARGET nebula_archive)
     target_link_libraries(galaxy_render_mtl PUBLIC nebula_archive)
 endif()
 target_include_directories(galaxy_render_mtl PUBLIC "${nebula_root}/runtime/src" "${nebula_root}/runtime/include")
+# The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake), for mods.cpp: source
+# properties belong to a directory, so this one sets its own.
+include("${nebula_root}/cmake/nebula_builtin_mods.cmake")
+nebula_builtin_mods("${nebula_root}" "${CMAKE_BINARY_DIR}/generated")
 target_include_directories(galaxy_render_mtl PRIVATE "${nebula_root}/third_party/smaa" "${nebula_root}/native/include"
     "${nebula_apple_utility_msl_dir}")
 target_link_libraries(galaxy_render_mtl PRIVATE nebula_msl)

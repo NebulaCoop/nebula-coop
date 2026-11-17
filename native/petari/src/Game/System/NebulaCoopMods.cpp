@@ -25,6 +25,31 @@ namespace {
     Room sNow = {};
     Room sBefore = {};
 
+    // What this player's mods put beside each player in the list (coop_set_description), by index.
+    const u32 cDescriptionBytes = 96;
+    struct Description {
+        char mText[cDescriptionBytes];
+        u32 mColor;
+    };
+    Description sDescriptions[cSlots] = {};
+
+    void clearDescription(s32 index) {
+        if (index >= 0 && index < cSlots) {
+            sDescriptions[index].mText[0] = '\0';
+            sDescriptions[index].mColor = 0xFFFFFFFF;
+        }
+    }
+
+    // The mods' chat commands this player typed, taken from the host and sent as chat_command events.
+    void takeCommands() {
+        char command[32];
+        s32 word = 0;
+        // A few a frame at most: one typed line is one command.
+        for (s32 i = 0; i < 4 && NebulaHost::coopCommandTake(command, sizeof(command), &word) != 0; i++) {
+            NebulaMods::fire(NEBULA_MOD_EVENT_COOP_COMMAND, word, nullptr, command);
+        }
+    }
+
     bool valid(s32 index) {
         return index >= 0 && index < cSlots && sNow.mHas[index];
     }
@@ -68,6 +93,7 @@ namespace NebulaCoopMods {
         }
         sBefore = sNow;
         read(sNow);
+        takeCommands();
         if (sNow.mIn && !sBefore.mIn) {
             // The players already there come with the room, as sm64coopdx's joined game: no join for each.
             NebulaMods::fire(NEBULA_MOD_EVENT_COOP_ROOM_JOINED, sNow.mMe);
@@ -80,6 +106,9 @@ namespace NebulaCoopMods {
         }
         if (!sNow.mIn) {
             if (sBefore.mIn) {
+                for (s32 i = 0; i < cSlots; i++) {
+                    clearDescription(i);
+                }
                 NebulaMods::fire(NEBULA_MOD_EVENT_COOP_ROOM_CLOSED);
             }
             return;
@@ -90,6 +119,7 @@ namespace NebulaCoopMods {
             const bool was = sBefore.mHas[i];
             const bool is = sNow.mHas[i];
             if (was && !is) {
+                clearDescription(i);
                 NebulaMods::fire(NEBULA_MOD_EVENT_COOP_PLAYER_LEAVE, i, nullptr, sBefore.mPlayers[i].name);
             }
             if (is && !was) {
@@ -206,5 +236,44 @@ namespace NebulaCoopMods {
 
     s32 ping(s32 index) {
         return sNow.mIn && valid(index) ? static_cast< s32 >(sNow.mPlayers[index].ping_ms) : 0;
+    }
+
+    void setDescription(s32 index, const char* pUtf8, u32 rgba) {
+        if (index < 0 || index >= cSlots) {
+            return;
+        }
+        if (pUtf8 == nullptr || pUtf8[0] == '\0') {
+            clearDescription(index);
+            return;
+        }
+        Description& rDescription = sDescriptions[index];
+        u32 i = 0;
+        for (; i + 1 < cDescriptionBytes && pUtf8[i] != '\0'; i++) {
+            rDescription.mText[i] = pUtf8[i];
+        }
+        // Not inside a character cut in two: back to its first byte.
+        if (pUtf8[i] != '\0') {
+            while (i > 0 && (static_cast< u8 >(rDescription.mText[i]) & 0xC0) == 0x80) {
+                i--;
+            }
+        }
+        rDescription.mText[i] = '\0';
+        rDescription.mColor = rgba;
+    }
+
+    const char* description(s32 index, u32* pColor) {
+        if (index < 0 || index >= cSlots || sDescriptions[index].mText[0] == '\0') {
+            return nullptr;
+        }
+        if (pColor != nullptr) {
+            *pColor = sDescriptions[index].mColor;
+        }
+        return sDescriptions[index].mText;
+    }
+
+    void chatSay(const char* pUtf8) {
+        if (pUtf8 != nullptr && pUtf8[0] != '\0' && sNow.mIn) {
+            NebulaHost::coopChatSay(pUtf8);
+        }
     }
 }  // namespace NebulaCoopMods

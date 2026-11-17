@@ -3,6 +3,8 @@
 #include "Game/Player/NebulaCharacter.hpp"
 #include "Game/Player/NebulaPalette.hpp"
 #include "Game/System/NebulaCoopMods.hpp"
+#include "Game/Screen/NebulaHudCounter.hpp"
+#include "Game/System/NebulaAchievements.hpp"
 #include "Game/System/LumaCore.hpp"
 #include "Game/System/NebulaModCalls.hpp"
 #include "nebula_text_tags.h"
@@ -536,6 +538,19 @@ namespace {
         return NebulaCharacter::index();
     }
 
+    int32_t apiHudCounter(int32_t line, uint32_t rgba, int32_t number) {
+        return NebulaHudCounter::setLine(line, rgba, number) ? 0 : -1;
+    }
+
+    int32_t apiStat(const char* pName) {
+        const s32 stat = NebulaAchievements::findStat(pName);
+        if (stat >= NebulaStat_Num) {
+            return -1;
+        }
+        const u64 count = NebulaAchievements::getStat(stat);
+        return count > 0x7FFFFFFFull ? 0x7FFFFFFF : static_cast< int32_t >(count);
+    }
+
     int32_t apiSetPlayerCharacterId(const char* pId) {
         if (pId == nullptr || pId[0] == '\0') {
             return NebulaCharacter::setOverride(-1) ? 1 : 0;
@@ -648,6 +663,10 @@ namespace {
         apiSetPlayerPaletteColor,
         apiResetPlayerPalette,
         NebulaCoopMods::paletteColor,
+        apiHudCounter,
+        apiStat,
+        NebulaCoopMods::setDescription,
+        NebulaCoopMods::chatSay,
     };
 }  // namespace
 

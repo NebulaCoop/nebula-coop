@@ -194,6 +194,13 @@ if (Test-Path ".gitmodules") {
     } else {
         Write-Ok "nebulanet submodule already present"
     }
+    # The built-in mods the host carries are packed in LumaLink-coop (cmake/nebula_builtin_mods.cmake).
+    if (-not (Test-Path "lumalink/builtin")) {
+        git submodule update --init lumalink
+        Write-Ok "Initialized lumalink submodule"
+    } else {
+        Write-Ok "lumalink submodule already present"
+    }
 }
 
 # ── 3. Start sccache Server ─────────────────────────────────────────────────

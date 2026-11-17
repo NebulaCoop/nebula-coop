@@ -1,13 +1,11 @@
-#include "Game/Screen/NebulaStarCounter.hpp"
-#include "nebula_module.h"
-#include "Game/System/NebulaHost.hpp"
+#include "Game/Screen/NebulaHudCounter.hpp"
+#include "nebula_mod_api.h"
 
 #include "Game/LiveActor/Nerve.hpp"
 #include "Game/Screen/CountUpPaneRumbler.hpp"
 #include "Game/Screen/CounterLayoutAppearer.hpp"
 #include "Game/Screen/LayoutCoreUtil.hpp"
 #include "Game/Screen/LayoutManager.hpp"
-#include "Game/System/NebulaAchievements.hpp"
 #include "Game/Util/LayoutUtil.hpp"
 #include "Game/Util/ObjUtil.hpp"
 #include "Game/Util/SceneUtil.hpp"
@@ -18,27 +16,37 @@
 #include <Game/Ui/TextBox.hpp>
 
 namespace {
-    // sm64coopdx's mod's colours: red for this room's stars, green for every star.
-    const u32 cRoomTint = 0xE81123FF;
-    const u32 cAllTimeTint = 0x32B028FF;
     const s32 cTintedMax = 16;
-    const s32 cCountMax = 99999;  // the all-time count's widest
+    const s32 cCountMax = 99999;  // the widest number the layout's text box holds
     const f32 cLineStepFallback = 34.0f;
+
+    // What the mods set (hud_counter), by line from 1.
+    struct Line {
+        u32 mColor;
+        s32 mNumber;
+    };
+    Line sLines[NEBULA_HUD_COUNTER_LINES] = {
+        {0xFFFFFFFF, -1},
+        {0xFFFFFFFF, -1},
+        {0xFFFFFFFF, -1},
+        {0xFFFFFFFF, -1},
+    };
 };  // namespace
 
-namespace NrvNebulaStarCounter {
-    NEW_NERVE(NebulaStarCounterNrvAppear, NebulaStarCounter, Appear);
-    NEW_NERVE(NebulaStarCounterNrvWait, NebulaStarCounter, Wait);
-    NEW_NERVE(NebulaStarCounterNrvCountUp, NebulaStarCounter, CountUp);
-    NEW_NERVE(NebulaStarCounterNrvDisappear, NebulaStarCounter, Disappear);
-};  // namespace NrvNebulaStarCounter
+namespace NrvNebulaHudCounter {
+    NEW_NERVE(NebulaHudCounterNrvAppear, NebulaHudCounter, Appear);
+    NEW_NERVE(NebulaHudCounterNrvWait, NebulaHudCounter, Wait);
+    NEW_NERVE(NebulaHudCounterNrvCountUp, NebulaHudCounter, CountUp);
+    NEW_NERVE(NebulaHudCounterNrvDisappear, NebulaHudCounter, Disappear);
+};  // namespace NrvNebulaHudCounter
 
 // The layout's star (its pictures and any text but the number) in the counter's colour. The layout's animations may
 // set those colours again (its Flash): each one they write is tinted once more after them.
-struct NebulaStarCounterTint {
+struct NebulaHudCounterTint {
     struct Entry {
         Ui::Pane* mPane;
         bool mText;
+        Color8 mOriginal[4];
         Color8 mWritten[4];
     };
     Entry mEntries[cTintedMax];
@@ -65,12 +73,32 @@ struct NebulaStarCounterTint {
             rEntry.mPane = pPane;
             rEntry.mText = text;
             for (s32 i = 0; i < 4; i++) {
+                rEntry.mOriginal[i] = text ? (i < 2 ? static_cast< Ui::TextBox* >(pPane)->GetTextColor(i) : Color8(0xFFFFFFFF))
+                                           : static_cast< Ui::Picture* >(pPane)->GetVtxColor(i);
                 // Never a colour the pane has: the first apply() tints them all.
                 rEntry.mWritten[i] = 0x00000001;
             }
         }
         for (Ui::Pane* it : pPane->GetChildList()) {
             collect(it);
+        }
+    }
+
+    // Another colour: each pane's own colours back, tinted again by the next apply().
+    void retint(Color8 tint) {
+        mTint = tint;
+        for (s32 i = 0; i < mNum; i++) {
+            Entry& rEntry = mEntries[i];
+            for (u32 c = 0; c < 4; c++) {
+                if (rEntry.mText) {
+                    if (c < 2) {
+                        static_cast< Ui::TextBox* >(rEntry.mPane)->SetTextColor(c, rEntry.mOriginal[c]);
+                    }
+                } else {
+                    static_cast< Ui::Picture* >(rEntry.mPane)->SetVtxColor(c, rEntry.mOriginal[c]);
+                }
+                rEntry.mWritten[c] = 0x00000001;
+            }
         }
     }
 
@@ -100,49 +128,44 @@ struct NebulaStarCounterTint {
     }
 };
 
-NebulaStarCounter::NebulaStarCounter(Kind kind)
-    : LayoutActor(kind == Kind_Room ? "NebulaRoomStarCounter" : "NebulaAllTimeStarCounter", true), mKind(kind), mCount(0),
-      mLayoutAppearer(nullptr), mPaneRumbler(nullptr), mTint(nullptr) {
+bool NebulaHudCounter::setLine(s32 line, u32 rgba, s32 number) {
+    if (line < 1 || line > NEBULA_HUD_COUNTER_LINES) {
+        return false;
+    }
+    Line& rLine = sLines[line - 1];
+    rLine.mColor = rgba;
+    rLine.mNumber = number < 0 ? -1 : (number > cCountMax ? cCountMax : number);
+    return true;
 }
 
-void NebulaStarCounter::init(const TableIter& rIter) {
-    // The save's own counter, with room in its number for an all-time count.
+NebulaHudCounter::NebulaHudCounter(s32 line)
+    : LayoutActor("NebulaHudCounter", true), mLine(line), mCount(0), mColor(0xFFFFFFFF), mLayoutAppearer(nullptr),
+      mPaneRumbler(nullptr), mTint(nullptr) {
+}
+
+void NebulaHudCounter::init(const TableIter& rIter) {
+    // The save's own counter, with room in its number for a long count.
     initLayoutManagerWithTextBoxBufferLength("StarCounter", 2, 8);
     MR::createAndAddPaneCtrl(this, "Counter", 1);
 
     mLayoutAppearer = new CounterLayoutAppearer(this, Vec2f(-50.0f, 0.0f));
     mPaneRumbler = new CountUpPaneRumbler(this, "Counter");
 
-    mTint = new NebulaStarCounterTint();
+    mColor = sLines[mLine - 1].mColor;
+    mTint = new NebulaHudCounterTint();
     mTint->mNum = 0;
-    mTint->mTint = mKind == Kind_Room ? cRoomTint : cAllTimeTint;
+    mTint->mTint = mColor;
     mTint->collect(getLayoutManager()->mLayout->mpRootPane);
-    static bool sReported = false;
-    if (!sReported) {
-        sReported = true;
-        nebula_log("NebulaStarCounter: %d of StarCounter's panes tinted\n", mTint->mNum);
-        for (s32 i = 0; i < mTint->mNum; i++) {
-            nebula_log("  %s (%s)\n", static_cast< const char* >(mTint->mEntries[i].mPane->mName), mTint->mEntries[i].mText ? "text" : "picture");
-        }
-    }
 
     MR::connectToSceneLayout(this);
-    initNerve(GET_NERVE(NebulaStarCounter, NebulaStarCounterNrvAppear));
+    initNerve(GET_NERVE(NebulaHudCounter, NebulaHudCounterNrvAppear));
 }
 
-s32 NebulaStarCounter::getCount() const {
-    if (mKind == Kind_Room) {
-        return NebulaHost::coopStarCount();
-    }
-    const u64 count = NebulaAchievements::getStat(NebulaStat_PowerStars);
-    return count > static_cast< u64 >(cCountMax) ? cCountMax : static_cast< s32 >(count);
+s32 NebulaHudCounter::getCount() const {
+    return sLines[mLine - 1].mNumber;
 }
 
-bool NebulaStarCounter::isWanted() const {
-    return NebulaHost::option(NEBULA_OPTION_STAR_COUNTER) != 0;
-}
-
-f32 NebulaStarCounter::getLineStep() const {
+f32 NebulaHudCounter::getLineStep() const {
     // The tallest picture or text of the layout (the star, or the number), from layout units to the screen's.
     f32 tallest = 0.0f;
     for (s32 i = 0; i < mTint->mNum; i++) {
@@ -164,67 +187,73 @@ f32 NebulaStarCounter::getLineStep() const {
     return step > 1.0f ? step : cLineStepFallback;
 }
 
-void NebulaStarCounter::appear() {
+void NebulaHudCounter::appear() {
     mCount = getCount();
-    if (mCount < 0 || !isWanted()) {
-        // The room's count outside a room, or the room doesn't play the mod.
+    if (mCount < 0) {
+        // No mod sets this line.
         kill();
         return;
     }
-    // Under the save's counter: the room's first, then the all-time one (first when there is no room).
-    const s32 slot = mKind == Kind_Room || NebulaHost::coopStarCount() < 0 ? 1 : 2;
-    mLayoutAppearer->appear(Vec2f(0.0f, getLineStep() * slot));
+    if (mColor != sLines[mLine - 1].mColor) {
+        mColor = sLines[mLine - 1].mColor;
+        mTint->retint(mColor);
+    }
+    mLayoutAppearer->appear(Vec2f(0.0f, getLineStep() * mLine));
     mPaneRumbler->reset();
     MR::startAnim(this, "Wait", 1);
 
     MR::setTextBoxNumberRecursive(this, "Counter", mCount);
-    setNerve(GET_NERVE(NebulaStarCounter, NebulaStarCounterNrvAppear));
+    setNerve(GET_NERVE(NebulaHudCounter, NebulaHudCounterNrvAppear));
     LayoutActor::appear();
     MR::requestMovementOn(this);
 }
 
-void NebulaStarCounter::disappear() {
+void NebulaHudCounter::disappear() {
     if (MR::isDead(this)) {
         return;
     }
     MR::requestMovementOn(this);
-    setNerve(GET_NERVE(NebulaStarCounter, NebulaStarCounterNrvDisappear));
+    setNerve(GET_NERVE(NebulaHudCounter, NebulaHudCounterNrvDisappear));
 }
 
-void NebulaStarCounter::control() {
+void NebulaHudCounter::control() {
     mLayoutAppearer->update();
     mPaneRumbler->update();
 }
 
-void NebulaStarCounter::calcAnim() {
+void NebulaHudCounter::calcAnim() {
     LayoutActor::calcAnim();
     mTint->apply();
 }
 
-void NebulaStarCounter::exeAppear() {
+void NebulaHudCounter::exeAppear() {
     if (mLayoutAppearer->isAppeared()) {
-        setNerve(GET_NERVE(NebulaStarCounter, NebulaStarCounterNrvWait));
+        setNerve(GET_NERVE(NebulaHudCounter, NebulaHudCounterNrvWait));
     }
 }
 
-void NebulaStarCounter::exeWait() {
-    // Turned off while shown: out at once rather than with the save's counter. Asked once a second (the host's
-    // settings are a copy each time).
-    if (getNerveStep() % 60 == 0 && !isWanted()) {
+void NebulaHudCounter::exeWait() {
+    const s32 count = getCount();
+    if (count < 0) {
+        // Removed while shown: out at once rather than with the save's counter.
         disappear();
         return;
     }
-    const s32 count = getCount();
-    if (count < mCount) {
-        // A new room starts from none.
-        mCount = count < 0 ? 0 : count;
+    if (mColor != sLines[mLine - 1].mColor) {
+        // Another count on this line now: shown as it is.
+        mColor = sLines[mLine - 1].mColor;
+        mTint->retint(mColor);
+        mCount = count;
+        MR::setTextBoxNumberRecursive(this, "Counter", mCount);
+    } else if (count < mCount) {
+        mCount = count;
         MR::setTextBoxNumberRecursive(this, "Counter", mCount);
     } else if (count > mCount) {
-        setNerve(GET_NERVE(NebulaStarCounter, NebulaStarCounterNrvCountUp));
+        setNerve(GET_NERVE(NebulaHudCounter, NebulaHudCounterNrvCountUp));
     }
 }
 
-void NebulaStarCounter::exeCountUp() {
+void NebulaHudCounter::exeCountUp() {
     if (MR::isFirstStep(this)) {
         mCount++;
 
@@ -234,11 +263,11 @@ void NebulaStarCounter::exeCountUp() {
     }
 
     if (MR::isAnimStopped(this, 0) && !mPaneRumbler->isRumbling()) {
-        setNerve(GET_NERVE(NebulaStarCounter, NebulaStarCounterNrvWait));
+        setNerve(GET_NERVE(NebulaHudCounter, NebulaHudCounterNrvWait));
     }
 }
 
-void NebulaStarCounter::exeDisappear() {
+void NebulaHudCounter::exeDisappear() {
     if (MR::isFirstStep(this)) {
         mLayoutAppearer->disappear();
     }

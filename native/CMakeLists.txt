@@ -218,6 +218,9 @@ endif()
 # The game API's fingerprint (cmake/nebula_fingerprint.cmake), which the host checks the module against.
 include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/nebula_fingerprint.cmake")
 nebula_fingerprint("${CMAKE_CURRENT_SOURCE_DIR}/.." "${petari}" "${CMAKE_CURRENT_BINARY_DIR}/generated")
+# The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake), for the host's mods.cpp.
+include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/nebula_builtin_mods.cmake")
+nebula_builtin_mods("${CMAKE_CURRENT_SOURCE_DIR}/.." "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
 target_include_directories(smg_game_common BEFORE INTERFACE
     "${CMAKE_CURRENT_BINARY_DIR}/generated"

@@ -593,7 +593,6 @@ void test_session() {
     host.port = 0u;
     host.room.max_players = 3u;
     host.room.cheats = true;
-    host.room.star_counter = true;
     host.room.password = "pw";
     host.game_version = "test 1";
     host.name = "HOSTY";
@@ -639,7 +638,7 @@ void test_session() {
     expect(save && save->file == 3u && save->files.size() == 1u && save->files[0].name == "GameData.bin" &&
                save->files[0].bytes == std::vector<std::uint8_t>(20000u, 0x5au),
            "with the host's save");
-    expect(joiner.room().cheats && joiner.room().star_counter && joiner.room().max_players == 3u,
+    expect(joiner.room().cheats && joiner.room().max_players == 3u,
            "and the room's settings");
     const std::vector<SessionPlayer> players = joiner.players();
     expect(players.size() == 2u && players[0].host && players[0].name == "HOSTY" && players[1].index == 1u &&
@@ -842,11 +841,10 @@ void test_session() {
     // The host changes the room.
     galaxy::RuntimeCoopSettings room = host_session.room();
     room.cheats = false;
-    room.star_counter = false;
     room.bubble_death = false;
     host_session.set_room(room);
     expect(wait_for([&] {
-               return !joiner.room().cheats && !joiner.room().star_counter && !joiner.room().bubble_death;
+               return !joiner.room().cheats && !joiner.room().bubble_death;
            }),
            "the host's room changes reach the players");
 

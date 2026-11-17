@@ -4,7 +4,7 @@
 #include "Game/LiveActor/Nerve.hpp"
 #include "Game/Screen/CoinCounter.hpp"
 #include "Game/Screen/MarioMeter.hpp"
-#include "Game/Screen/NebulaStarCounter.hpp"
+#include "Game/Screen/NebulaHudCounter.hpp"
 #include "Game/Screen/PlayerLeft.hpp"
 #include "Game/Screen/StarCounter.hpp"
 #include "Game/Screen/StarPieceCounter.hpp"
@@ -30,8 +30,9 @@ namespace NrvCounterLayoutController {
 CounterLayoutController::CounterLayoutController()
     : LayoutActor("カウンタ系レイアウト制御", true), mPlayerNotMovingFrame(), mIsTicoEatRequested(), mCoinCounter(), mStarPieceCounter(), mPlayerLeft(),
       mStarCounter(), mHPMeter() {
-    mRoomStarCounter = nullptr;
-    mAllTimeStarCounter = nullptr;
+    for (s32 i = 0; i < NEBULA_HUD_COUNTER_LINES; i++) {
+        mHudCounters[i] = nullptr;
+    }
     lumacore::setClass(this, lumacore::kClassId< CounterLayoutController >);
 }
 
@@ -47,10 +48,15 @@ void CounterLayoutController::init(const TableIter& /*rIter*/) {
     mPlayerLeft->initWithoutIter();
     mStarCounter = new StarCounter();
     mStarCounter->initWithoutIter();
-    mRoomStarCounter = new NebulaStarCounter(NebulaStarCounter::Kind_Room);
-    mRoomStarCounter->initWithoutIter();
-    mAllTimeStarCounter = new NebulaStarCounter(NebulaStarCounter::Kind_AllTime);
-    mAllTimeStarCounter->initWithoutIter();
+    mCoinCounter->mFlag.mHudPart = NEBULA_HUD_COINS;
+    mStarPieceCounter->mFlag.mHudPart = NEBULA_HUD_STAR_BITS;
+    mPlayerLeft->mFlag.mHudPart = NEBULA_HUD_LIVES;
+    mStarCounter->mFlag.mHudPart = NEBULA_HUD_STARS;
+    for (s32 i = 0; i < NEBULA_HUD_COUNTER_LINES; i++) {
+        mHudCounters[i] = new NebulaHudCounter(i + 1);
+        mHudCounters[i]->initWithoutIter();
+        mHudCounters[i]->mFlag.mHudPart = NEBULA_HUD_STARS;
+    }
 
     appear();
 }
@@ -84,8 +90,9 @@ void CounterLayoutController::requestedTicoEat(bool param1) {
         mCoinCounter->kill();
         mPlayerLeft->kill();
         mStarCounter->kill();
-        mRoomStarCounter->kill();
-        mAllTimeStarCounter->kill();
+        for (s32 i = 0; i < NEBULA_HUD_COUNTER_LINES; i++) {
+            mHudCounters[i]->kill();
+        }
     }
 
     mIsTicoEatRequested = true;
@@ -109,8 +116,9 @@ void CounterLayoutController::showAllLayout() {
         mStarPieceCounter->forceAppear(false);
         mPlayerLeft->forceAppear();
         mStarCounter->appear();
-        mRoomStarCounter->appear();
-        mAllTimeStarCounter->appear();
+        for (s32 i = 0; i < NEBULA_HUD_COUNTER_LINES; i++) {
+            mHudCounters[i]->appear();
+        }
     }
 }
 
@@ -120,8 +128,9 @@ void CounterLayoutController::hideAllLayout() {
         mStarPieceCounter->disappear(false);
         mPlayerLeft->disappear();
         mStarCounter->disappear();
-        mRoomStarCounter->disappear();
-        mAllTimeStarCounter->disappear();
+        for (s32 i = 0; i < NEBULA_HUD_COUNTER_LINES; i++) {
+            mHudCounters[i]->disappear();
+        }
     }
 }
 
@@ -168,8 +177,9 @@ void CounterLayoutController::killAllCoounter() {
     mStarPieceCounter->kill();
     mPlayerLeft->kill();
     mStarCounter->kill();
-    mRoomStarCounter->kill();
-    mAllTimeStarCounter->kill();
+    for (s32 i = 0; i < NEBULA_HUD_COUNTER_LINES; i++) {
+        mHudCounters[i]->kill();
+    }
 }
 
 bool CounterLayoutController::tryEndTicoEatStarPiece() {
