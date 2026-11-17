@@ -305,19 +305,21 @@ jobs:
         run: |
           cmake -S platform/sdl -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release "-DNEBULA_DEPS=$PWD/deps"
           cmake --build build/host --target main
-      - name: LLVM 21
-        # The game module's row generator needs libclang 21 or later (tools/lumacore/instrument.py); Ubuntu 24.04 has 18.
+      - name: LLVM 22
+        # The game module's row generator needs libclang 22, as the release's game build uses (tools/lumacore/gen_types.py reads some member types
+        # differently with 21); Ubuntu 24.04 has 18.
         run: |
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm-22.list
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang-21 libclang1-21 libclang-common-21-dev
+          sudo apt-get install -y --no-install-recommends clang-22 libclang1-22 libclang-common-22-dev
       - name: Game module
         env:
-          CC: clang-21
-          CXX: clang++-21
+          CC: clang-22
+          CXX: clang++-22
         run: |
-          cmake -S native -B build/game -G Ninja -DCMAKE_BUILD_TYPE=Release
+          # apt.llvm.org names its libclang libclang-22.so.1, which the row generator does not find beside the compiler.
+          cmake -S native -B build/game -G Ninja -DCMAKE_BUILD_TYPE=Release -DNEBULA_LIBCLANG=/usr/lib/llvm-22/lib/libclang-22.so.1
           cmake --build build/game --target smg_game
       - name: Disc import tool
         run: cargo build --release --locked -p nebula-import --bin nebula-import

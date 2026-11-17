@@ -287,10 +287,6 @@ namespace GameSequenceFunction {
         }
     }
 
-    void startReloadSaveDataSequence() {
-        ::getSaveDataHandleSequence()->startReload();
-    }
-
     void setGameDataSaveWindowFollows() {
         ::getSaveDataHandleSequence()->setWindowFollows(true);
     }

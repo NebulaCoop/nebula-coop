@@ -34,7 +34,7 @@ namespace {
 SaveDataHandleSequence::SaveDataHandleSequence()
     : NerveExecutor("セーブ/ロード"), mCurrentUserFile(), mBackupUserFile(), mSaveDataHandler(), mSaveErrorSequence(),
       mSysInfoWindowConfirm(), mSysInfoWindowSave(), mSucceeded(), mIsConfirmRemind(), mIsSaveAndQuitMsg(), mIsCorrupted(), mIsNoSaveMode(), mWorkUserFile(),
-      mNerveForError(), mSaveIcon(), mWindowFollows(false), mNewUserFile(nullptr) {
+      mNerveForError(), mSaveIcon(), mWindowFollows(false) {
     initNerve(GET_NERVE_ANON(SaveDataHandleSequenceNoOperation));
 }
 
@@ -42,7 +42,6 @@ void SaveDataHandleSequence::initAfterResourceLoaded() {
     mCurrentUserFile = new UserFile();
     mBackupUserFile = new UserFile();
     mSaveDataHandler = new SaveDataHandler(mCurrentUserFile);
-    mNewUserFile = new UserFile();
 
     mSysInfoWindowConfirm = MR::createSysInfoWindowExecuteWithChildren();
     mSysInfoWindowConfirm->kill();

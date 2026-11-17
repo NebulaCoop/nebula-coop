@@ -6711,7 +6711,7 @@ void svc_mods_start(void*) {
                                 },
                                 [](const char* text) { log_line("mods:", text); }, layers_chosen);
     // The characters the mods added, for the Options page's CHARACTER row (the game's list, Mario and Luigi first).
-    if (const NebulaModApi* api = game_api(); api != nullptr && NEBULA_MOD_API_HAS(api, character_like)) {
+    if (const NebulaModApi* api = game_api(); api != nullptr && api->character_like != nullptr) {
         std::vector<galaxy::PlayableCharacter> characters;
         for (int32_t i = 0; i < api->character_count(); ++i) {
             const char* id = api->character_id(i);
@@ -6720,7 +6720,7 @@ void svc_mods_start(void*) {
             galaxy::PlayableCharacter character{id, name != nullptr ? name : id,
                                                 api->character_like(i) == 1 ? galaxy::CoopCharacter::Luigi : galaxy::CoopCharacter::Mario};
             // Its own colours, for the page's COLOURS rows.
-            for (int32_t part = 0; part < NEBULA_PALETTE_PARTS && NEBULA_MOD_API_HAS(api, character_palette_color); ++part) {
+            for (int32_t part = 0; part < NEBULA_PALETTE_PARTS && api->character_palette_color != nullptr; ++part) {
                 const int32_t rgb = api->character_palette_color(i, part);
                 if (rgb < 0) continue;
                 character.palette[static_cast<std::size_t>(part) * 3] = static_cast<std::uint8_t>(rgb >> 16);

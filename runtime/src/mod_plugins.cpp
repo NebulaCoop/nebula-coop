@@ -477,7 +477,7 @@ std::size_t start_plugins(const std::vector<PluginFile>& plugins, const ModRows&
                 for (int part = 0; part < NEBULA_PALETTE_PARTS; ++part) {
                     const int given = static_cast<std::size_t>(part) < row.palette.size() ? row.palette[static_cast<std::size_t>(part)] : -1;
                     palette[part] = given >= 0 ? given
-                                    : NEBULA_MOD_API_HAS(&g_api, character_palette_color) ? g_api.character_palette_color(base, part)
+                                    : g_api.character_palette_color != nullptr ? g_api.character_palette_color(base, part)
                                                                                          : 0;
                 }
                 character.palette = palette;

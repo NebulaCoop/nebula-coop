@@ -43,8 +43,6 @@ public:
     void setWindowFollows(bool follows) {
         mWindowFollows = follows;
     }
-    // startPreLoad from a new console's save data: a missing file leaves none of the last one read.
-    void startReload();
     void startLoad(int, bool);
     void storeMiiOrIconId(int, const void*, const u32*);
     void storeCopyUserFile(int, int);
@@ -101,8 +99,6 @@ public:
     SaveIcon* mSaveIcon;
     bool mWindowFollows;
     int mSaveCopyLoading = 0;
-    // A new console's user file, never changed: what startReload starts from.
-    UserFile* mNewUserFile;
     bool mSaveDamaged = false;
     int mPreLoadState = 0;
 };

@@ -2235,9 +2235,6 @@ void open_folder_in_explorer(const std::filesystem::path& folder) {
     host_window::open_folder(folder);
 }
 
-// Explorer at the Mii import folder (its files join the database at every start).
-void open_mii_folder() { open_folder_in_explorer(galaxy::host::mii_import_folder()); }
-
 // SAVES (GENERAL page): an import is picked, read and checked (save_transfer::plan_import). A save of this release is
 // read by the game (save_transfer::game_reader, nebula_save_import.h) and the player places its files one by one; at
 // the write the game reads it again with the save as it is then, and the chosen files are put together with it
@@ -4868,11 +4865,6 @@ public:
         }
         state.saved_language = get_runtime_settings().language;
         state.resolved_saved_language = game_language_resolved(state.saved_language);
-        {
-            const std::lock_guard<std::mutex> lock(s_mii_mutex);
-            state.mii_status = s_mii_status;
-        }
-        state.choosing_miis = s_mii_dialog_open.load(std::memory_order_acquire);
         state.folders_open = host_window::folders_open();
         state.saves_offered = !galaxy::save_transfer::game_save_root().empty() && !galaxy::save_transfer::game_code().empty();
         state.saves_step = s_saves_step.load(std::memory_order_acquire);
@@ -4892,17 +4884,13 @@ public:
         // The desktop hosts pause or mute a game whose window is not in front (host_main.cpp follow_focus_loss).
         state.focus_loss_offered = galaxy::kDesktopWindow;
         state.discord_offered = galaxy::discord::supported();
-        state.mii_count = s_mii_count.load(std::memory_order_acquire);
-        if (state.mii_count < 0) {
-            state.mii_count = static_cast<int>(galaxy::host::mii_library_count());
-            s_mii_count.store(state.mii_count, std::memory_order_release);
-        }
         return state;
     }
     void act(ui::GeneralPageAction action) const override {
         switch (action) {
-        case ui::GeneralPageAction::ImportMiis: start_mii_import_dialog(); break;
-        case ui::GeneralPageAction::OpenMiiFolder: open_mii_folder(); break;
+        // No Mii rows: co-op has no file select, so nothing shows Miis.
+        case ui::GeneralPageAction::ImportMiis:
+        case ui::GeneralPageAction::OpenMiiFolder: break;
         case ui::GeneralPageAction::ImportSaves: start_saves_import(); break;
         case ui::GeneralPageAction::ConfirmImport: confirm_saves_import(false); break;
         case ui::GeneralPageAction::ReplaceAllSaves: confirm_saves_import(true); break;
@@ -6634,7 +6622,7 @@ bool native_settings_type(char32_t character) {
 }
 
 bool request_restart() noexcept {
-    return host_window::restart_game(false);
+    return host_window::restart_game(host_window::Restart::Start);
 }
 
 NativeSettingsView native_settings_view() {

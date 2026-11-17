@@ -1269,8 +1269,15 @@ void pump_events(int timeout_ms) noexcept {
             if (event.text.text != nullptr) {
                 if (galaxy::luma_input::text_open()) {
                     galaxy::luma_input::text_utf8(event.text.text);
-                } else {
-                    (void)galaxy::render::native_settings_handle_window_text(event.text.text);
+                } else if (!galaxy::render::native_settings_handle_window_text(event.text.text)) {
+                    // Typed characters (UTF-8): the printable ASCII the game's font draws, to a Settings text row or
+                    // the co-op menu's text.
+                    for (const char* text = event.text.text; *text != '\0'; ++text) {
+                        const unsigned char c = static_cast<unsigned char>(*text);
+                        if (c >= 0x20u && c < 0x7Fu && !galaxy::render::native_settings_type(static_cast<char32_t>(c))) {
+                            galaxy::render::push_coop_text(static_cast<char32_t>(c));
+                        }
+                    }
                 }
             }
             break;
@@ -1308,15 +1315,6 @@ void pump_events(int timeout_ms) noexcept {
                 break;
             }
             menu_keys.push_back({virtual_key(event.key.scancode), event.type == SDL_EVENT_KEY_DOWN, event.key.repeat});
-            break;
-        case SDL_EVENT_TEXT_INPUT:
-            // Typed characters (UTF-8): the printable ASCII the game's font draws.
-            for (const char* text = event.text.text; text != nullptr && *text != '\0'; ++text) {
-                const unsigned char c = static_cast<unsigned char>(*text);
-                if (c >= 0x20u && c < 0x7Fu && !galaxy::render::native_settings_type(static_cast<char32_t>(c))) {
-                    galaxy::render::push_coop_text(static_cast<char32_t>(c));
-                }
-            }
             break;
         case SDL_EVENT_GAMEPAD_ADDED:
             open_gamepad(event.gdevice.which);

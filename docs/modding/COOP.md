@@ -30,7 +30,7 @@ this player is index 0 and the host, with no name.
 | `coop_ping(i)` | `coop.ping(i)` | round trip in milliseconds (0 for this player or unknown) |
 
 The values are read once a frame, on the game's thread. A C plugin checks a call with
-`NEBULA_MOD_API_HAS(api, coop_count)` before using it.
+that `api->coop_count` is not null before using it.
 
 ## Events
 

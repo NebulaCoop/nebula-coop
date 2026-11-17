@@ -93,7 +93,7 @@ fn png(image: &str, file: &[u8]) -> Result<()> {
     if file.len() > i32::MAX as usize {
         return Err(unreadable(image));
     }
-    let mut decoder = png::Decoder::new_with_limits(file, png::Limits { bytes: usize::MAX });
+    let mut decoder = png::Decoder::new_with_limits(std::io::Cursor::new(file), png::Limits { bytes: usize::MAX });
     decoder.ignore_checksums(true);
     let mut reader = decoder.read_info().map_err(|_| unreadable(image))?;
     let (width, height) = (reader.info().width, reader.info().height);

@@ -173,12 +173,11 @@ int main() {
     }
     {
         // Characters (sm64coopdx's character table): a model on Mario or Luigi, its numbers by its id.
-        const auto with_layer = [](const std::string& layer) {
-            return std::string(R"({"format":1,"id":"a","name":"b","version":"1.0.0","game":"RMG","layers":[{)") + layer + "}]}";
-        };
-        const std::optional<Manifest> wario = parse_manifest(
-            R"({"format":1,"id":"a","name":"b","game":"RMG","requires":["characters"],"layers":[{"characters":[{"id":"wario","name":"WARIO","archive":"Wario"},)"
-            R"({"id":"waluigi","like":"luigi","palette":{"cap":"#5A22A0","overalls":"202020"}}],"player_constants":{"wario":{"mJumpHeight":[20,null,30]},"luigi":{"mJumpHeight":25}}}]})");
+        // Nebula 2 reads them as the previous engine's rows (pre_standard).
+        const auto with_layer = [](const std::string& layer) { return old_layer(layer); };
+        const std::optional<Manifest> wario = parse_manifest(old_layer(
+            R"("characters":[{"id":"wario","name":"WARIO","archive":"Wario"},)"
+            R"({"id":"waluigi","like":"luigi","palette":{"cap":"#5A22A0","overalls":"202020"}}],"player_constants":{"wario":{"mJumpHeight":[20,null,30]},"luigi":{"mJumpHeight":25}})"));
         check(wario && wario->layers.size() == 1u && wario->layers[0].characters.size() == 2u, "characters read");
         if (wario && wario->layers.size() == 1u && wario->layers[0].characters.size() == 2u) {
             const Layer& layer = wario->layers[0];
@@ -195,7 +194,6 @@ int main() {
                       layer.player_constants[2].character_id.empty() && layer.player_constants[2].character == 1,
                   "player numbers by a character's id");
             check(layer_sets_game(layer), "characters change the game");
-            check(refusal(*wario, "RMGE01", "2.1.0", "windows").empty(), "a mod needing characters is usable");
         }
         for (const char* bad : {R"("characters":[{"id":"Wario"}])", R"("characters":[{"id":""}])", R"("characters":[{"id":"mario"}])",
                                 R"("characters":[{"id":"w","like":"wario"}])", R"("characters":[{"id":"w","archive":"../Wario"}])",
