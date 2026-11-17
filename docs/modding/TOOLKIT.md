@@ -2,7 +2,7 @@
 
 Every game function a script or plugin calls by name, generated from the game's headers (tools/lumacore). Letters: a none, b bool, c int, d float, e vec3, g text, h handle (an object, a sensor...); an upper-case letter is a value that comes back after the result (pass one in, or none for zero).
 
-3577 functions.
+3582 functions.
 
 | Name | Takes | Gives |
 |---|---|---|
@@ -3410,6 +3410,7 @@ Every game function a script or plugin calls by name, generated from the game's 
 | `coop.me` |  | c |
 | `coop.mission` | c index | c |
 | `coop.name` | c index | g |
+| `coop.palette_color` | c index, c part | c |
 | `coop.ping` | c index | c |
 | `coop.same_place` | c index | c |
 | `coop.set_description` | c index, g utf8, c rgba |  |
@@ -3438,6 +3439,7 @@ Every game function a script or plugin calls by name, generated from the game's 
 | `nebula.character_id` | c index | g |
 | `nebula.character_like` | c index | c |
 | `nebula.character_name` | c index | g |
+| `nebula.character_palette_color` | c index, c part | c |
 | `nebula.circle_wipe` | c open, c frames | c |
 | `nebula.declare_item` | h actor, c what, c count |  |
 | `nebula.distance_to_player` | h actor | d |
@@ -3510,6 +3512,7 @@ Every game function a script or plugin calls by name, generated from the game's 
 | `nebula.player_character` |  | c |
 | `nebula.player_constant` | c character, g name, c index | d |
 | `nebula.player_front` | E xyz |  |
+| `nebula.player_palette_color` | c part | c |
 | `nebula.pointer` | J xy | c |
 | `nebula.rail_at_end` | h actor | c |
 | `nebula.rail_coord` | h actor | d |
@@ -3521,6 +3524,7 @@ Every game function a script or plugin calls by name, generated from the game's 
 | `nebula.registry_mod` | g kind, c index | g |
 | `nebula.registry_name` | g kind, c index | g |
 | `nebula.registry_value` | g kind, g name | c |
+| `nebula.reset_player_palette` |  |  |
 | `nebula.save_game` |  |  |
 | `nebula.screen_position` | e xyz, J xy | c |
 | `nebula.set_animation_frame` | h actor, d frame |  |
@@ -3539,6 +3543,7 @@ Every game function a script or plugin calls by name, generated from the game's 
 | `nebula.set_player_character_id` | g id | c |
 | `nebula.set_player_constant` | c character, g name, c index, d value | c |
 | `nebula.set_player_control` | c on |  |
+| `nebula.set_player_palette_color` | c part, c color | c |
 | `nebula.set_position` | h actor, e xyz |  |
 | `nebula.set_rail_coord` | h actor, d coord |  |
 | `nebula.set_rotation` | h actor, e xyz |  |

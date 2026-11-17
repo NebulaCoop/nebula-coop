@@ -1035,6 +1035,21 @@ typedef struct NebulaModApi {
        coop_character gives its base. Valid until the next frame. */
     const char* (*coop_character_id)(int32_t index);
 
+    /* Colours (docs/modding/CHARACTERS.md "Colours"), sm64coopdx's palettes: `part` is a NEBULA_PALETTE_*, a colour
+       0xRRGGBB. A player wears the Options page's colours, else their character's own, and a mod's parts over them. */
+    /* A character's own colour for a part (its model's: luma.json "palette", NebulaCharacterClass's); -1 for no such
+       character or part. */
+    int32_t (*character_palette_color)(int32_t index, int32_t part);
+    /* The colour the player wears for a part now; -1 for no such part. */
+    int32_t (*player_palette_color)(int32_t part);
+    /* Puts a colour on a part of the player over their own, as sm64coopdx's network_player_set_override_palette_color;
+       the others in a room see it. A negative colour takes it off. 1: done; 0: no such part. */
+    int32_t (*set_player_palette_color)(int32_t part, int32_t color);
+    /* Every part back to the player's own colours (network_player_reset_override_palette). */
+    void (*reset_player_palette)(void);
+    /* Online co-op: the colour a player wears for a part (this player's own outside a room, as index 0); -1 for an
+       index nobody has or no such part. */
+    int32_t (*coop_palette_color)(int32_t index, int32_t part);
     /* A counter under the HUD's Power Star counter, in its look (the StarCounter layout) with its star tinted `rgba`
        (0xRRGGBBAA; 0xFFFFFFFF keeps the game's colours): `line` 1 is the first under it, to NEBULA_HUD_COUNTER_LINES.
        It comes and goes with the HUD's counters, and counts up with their flash as `number` grows; a smaller number,
@@ -1052,22 +1067,6 @@ typedef struct NebulaModApi {
        djui_chat_message_create). A text that is one of the game's chat texts' ids ("CoopCmd...") shows in the
        language played. Nothing outside a room. */
     void (*coop_chat_say)(const char* utf8);
-
-    /* Colours (docs/modding/CHARACTERS.md "Colours"), sm64coopdx's palettes: `part` is a NEBULA_PALETTE_*, a colour
-       0xRRGGBB. A player wears the Options page's colours, else their character's own, and a mod's parts over them. */
-    /* A character's own colour for a part (its model's: luma.json "palette", NebulaCharacterClass's); -1 for no such
-       character or part. */
-    int32_t (*character_palette_color)(int32_t index, int32_t part);
-    /* The colour the player wears for a part now; -1 for no such part. */
-    int32_t (*player_palette_color)(int32_t part);
-    /* Puts a colour on a part of the player over their own, as sm64coopdx's network_player_set_override_palette_color;
-       the others in a room see it. A negative colour takes it off. 1: done; 0: no such part. */
-    int32_t (*set_player_palette_color)(int32_t part, int32_t color);
-    /* Every part back to the player's own colours (network_player_reset_override_palette). */
-    void (*reset_player_palette)(void);
-    /* Online co-op: the colour a player wears for a part (this player's own outside a room, as index 0); -1 for an
-       index nobody has or no such part. */
-    int32_t (*coop_palette_color)(int32_t index, int32_t part);
 } NebulaModApi;
 
 /* The lines hud_counter has under the Power Star counter. */

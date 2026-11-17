@@ -3140,15 +3140,15 @@ namespace {
         apiPlayerCharacter,
         apiSetPlayerCharacterId,
         NebulaCoopMods::characterId,
-        apiHudCounter,
-        apiStat,
-        NebulaCoopMods::setDescription,
-        NebulaCoopMods::chatSay,
         apiCharacterPaletteColor,
         apiPlayerPaletteColor,
         apiSetPlayerPaletteColor,
         apiResetPlayerPalette,
         NebulaCoopMods::paletteColor,
+        apiHudCounter,
+        apiStat,
+        NebulaCoopMods::setDescription,
+        NebulaCoopMods::chatSay,
     };
 }  // namespace
 
