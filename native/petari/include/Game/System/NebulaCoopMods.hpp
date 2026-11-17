@@ -8,7 +8,8 @@
 namespace NebulaCoopMods {
     // Each frame on the game's thread (GameSystem::update), before the mods' frame: the room's players read again,
     // and room_joined, player_join, player_leave, player_place and room_closed sent for what changed, then the
-    // mods' chat commands this player typed (chat_command). Nothing while no mod runs.
+    // mods' chat commands this player typed (chat_command); each also goes to the coop service's watchers (LumaCoop).
+    // Nothing while no mod runs.
     void update();
 
     s32 inRoom();
@@ -26,6 +27,8 @@ namespace NebulaCoopMods {
     s32 ping(s32 index);
     // The id of the character they play ("" for nobody).
     const char* characterId(s32 index);
+    // Their NEBULA_COOP_LIST_* flags (this player's outside a room, as index 0: you and host); 0 for nobody.
+    u32 listFlags(s32 index);
 
     // What this player's mods show beside a player in the list (coop_set_description, sm64coopdx's
     // network_player_set_description): null or "" takes it away. Kept by index until its player leaves or the room

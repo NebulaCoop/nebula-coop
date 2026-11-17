@@ -5,6 +5,7 @@
 #include "Game/System/LumaContentFx.hpp"
 #include "Game/System/LumaContentModel.hpp"
 #include "Game/System/LumaAnim.hpp"
+#include "Game/System/LumaCoop.hpp"
 #include "Game/System/LumaPlayer.hpp"
 #include "Game/System/LumaUi.hpp"
 #include "Game/System/LumaDrawLight.hpp"
@@ -65,6 +66,7 @@ namespace luma {
                 {"draw.native", 1, 0, LUMA_DRAW_NATIVE_PERMISSION, "draw"},
                 {"anim", 1, 1, nullptr, "animation"},
                 {"player", 1, 0, nullptr, "services-player"},
+                {"coop", 1, 0, nullptr, "services-coop"},
                 {"save", 1, 1, nullptr, "services-save"},
                 {"save.global", 1, 0, nullptr, "services-save"},
                 {"save.game", 1, 0, LUMA_SAVE_GAME_PERMISSION, "services-save"},
@@ -689,6 +691,7 @@ namespace luma {
             (void)provide(luma::draw::native::provider());
             (void)provide(luma::anim::provider());
             (void)provide(luma::player::provider());
+            (void)provide(luma::coop::provider());
             (void)provide(luma::save::provider());
             (void)provide(luma::save::globalProvider());
             (void)provide(luma::save::gameProvider());
