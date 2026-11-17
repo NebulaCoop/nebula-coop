@@ -29,8 +29,8 @@ this player is index 0 and the host, with no name.
 | `coop_stars(i)` | `coop.stars(i)` | Power Stars they got in this room (with the Personal Star Counter on) |
 | `coop_ping(i)` | `coop.ping(i)` | round trip in milliseconds (0 for this player or unknown) |
 
-The values are read once a frame, on the game's thread. A C plugin checks a call with
-that `api->coop_count` is not null before using it.
+The values are read once a frame, on the game's thread. A C plugin checks that
+`api->coop_count` is not null before using it.
 
 ## Events
 
