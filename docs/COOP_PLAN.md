@@ -83,8 +83,8 @@ introduces players, as sm64coopdx's CoopNet does, so nobody has to forward a por
 - **Server settings.** The `coop_*` keys in `runtime_settings.ini`, so a dedicated server can be configured without a
   menu: `coop_port` (default 7777), `coop_max_players` (2-16, default 8), `coop_player_name`, `coop_password`, and the
   [player collision](#player-collisions) options `coop_player_interaction`, `coop_knockback_strength` and
-  `coop_pvp_mode`, [bubble on death](#bubble-on-death) `coop_bubble_death` (`1` or `0`, default `1`), and
-  `coop_cheats`. They're written only once they differ from the defaults. The host's collision and bubble options and
+  `coop_pvp_mode`, [bubble on death](#bubble-on-death) `coop_bubble_death` (`1` or `0`, default `1`),
+  [saved lives](#saved-lives) `coop_save_lives` (`1` or `0`, default `1`), and `coop_cheats`. They're written only once they differ from the defaults. The host's collision and bubble options and
   save are the session's, as in sm64coopdx.
 
 ## Instances: one per galaxy and mission
@@ -228,8 +228,8 @@ How a join goes (`galaxy/coop_mods.h`, `galaxy/coop_session.h`), as sm64coopdx's
 
 Nebula's in-game settings menu (F1, the pause menu's Settings) keeps its pages, but ADVANCED becomes **ONLINE**:
 
-- **Room.** The session's settings: Player Interaction, Knockback Strength, PvP Mode, Bubble on Death, Cheats and
-  the player list.
+- **Room.** The session's settings: Player Interaction, Knockback Strength, PvP Mode, Bubble on Death, Lives, Cheats
+  and the player list.
   The host changes them for everyone, like sm64coopdx's in-game host settings; other players see them.
 - **No Leave game.** The way out of an online game is the game's own: the pause menu's Quit (in the Observatory, or
   before it opens) returns to the main menu, and back there the session ends (the host closes the room, a joiner
@@ -571,6 +571,22 @@ the Online tab (Bubble on Death, `coop_bubble_death`, on by default), sent with 
   (`NEBULA_COOP_PLAYER_BUBBLED`, with `DEAD` and `INTANGIBLE`) and its part, and the others draw the bubble round its
   copy, bursting as it's let out (game API 120, session protocol 7).
 - Not yet: Mario keeps a power-up form in the bubble (a miss would have taken it).
+
+## Saved lives
+
+A room rule on the Host page and the Online tab (Lives, `coop_save_lives`), sent with the room in the same byte as
+bubble on death, so it adds nothing to a room's traffic.
+
+- **SAVED** (the default): the save keeps the lives the player had when it was last written, and they come back on
+  its next load (`GameDataPlayerStatus::deserialize`, asking `NEBULA_COOP_MENU_SAVE_LIVES`). A save written with
+  none left (a game over) starts with the usual 4. As the lives are kept, Peach's letter brings no 1-ups for having
+  10 or more.
+- **CLASSIC**: the original game's: every load starts with 4 lives, and 10 or more at the last save bring Peach's
+  letter of 1-ups.
+- The save has always held the lives (the original game wrote them to work out the letter), so a save from before
+  the rule keeps the lives it was last written with.
+- Lives are each player's, and the save is the host's: only the host's lives are in it. A joiner's game starts with
+  4 either way. A change in play counts from the save's next load.
 
 ## Races and timers
 

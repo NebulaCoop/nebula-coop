@@ -121,6 +121,10 @@ struct RuntimeCoopSettings {
     // Bubble on death (sm64coopdx's): a player who dies with another alive in the same part of the galaxy floats in a
     // bubble to them instead of missing, for a life.
     bool bubble_death = true;
+    // Saved lives: the save keeps the lives a player had, and they come back on the next load. Off, the original
+    // game's (classic): every load starts with 4 lives, and 10 or more at the last save bring Peach's letter of 1-ups.
+    // Only the host's lives are in the save: a player who joined starts with 4.
+    bool save_lives = true;
     // The room's cheats (the Online tab's Cheats): off, they do nothing for anyone in it.
     bool cheats = false;
 

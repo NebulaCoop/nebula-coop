@@ -623,7 +623,7 @@ int main() {
                "coop_port=9000\ncoop_max_players=40\ncoop_player_name=  Mario\x01 Bros  \ncoop_password=pw\n"
                "coop_room_name=  Star Hunt\x02  \n"
                "coop_player_interaction=Friendly_Fire\ncoop_knockback_strength=60\ncoop_pvp_mode=revamped\ncoop_cheats=1\n"
-               "coop_bubble_death=0\ncoop_character=Luigi\ncoop_character_id=Waluigi\ncoop_join_address=192.168.1.20:7778\n"
+               "coop_bubble_death=0\ncoop_save_lives=0\ncoop_character=Luigi\ncoop_character_id=Waluigi\ncoop_join_address=192.168.1.20:7778\n"
                "coop_network=Direct\ncoop_nebulanet=http://127.0.0.1:8787\ncoop_public=1\n"
                "coop_palette=#083084,DC0000,ffffff,6e3214,4a1400,ffaa84,00b400,c40000\n");
     galaxy::load_runtime_settings_from_file();
@@ -634,6 +634,7 @@ int main() {
                          coop.player_interaction == galaxy::CoopPlayerInteraction::FriendlyFire &&
                          coop.knockback_strength == galaxy::kCoopKnockbackTooMuch &&
                          coop.pvp_mode == galaxy::CoopPvpMode::Revamped && coop.cheats && !coop.bubble_death &&
+                         !coop.save_lives &&
                          coop.character == galaxy::CoopCharacter::Luigi && coop.character_id == "waluigi" &&
                          galaxy::coop_character_id(coop) == "waluigi" && coop.join_address == "192.168.1.20:7778" &&
                          !coop.nebulanet && coop.nebulanet_server == "http://127.0.0.1:8787" &&

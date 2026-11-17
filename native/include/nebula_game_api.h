@@ -920,7 +920,10 @@ enum {
    file select starts: 1 when the game's title shows before the menu (once, as Nebula starts), 0 when the menu opens at
    once (back from a room, or when the menu starts one itself: --host, --join, a restart for the room's mods).
    NEBULA_COOP_MENU_LEAVE, each game scene frame: 1 once when the room ended under the player (its host quit, or the
-   player was let go), so the game starts again at the main menu; else 0. */
+   player was let go), so the game starts again at the main menu; else 0. NEBULA_COOP_MENU_SAVE_LIVES, as the game
+   reads a save: 1 when the save's lives come back (the room's Lives rule, SAVED by default: the host's, or the
+   player's own outside a room), else 0, the original game's (every load starts with 4 lives). Always 0 for a player
+   who joined: the lives in the host's save are the host's. */
 enum {
     NEBULA_COOP_MENU_OPEN = 1,
     NEBULA_COOP_MENU_POLL,
@@ -932,6 +935,7 @@ enum {
     NEBULA_COOP_MENU_JOINED,
     NEBULA_COOP_MENU_TITLE,
     NEBULA_COOP_MENU_LEAVE,
+    NEBULA_COOP_MENU_SAVE_LIVES,
 };
 enum {
     NEBULA_COOP_KEY_TAB = 1u << 0,    /* the main menu's reset (as the controller's Back, the Wii Remote's Minus) */
