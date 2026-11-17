@@ -2976,6 +2976,10 @@ int32_t svc_coop_menu(void*, uint32_t what) {
 #endif
         return gCoopLuigi.load(std::memory_order_relaxed) ? 1 : 0;
     case NEBULA_COOP_MENU_JOINED: return gCoopSession.active() && !gCoopSession.is_host() ? 1 : 0;
+    case NEBULA_COOP_MENU_SAVE_LIVES:
+        // A joiner plays the host's save, whose lives are the host's: theirs start afresh.
+        if (gCoopSession.active() && !gCoopSession.is_host()) return 0;
+        return (gCoopSession.is_host() ? gCoopSession.room() : gCoopMenu.room()).save_lives ? 1 : 0;
     case NEBULA_COOP_MENU_LEAVE:
         // Each game scene frame: the room's news, the chat's line, and the room ending under the player.
         pump_coop_session();

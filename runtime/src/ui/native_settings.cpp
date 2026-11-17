@@ -2889,6 +2889,13 @@ std::vector<SettingsRow> online_page(const RuntimeSettings& runtime) {
                         s_runtime_draft.coop.bubble_death = !s_runtime_draft.coop.bubble_death;
                     },
                     "ON: A PLAYER WHO DIES NEAR ANOTHER FLOATS TO THEM IN A BUBBLE, FOR A LIFE, INSTEAD OF A MISS"});
+    rows.push_back({"LIVES", coop.save_lives ? std::string("SAVED") : std::string("CLASSIC"),
+                    [](RenderConfig&, int delta) {
+                        if (delta == 0) return;
+                        s_runtime_draft.coop.save_lives = !s_runtime_draft.coop.save_lives;
+                    },
+                    "SAVED: THE SAVE KEEPS YOUR LIVES FOR NEXT TIME. CLASSIC: EVERY GAME STARTS WITH 4 LIVES, AS THE "
+                    "ORIGINAL. FROM THE SAVE'S NEXT LOAD; PLAYERS WHO JOIN START WITH 4 EITHER WAY"});
     rows.push_back({"ALLOW CHEATS", coop.cheats ? std::string("ON") : std::string("OFF"),
                     [](RenderConfig&, int delta) {
                         if (delta == 0) return;

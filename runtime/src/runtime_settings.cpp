@@ -349,6 +349,8 @@ void apply_kv(RuntimeSettings& settings, const char* key, const char* value) {
         }
     } else if (std::strcmp(key, "coop_bubble_death") == 0) {
         settings.coop.bubble_death = std::strcmp(value, "0") != 0;
+    } else if (std::strcmp(key, "coop_save_lives") == 0) {
+        settings.coop.save_lives = std::strcmp(value, "0") != 0;
     } else if (std::strcmp(key, "coop_cheats") == 0) {
         settings.coop.cheats = std::strcmp(value, "1") == 0;
     } else if (std::strcmp(key, "coop_pvp_mode") == 0) {
@@ -763,6 +765,9 @@ bool save_runtime_settings_to_file() {
         }
         if (settings.coop.bubble_death != defaults.bubble_death) {
             contents << "coop_bubble_death=" << (settings.coop.bubble_death ? 1 : 0) << '\n';
+        }
+        if (settings.coop.save_lives != defaults.save_lives) {
+            contents << "coop_save_lives=" << (settings.coop.save_lives ? 1 : 0) << '\n';
         }
         if (settings.coop.cheats != defaults.cheats) contents << "coop_cheats=" << (settings.coop.cheats ? 1 : 0) << '\n';
         // The pop-ups this player turned off (each is on by default).

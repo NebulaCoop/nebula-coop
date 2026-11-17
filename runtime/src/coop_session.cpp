@@ -78,7 +78,7 @@ void write_room(ByteWriter& out, const RuntimeCoopSettings& room) {
         .u8(static_cast<std::uint8_t>(room.pvp_mode))
         .u8(room.cheats ? 1u : 0u)
         .u8(static_cast<std::uint8_t>(room.max_players))
-        .u8(room.bubble_death ? 1u : 0u);
+        .u8((room.bubble_death ? 1u : 0u) | (room.save_lives ? 2u : 0u));
 }
 
 // Into `room`, keeping what isn't the room's (the player's name and character, the address).
@@ -89,7 +89,10 @@ void read_room(ByteReader& in, RuntimeCoopSettings& room) {
     room.pvp_mode = static_cast<CoopPvpMode>(std::min<unsigned>(in.u8(), 1u));
     room.cheats = in.u8() != 0u;
     room.max_players = std::clamp<unsigned>(in.u8(), 2u, kCoopMaxPlayersLimit);
-    room.bubble_death = in.u8() != 0u;
+    // Bit 0 bubble on death, bit 1 saved lives: the rules that are on or off share a byte.
+    const unsigned flags = in.u8();
+    room.bubble_death = (flags & 1u) != 0u;
+    room.save_lives = (flags & 2u) != 0u;
 }
 
 // A player's character id as the room keeps it: a mod's (1 to 31 of a-z, 0-9, '_' and '-', in lower case, as
@@ -1206,6 +1209,7 @@ void Session::set_room(const RuntimeCoopSettings& room) {
     next.pvp_mode = room.pvp_mode;
     next.cheats = room.cheats;
     next.bubble_death = room.bubble_death;
+    next.save_lives = room.save_lives;
     next.max_players = max_players;
     if (next == state_->room) return;
     state_->room = next;
