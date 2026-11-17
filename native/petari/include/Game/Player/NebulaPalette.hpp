@@ -51,7 +51,7 @@ private:
         u32 mSize;
         bool mChanged;        // the copy differs: drawn in its place
     };
-    enum { cMaxEntries = 24 };
+    enum { cMaxEntries = 40 };
 
     void add(const void* pSource, u32 parts);
     void build(Entry& rEntry);

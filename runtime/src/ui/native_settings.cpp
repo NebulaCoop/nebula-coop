@@ -382,6 +382,9 @@ constexpr unsigned kPlayerTab = 8u;
 std::optional<galaxy::coop::TextEdit> s_settings_text;
 std::atomic<bool> s_settings_typing{false};
 std::uint64_t s_settings_text_swallow = 0u;
+// The part the PLAYER page's ADVANCED COLOURS rows edit (an index into its parts' rows, CAP first). Under
+// s_native_settings_mutex.
+std::size_t s_palette_edit_part = 0u;
 galaxy::input::ControlsConfig s_controls_draft = galaxy::input::default_controls_config();
 RuntimeInputMode s_input_mode_draft = RuntimeInputMode::Auto;
 galaxy::input::ControlScheme s_controls_scheme = galaxy::input::ControlScheme::Keyboard;
@@ -4973,6 +4976,13 @@ std::vector<SettingsRow> online_page(const RuntimeSettings& runtime) {
                         s_runtime_draft.coop.bubble_death = !s_runtime_draft.coop.bubble_death;
                     },
                     "ON: A PLAYER WHO DIES NEAR ANOTHER FLOATS TO THEM IN A BUBBLE, FOR A LIFE, INSTEAD OF A MISS"});
+    rows.push_back({"LIVES", coop.save_lives ? std::string("SAVED") : std::string("CLASSIC"),
+                    [](RenderConfig&, int delta) {
+                        if (delta == 0) return;
+                        s_runtime_draft.coop.save_lives = !s_runtime_draft.coop.save_lives;
+                    },
+                    "SAVED: THE SAVE KEEPS YOUR LIVES FOR NEXT TIME. CLASSIC: EVERY GAME STARTS WITH 4 LIVES, AS THE "
+                    "ORIGINAL. FROM THE SAVE'S NEXT LOAD; PLAYERS WHO JOIN START WITH 4 EITHER WAY"});
     rows.push_back({"ALLOW CHEATS", coop.cheats ? std::string("ON") : std::string("OFF"),
                     [](RenderConfig&, int delta) {
                         if (delta == 0) return;
@@ -5153,6 +5163,51 @@ std::vector<SettingsRow> player_page(const RuntimeSettings& runtime) {
                                 s_runtime_draft.coop.palette = changed == own ? std::string() : format_coop_palette(changed);
                             },
                             "THIS PART'S COLOUR: YOUR CHARACTER'S OWN OR ANOTHER. OTHER PLAYERS SEE IT TOO"});
+        }
+        // Any colour for a part, as sm64coopdx's palette editor: a part, then its red, green and blue, in fives (a
+        // channel off a five steps to the nearest one first).
+        rows.push_back({"ADVANCED COLOURS", {}, nullptr, {}, true});
+        const std::size_t edited = s_palette_edit_part % std::size(kParts);
+        const std::size_t edit_part = kParts[edited].part;
+        {
+            char value[32];
+            std::snprintf(value, sizeof(value), "%s  #%06X", kParts[edited].label, static_cast<unsigned>(rgb_of(wearing, edit_part)));
+            rows.push_back({"PART", value,
+                            [](RenderConfig&, int delta) {
+                                s_palette_edit_part =
+                                    ui::settings_step(static_cast<unsigned>(s_palette_edit_part % std::size(kParts)),
+                                                      static_cast<unsigned>(std::size(kParts)), delta);
+                            },
+                            "THE PART THE RED, GREEN AND BLUE BELOW CHANGE"});
+        }
+        static constexpr unsigned kChannelStep = 5u;
+        static constexpr unsigned kChannelSteps = 255u / kChannelStep;
+        struct ChannelRow {
+            const char* label;
+            std::size_t offset;
+            const char* help;
+        };
+        static constexpr ChannelRow kChannels[] = {
+            {"RED", 0u, "HOW MUCH RED THE PART HAS, 0 TO 255"},
+            {"GREEN", 1u, "HOW MUCH GREEN THE PART HAS, 0 TO 255"},
+            {"BLUE", 2u, "HOW MUCH BLUE THE PART HAS, 0 TO 255"},
+        };
+        for (const ChannelRow& channel : kChannels) {
+            const unsigned level = wearing[edit_part * 3u + channel.offset];
+            SettingsRow row{channel.label, std::to_string(level),
+                            [edit_part, offset = channel.offset, own, wearing](RenderConfig&, int delta) {
+                                const unsigned current = wearing[edit_part * 3u + offset];
+                                unsigned step = current / kChannelStep;
+                                if (delta < 0 && current % kChannelStep != 0u) ++step;  // down from 132 is 130
+                                const int next = std::clamp(static_cast<int>(step) + delta, 0, static_cast<int>(kChannelSteps));
+                                CoopPalette changed = wearing;
+                                changed[edit_part * 3u + offset] = static_cast<std::uint8_t>(static_cast<unsigned>(next) * kChannelStep);
+                                s_runtime_draft.coop.palette = changed == own ? std::string() : format_coop_palette(changed);
+                            },
+                            channel.help};
+            row.slider_steps = static_cast<std::uint16_t>(kChannelSteps);
+            row.slider_at = static_cast<std::uint16_t>((level + kChannelStep / 2u) / kChannelStep);
+            rows.push_back(std::move(row));
         }
     }
 

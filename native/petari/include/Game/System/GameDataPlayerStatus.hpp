@@ -26,6 +26,6 @@ public:
     u8 mStoryProgress;
 
 private:
-    // The lives from the previous session.
+    // The lives from the previous session, with classic lives (0 when they came back as the lives).
     u16 mPlayerLeftSupply;
 };

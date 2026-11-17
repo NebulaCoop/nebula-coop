@@ -1,10 +1,11 @@
 #include "Game/System/GameDataPlayerStatus.hpp"
 #include "Game/System/GameRules.hpp"
+#include "Game/System/NebulaHost.hpp"
 #include "Game/Util/MathUtil.hpp"
 #include "Game/System/SaveBytes.hpp"
 
 namespace {
-    // The lives the player starts with and has again on every load (4).
+    // The lives the player starts with, and has again on every load with classic lives (4).
     const s32 cStartingPlayerLeft = 4;
     // The most lives (99).
     const s32 cMaxPlayerLeft = 99;
@@ -26,7 +27,7 @@ s32 GameDataPlayerStatus::serialize(u8* pBuffer, u32 size) const {
     SaveWriter stream(pBuffer, size);
     stream.write(&mStoryProgress, sizeof(mStoryProgress));
     stream.write(&mStockedStarPiece, sizeof(mStockedStarPiece));
-    // Read back as mPlayerLeftSupply; the lives start again on every load.
+    // The lives now: on the next load, the lives again (saved lives), or mPlayerLeftSupply (classic).
     stream.write(&mPlayerLeft, sizeof(mPlayerLeft));
     return stream.getPosition();
 }
@@ -39,11 +40,23 @@ s32 GameDataPlayerStatus::deserialize(const u8* pBuffer, u32 size) {
     stream.read(&mStoryProgress, sizeof(mStoryProgress));
     stream.read(&mStockedStarPiece, sizeof(mStockedStarPiece));
 
-    if (stream.getAvailable() != 0) {
-        stream.read(&mPlayerLeftSupply, sizeof(mPlayerLeftSupply));
-    }
-
     mPlayerLeft = ::cStartingPlayerLeft;
+
+    if (stream.getAvailable() != 0) {
+        u16 savedLeft = 0;
+        stream.read(&savedLeft, sizeof(savedLeft));
+
+        // Online co-op's Lives rule (NEBULA_COOP_MENU_SAVE_LIVES, saved by default): the lives at the last save come
+        // back, and as they are kept, Peach's letter brings no 1-ups for them. A save left with none (a game over)
+        // starts with the starting lives. Classic, the original game's: they start again, and 10 or more at the last
+        // save bring the letter's 1-ups.
+        if (NebulaHost::coopMenu(NEBULA_COOP_MENU_SAVE_LIVES) == 1 && savedLeft > 0) {
+            mPlayerLeft = MR::clamp(static_cast< s32 >(savedLeft), 1, ::cMaxPlayerLeft);
+            mPlayerLeftSupply = 0;
+        } else {
+            mPlayerLeftSupply = savedLeft;
+        }
+    }
 
     return 0;
 }

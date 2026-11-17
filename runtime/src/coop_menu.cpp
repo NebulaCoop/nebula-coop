@@ -27,6 +27,7 @@ enum HostRow : unsigned {
     RowKnockback,
     RowPvp,
     RowBubble,
+    RowLives,
     RowCheats,
     RowMods,
     RowStart,
@@ -369,6 +370,10 @@ std::vector<MenuRow> MainMenu::rows() const {
         rows[RowBubble] = {"BUBBLE ON DEATH", coop.bubble_death ? "ON" : "OFF",
                            "ON: A PLAYER WHO DIES NEAR ANOTHER FLOATS TO THEM IN A BUBBLE, FOR A LIFE, INSTEAD OF A MISS",
                            false, true};
+        rows[RowLives] = {"LIVES", coop.save_lives ? "SAVED" : "CLASSIC",
+                          "SAVED: THE SAVE KEEPS YOUR LIVES FOR NEXT TIME. CLASSIC: EVERY GAME STARTS WITH 4 LIVES, AS "
+                          "THE ORIGINAL. PLAYERS WHO JOIN START WITH 4 EITHER WAY",
+                          false, true};
         rows[RowCheats] = {"CHEATS", coop.cheats ? "ON" : "OFF",
                            "ON: EVERYONE IN THE ROOM MAY USE THE ONLINE TAB'S CHEATS", false, true};
         const unsigned on = mods_on(mods_);
@@ -586,6 +591,7 @@ void MainMenu::change(int delta) {
             coop.pvp_mode = static_cast<CoopPvpMode>(step(static_cast<unsigned>(coop.pvp_mode), delta, 2u));
             break;
         case RowBubble: coop.bubble_death = step(coop.bubble_death ? 1u : 0u, delta, 2u) == 1u; break;
+        case RowLives: coop.save_lives = !coop.save_lives; break;
         case RowCheats: coop.cheats = step(coop.cheats ? 1u : 0u, delta, 2u) == 1u; break;
         case RowNetwork: coop.nebulanet = !coop.nebulanet; break;
         case RowLobby: coop.public_room = !coop.public_room; break;
@@ -859,6 +865,7 @@ void MainMenu::reset() {
     case RowKnockback: room_.knockback_strength = defaults.knockback_strength; break;
     case RowPvp: room_.pvp_mode = defaults.pvp_mode; break;
     case RowBubble: room_.bubble_death = defaults.bubble_death; break;
+    case RowLives: room_.save_lives = defaults.save_lives; break;
     case RowCheats: room_.cheats = defaults.cheats; break;
     case RowNetwork: room_.nebulanet = defaults.nebulanet; break;
     case RowLobby: room_.public_room = defaults.public_room; break;
