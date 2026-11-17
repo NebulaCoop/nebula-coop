@@ -962,7 +962,7 @@ std::vector<wstring> Register(const InstallLayout& layout, const wstring& versio
     {
         Key nebula(kProductKey);
         nebula.Set(L"InstallRoot", layout.root);
-        for (const wchar_t* name : {L"LumaLinkWindow", L"LumaLinkCommand", L"LumaLinkPath"}) nebula.Delete(name);
+        for (const wchar_t* value : {L"LumaLinkWindow", L"LumaLinkCommand", L"LumaLinkPath"}) nebula.Delete(value);
     }
     // NebulaCoop registers no .luma file type and no nebula: links: those stay upstream Nebula's, which an install
     // beside it must not take over. Its mods are added in the game's MODS page.

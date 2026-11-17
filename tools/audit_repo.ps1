@@ -62,6 +62,11 @@ foreach ($RelativePath in $TrackedFiles) {
         if ($File.Length -gt 16MB) { $Failures.Add("Shader-cache seed larger than 16 MiB: $($File.FullName)") }
         continue
     }
+    # The validator's test libraries (crates/luma-validate/tests/data): tiny mods built to check its rules on code.
+    if ($RelativePath -like 'crates/luma-validate/tests/data/*') {
+        if ($File.Length -gt 1MB) { $Failures.Add("Validator test file larger than 1 MiB: $($File.FullName)") }
+        continue
+    }
     # The game module's PGO profile (native/pgo, NEBULA_PGO): clang's merged counters for Nebula's own code.
     if ($RelativePath -eq 'native/pgo/game.profdata') {
         if ($File.Length -gt 16MB) { $Failures.Add("PGO profile larger than 16 MiB: $($File.FullName)") }
