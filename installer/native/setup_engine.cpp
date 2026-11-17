@@ -956,7 +956,7 @@ std::vector<wstring> Register(const InstallLayout& layout, const wstring& versio
     link(PathCombine(StartMenuFolder(), name + L" Setup.lnk"), layout.SetupCopy(), L"", layout.root, L"Repair, restore or uninstall " + name);
     if (desktop || FileExists(DesktopLink())) link(DesktopLink(), starter, L"", layout.root, L"Play " + name);
     // Programs earlier versions had: their shortcuts go (LumaLink has a Setup of its own).
-    DeleteQuietly(PathCombine(StartMenuFolder(), L"Nebula Settings.lnk"));
+    DeleteQuietly(PathCombine(StartMenuFolder(), name + L" Settings.lnk"));
     DeleteQuietly(PathCombine(StartMenuFolder(), L"LumaLink.lnk"));
 
     {
