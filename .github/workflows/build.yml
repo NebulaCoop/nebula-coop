@@ -33,7 +33,8 @@ env:
 
 jobs:
   # Sorts the changed files into what they affect:
-  #   game:      the host, the game module, the disc import tool and the Windows, Linux and Android test builds;
+  #   game:      the host, the game module, the disc import tool and the Windows and Linux test builds;
+  #   android:   the Android test build, only when platform/android changes (shared code doesn't start it);
   #   installer: Nebula Setup and the install root's Nebula.exe (installer/native), compiled.
   # Documentation, the other workflows, NebulaNet and tools/ affect neither. A file both use (the icon the host and
   # Setup are both built with, the store version Setup writes) and this workflow itself run both.
@@ -48,6 +49,7 @@ jobs:
     outputs:
       game: ${{ steps.filter.outputs.game }}
       installer: ${{ steps.filter.outputs.installer }}
+      android: ${{ steps.filter.outputs.android }}
     steps:
       - uses: actions/Checkout@v7
         if: github.event_name != 'workflow_dispatch'
@@ -61,7 +63,7 @@ jobs:
         run: |
           all() {
             echo "Building everything: $1"
-            { echo game=true; echo installer=true; } >> "$GITHUB_OUTPUT"
+            { echo game=true; echo installer=true; echo android=true; } >> "$GITHUB_OUTPUT"
             exit 0
           }
           # The commit of the newest finished Build of main whose Build result passed. A push is compared with it, not
@@ -98,10 +100,13 @@ jobs:
           esac
           game=false
           installer=false
+          android=false
           while IFS= read -r file; do
             case "$file" in
               "") ;;
-              .github/workflows/build.yml) game=true; installer=true ;;
+              .github/workflows/build.yml) game=true; installer=true; android=true ;;
+              # The Android port: its own build, which needs the host's shader tools and the game module too.
+              platform/android/*) game=true; android=true ;;
               # The lumalink submodule's commit carries the built-in mods the host embeds.
               lumalink) game=true ;;
               *.md | docs/* | LICENSE | .github/* | nebulanet/* | web/* | tools/*) ;;
@@ -112,8 +117,8 @@ jobs:
           done <<< "$files"
           echo "$(printf '%s\n' "$files" | grep -c .) changed files, the first 100:"
           printf '%s\n' "$files" | head -n 100 | sed 's/^/  /'
-          echo "Game: $game. Installer: $installer."
-          { echo "game=$game"; echo "installer=$installer"; } >> "$GITHUB_OUTPUT"
+          echo "Game: $game. Installer: $installer. Android: $android."
+          { echo "game=$game"; echo "installer=$installer"; echo "android=$android"; } >> "$GITHUB_OUTPUT"
 
   import:
     name: Disc import tool (Rust)
@@ -367,7 +372,7 @@ jobs:
     # The Vulkan host build's shader tools compile the SPIR-V the APK carries.
     # Also needs the game module: if it doesn't build, the APK is useless.
     needs: [changes, host, game]
-    if: needs.changes.outputs.game == 'true'
+    if: needs.changes.outputs.android == 'true'
     runs-on: windows-2025
     steps:
       - uses: actions/Checkout@v7
