@@ -222,13 +222,24 @@ jobs:
     env:
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       SCCACHE_GHA_ENABLED: "true"
+      LLVM_VERSION: '22.1.6'
     steps:
       - uses: actions/Checkout@v7
       # The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake).
       - name: Built-in mods
         run: git submodule update --init --depth 1 lumalink
-      - name: Clang version
-        run: '& "C:\Program Files\LLVM\bin\clang.exe" --version'
+      - name: LLVM
+        # The row generator needs libclang 21 or later (tools/lumacore/instrument.py); the runner's is older. The
+        # release's LLVM, as release.yml's game job takes it.
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o llvm.tar.xz \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/clang+llvm-$LLVM_VERSION-x86_64-pc-windows-msvc.tar.xz"
+          mkdir llvm
+          tar -xJf llvm.tar.xz -C llvm --strip-components=1
+          rm llvm.tar.xz
+          llvm/bin/clang --version
       # Archive deps (zlib, xz, libarchive) built at configure time: skip when already built.
       - name: Cache configure-time dependencies
         uses: actions/cache@v6
@@ -240,7 +251,7 @@ jobs:
       - name: Start sccache
         run: sccache --start-server
       - name: Build
-        run: .\native\build.ps1 -Petari native\petari -Build build\game
+        run: .\native\build.ps1 -Petari native\petari -Build build\game -Llvm (Join-Path $env:RUNNER_TEMP 'llvm\bin')
       - uses: actions/upload-artifact@v7
         with:
           name: windows-game-module

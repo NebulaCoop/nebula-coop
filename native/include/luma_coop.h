@@ -98,7 +98,7 @@ typedef struct LumaCoopService {
     /* 1.0. Game thread. `fn` gets the room's events (at the start of a frame, never inside this call) while the mod
        runs. A later call replaces fn and user; a null fn stops the events. LUMA_OK; 32 mods watching already:
        LUMA_E_LIMIT, reported; LUMA_E_MEMORY when there is no memory for it. */
-    /* events: JOINED(value), CLOSED, PLAYER_JOIN(value), PLAYER_LEAVE(value), PLAYER_PLACE(value), COMMAND(value, flags) */
+    /* events: JOINED(value), CLOSED(), PLAYER_JOIN(value), PLAYER_LEAVE(value), PLAYER_PLACE(value), COMMAND(value, flags) */
     int32_t (*watch)(const LumaMod* mod, LumaEventFn fn, void* user);
 } LumaCoopService;
 
