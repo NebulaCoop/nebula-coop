@@ -45,9 +45,14 @@ public:
     };
     struct Inputs {
         Texture* color = nullptr;  // the scene target's single-sample colour (no pass open)
-        unsigned frame_width = 0;  // the frame in scene target pixels
+        unsigned frame_width = 0;  // the frame in scene target pixels (the part of it drawn in)
         unsigned frame_height = 0;
+        unsigned extent_width = 0;  // the scene target's size (0: the frame's)
+        unsigned extent_height = 0;
+        unsigned lowest_sixteenths = 16u;  // the smallest dynamic resolution step the frame may take (16: none)
         float scale = 1.0f;
+        [[nodiscard]] unsigned whole_width() const noexcept { return extent_width != 0u ? extent_width : frame_width; }
+        [[nodiscard]] unsigned whole_height() const noexcept { return extent_height != 0u ? extent_height : frame_height; }
     };
     // BloomEffect::preDraw, BloomEffectSimple::draw with the game's own chain: the scene before the bloom works over
     // it. `commands`: an id<MTLCommandBuffer> with no encoder open.
@@ -56,12 +61,25 @@ public:
     // does not fit), and its picture is the kept scene. The composite writes the kept scene's alpha with its colour.
     [[nodiscard]] std::shared_ptr<Texture> take_kept_image();
     void keep_picture(std::shared_ptr<Texture> picture);
+    // The simple bloom's source without a copy: the scene target continues on the image this returns (the hand-over makes
+    // one when it does not fit), and give_source takes the scene's picture as the source; prepare() copies nothing then.
+    // Only where the composite covers all of the target that is read (the whole target, or dynamic resolution's
+    // rectangle), which it then writes from the source.
+    [[nodiscard]] std::shared_ptr<Texture> take_source_image();
+    void give_source(std::shared_ptr<Texture> picture);
     // The chain before its composite, recorded with no encoder open; false when there is nothing to draw.
     bool prepare(Object commands, const Inputs& in, const Params& params);
     // The composite prepare() set up, in the open scene pass `encoder` (an id<MTLRenderCommandEncoder>) whose colour is
     // `color_format` over `samples` samples a pixel.
     void finish(Object encoder, Format color_format, unsigned samples);
-    // Once a frame: hands back the textures no pass has asked for in 600 frames; prepare() makes them again.
+    // A picture of the scene target's own format drawn back over the frame, each pixel's channels as they were (the
+    // composite's kind 0, which loads the pixel): a capture that took the scene target's texture continues the scene
+    // from it. prepare_draw_back with no encoder open (it may make the composite); false: the capture copies instead.
+    // draw_back in the open scene pass `encoder`.
+    [[nodiscard]] bool prepare_draw_back(Format color_format, unsigned samples);
+    void draw_back(Object encoder, Format color_format, unsigned samples, const Texture& picture, unsigned width,
+                   unsigned height);
+    // Once a frame: hands back the textures no pass has asked for in kIdleSteps game steps (idle_clock.h); prepare() makes them again.
     void trim_idle();
 
 private:
@@ -89,6 +107,7 @@ private:
 
     bool ready_ = false;
     bool kept_ = false;
+    bool source_given_ = false;  // give_source ran since the last prepare
     bool to_build_ = false;  // initialized: poll_ready makes the passes
     Format depth_format_ = Format::Depth32fStencil8;
     std::future<Functions> compiling_;
@@ -116,8 +135,7 @@ private:
     std::shared_ptr<Texture> work_, box_tmp_, mask_, level1_, level2_in_, level2_;
     std::array<std::shared_ptr<Texture>, 3> blur_h_;
     std::array<std::shared_ptr<Texture>, 3> blur2_h_;
-    // trim_idle() calls, and the clock at the last use of each group.
-    std::uint64_t clock_ = 0;
+    // idle_clock() at the last use of each group.
     std::uint64_t keep_used_ = 0;
     std::uint64_t work_used_ = 0;
     std::uint64_t normal_used_ = 0;

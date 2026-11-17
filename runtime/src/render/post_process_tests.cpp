@@ -7,6 +7,7 @@
 
 #include "galaxy/render/render_config.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -115,15 +116,124 @@ void hdr_output() {
     cfg.paper_white = 300u;
     levels = post_output_for(cfg, display);
     expect(levels.peak_nits == 300u, "the peak stays at or above the paper white");
+    // The calibrated peak and black over the display's report.
+    cfg.paper_white = 200u;
+    cfg.hdr_peak = 750u;
+    cfg.hdr_black = 20u;
+    display.peak_nits = 1000u;
+    levels = post_output_for(cfg, display);
+    expect(levels.peak_nits == 750u && levels.black == 20u && levels.pattern == HdrPattern::None,
+           "the calibrated peak and black");
+    // The calibration's live levels while it is up, then the settings' again.
+    HdrCalibration calibration{};
+    calibration.active = true;
+    calibration.pattern = HdrPattern::Peak;
+    calibration.peak_nits = 1450u;
+    calibration.black = 3u;
+    calibration.paper_white_nits = 240u;
+    set_hdr_calibration(calibration);
+    levels = post_output_for(cfg, display);
+    expect(levels.peak_nits == 1450u && levels.black == 3u && levels.paper_white_nits == 240u &&
+               levels.pattern == HdrPattern::Peak,
+           "the calibration's levels while it is up");
+    set_hdr_calibration(HdrCalibration{});
+    expect(post_output_for(cfg, display).peak_nits == 750u, "the settings' levels after it");
+    cfg.hdr_peak = 0u;
+    cfg.hdr_black = 0u;
+    // The peak's steps: 100 to 10000, rising, each found again by its level.
+    bool steps_ok = hdr_peak_at(0u) == kHdrPeakMin && hdr_peak_at(kHdrPeakSteps) == kHdrPeakMax &&
+                    hdr_peak_at(36u) == 1000u && normalized_hdr_peak(1013u) == 1000u && normalized_hdr_peak(0u) == 0u;
+    for (unsigned step = 0u; step <= kHdrPeakSteps; ++step) {
+        steps_ok = steps_ok && hdr_peak_step(hdr_peak_at(step)) == step &&
+                   (step == 0u || hdr_peak_at(step) > hdr_peak_at(step - 1u));
+    }
+    expect(steps_ok, "the peak's steps");
+    expect(hdr_black_nits(0u) == 0.0f && close_to(hdr_black_nits(kHdrBlackSteps), 2.0f, 1e-6f) &&
+               close_to(hdr_black_nits(kHdrBlackStart), 0.5079f, 1e-4f) &&
+               hdr_black_nits(1u) > 0.0f && hdr_black_nits(1u) < 0.0002f,
+           "the black's steps");
     levels.paper_white_nits = 200u;
     levels.peak_nits = 1000u;
+    levels.black = 100u;
+    levels.pattern = HdrPattern::Black;
     const std::int32_t word = post_output_word(levels);
-    expect((word & 1023) == 200 && ((word >> 10) & 16383) == 1000, "the constants word holds paper white and peak");
+    const std::uint32_t bits = static_cast<std::uint32_t>(word);
+    expect((bits & 511u) == 200u && ((bits >> 9u) & 16383u) == 1000u && ((bits >> 23u) & 127u) == 100u && (bits >> 30u) == 2u,
+           "the constants word holds paper white, peak, black and pattern");
     PostConstants constants{};
-    set_post_output(constants, levels);
-    expect(constants.origin[2] == 2 && constants.origin[3] == word, "HDR last write constants");
-    set_post_output(constants, PostOutput{});
+    set_post_output(constants, levels, 1920u, 1080u);
+    expect(constants.origin[2] == 2 && constants.origin[3] == word && constants.turn[1] == 1920 && constants.turn[2] == 1080,
+           "HDR last write constants");
+    set_post_output(constants, PostOutput{}, 1920u, 1080u);
     expect(constants.origin[2] == 1 && constants.origin[3] == 0, "SDR last write constants are the window's, as before HDR");
+    // A capture of the calibration: the SDR write with the test box's word; of any other HDR picture, the plain SDR write.
+    const PostOutput capture = capture_output(levels);
+    expect(!capture.hdr && capture.pattern == HdrPattern::Black && capture.black == 100u && capture.peak_nits == 1000u,
+           "a capture keeps the test box");
+    set_post_output(constants, capture, 1920u, 1080u);
+    expect(constants.origin[2] == 1 && constants.origin[3] == post_output_word(capture), "the capture's SDR write draws the box");
+    PostOutput no_box = levels;
+    no_box.pattern = HdrPattern::None;
+    expect(capture_output(no_box) == PostOutput{} && capture_output(PostOutput{}) == PostOutput{}, "other captures: plain SDR");
+    // The black level lift: true black to the display's black, the black's rise smooth, white kept.
+    const float zero[3] = {0.0f, 0.0f, 0.0f};
+    const float near_black[3] = {0.01f, 0.01f, 0.01f};
+    float lifted[3]{};
+    hdr10_encode(zero, 200u, 1000u, lifted, 0.05f);
+    expect(close_to(pq_decode(lifted[0]), 0.05f, 2e-3f), "true black lifts to the display's black");
+    float plain[3]{};
+    hdr10_encode(near_black, 200u, 1000u, plain);
+    hdr10_encode(near_black, 200u, 1000u, lifted, 0.05f);
+    expect(pq_decode(lifted[0]) > pq_decode(plain[0]) && pq_decode(lifted[0]) > 0.05f, "shadows lift above the black");
+    hdr10_encode(white, 200u, 1000u, plain);
+    hdr10_encode(white, 200u, 1000u, lifted, 0.05f);
+    expect(close_to(pq_decode(lifted[0]), pq_decode(plain[0]), pq_decode(plain[0]) * 0.01f), "the paper white keeps its level");
+    // The test box: the surround at the top of PQ, the cells at the peak, the picture outside.
+    PostOutput peak_test{};
+    peak_test.hdr = true;
+    peak_test.peak_nits = 800u;
+    peak_test.pattern = HdrPattern::Peak;
+    const int side = static_cast<int>(kHdrBoxSide * 1080.0f + 0.5f);
+    const int box_left = (1920 - side) / 2;
+    const int box_top = 324 - side / 2;
+    expect(hdr_box(1920, 1080).left == box_left && hdr_box(1920, 1080).top == box_top && hdr_box(1920, 1080).side == side,
+           "the box centred across, its middle 0.30 of the height down");
+    // At 16:9, 48:9, 4:3, 16:10 and an upright phone: inside the picture, its foot above the middle (the window's half).
+    const std::array<std::array<int, 2>, 5> shapes{{{1920, 1080}, {1920, 360}, {1440, 1080}, {2560, 1600}, {1080, 2400}}};
+    for (const std::array<int, 2>& shape : shapes) {
+        const HdrBox b = hdr_box(shape[0], shape[1]);
+        expect(b.left > 0 && b.top > 0 && b.left + b.side < shape[0] && b.top + b.side <= shape[1] / 2 + shape[1] / 40,
+               "the box over the window's half at every shape");
+    }
+    // The star: its middle and its five points in, the gaps between the points and past them out.
+    expect(hdr_star(0.0f, 0.0f) && hdr_star(0.0f, 0.95f) && hdr_star(0.9f, 0.29f) && hdr_star(-0.55f, -0.75f) &&
+               hdr_star(0.55f, -0.75f) && hdr_star(-0.9f, 0.29f),
+           "inside the star");
+    expect(!hdr_star(0.45f, 0.62f) && !hdr_star(0.0f, -0.6f) && !hdr_star(0.0f, 1.05f) && !hdr_star(0.9f, 0.9f) &&
+               !hdr_star(-0.7f, -0.2f),
+           "outside the star");
+    const int middle_x = box_left + side / 2;
+    const int middle_y = box_top + side / 2;
+    expect(hdr_pattern_code(peak_test, box_left + 2, box_top + 2, 1920, 1080) == 1.0f, "the surround at 10000 nits");
+    expect(close_to(hdr_pattern_code(peak_test, middle_x, middle_y, 1920, 1080), pq_encode(800.0f), 1e-6f), "the star at the peak");
+    // The star sits evenly: as far from the box's top to its point as from its feet to the box's foot.
+    int star_top = side;
+    int star_foot = 0;
+    for (int y = 0; y < side; ++y) {
+        for (int x = 0; x < side; ++x) {
+            if (hdr_pattern_code(peak_test, box_left + x, box_top + y, 1920, 1080) != 1.0f) {
+                star_top = std::min(star_top, y);
+                star_foot = std::max(star_foot, y);
+            }
+        }
+    }
+    expect(std::abs(star_top - (side - 1 - star_foot)) <= 2, "the star centred up and down in the box");
+    expect(hdr_pattern_code(peak_test, 4, 4, 1920, 1080) < 0.0f, "the picture outside the box");
+    peak_test.pattern = HdrPattern::Black;
+    peak_test.black = kHdrBlackSteps;
+    expect(hdr_pattern_code(peak_test, box_left + 2, box_top + 2, 1920, 1080) == 0.0f &&
+               close_to(hdr_pattern_code(peak_test, middle_x, middle_y, 1920, 1080), pq_encode(2.0f), 1e-6f),
+           "the black test: a star at the black level on true black");
     // HDR is wanted only with the setting and a display that offers it.
     cfg.hdr = false;
     expect(!hdr_output_wanted(cfg, display), "HDR off in the settings");
@@ -136,12 +246,19 @@ void hdr_output() {
     display.peak_nits = 800u;
     display.full_frame_nits = 600u;
     display.min_nits_10000 = 50u;
-    const HdrMetadata metadata = hdr10_metadata(display, 200u);
+    PostOutput reported{};
+    reported.hdr = true;
+    reported.peak_nits = 800u;
+    const HdrMetadata metadata = hdr10_metadata(display, reported);
     expect(close_to(metadata.red[0], 0.708f, 1e-4f) && close_to(metadata.blue[1], 0.046f, 1e-4f) && close_to(metadata.white[0], 0.3127f, 1e-4f),
            "BT.2020 primaries");
     expect(close_to(metadata.max_luminance, 800.0f, 0.5f) && close_to(metadata.min_luminance, 0.005f, 1e-5f) &&
                close_to(metadata.max_frame_average_light, 600.0f, 0.5f),
            "metadata luminances");
+    reported.black = 40u;
+    expect(close_to(hdr10_metadata(display, reported).min_luminance, hdr_black_nits(40u), 1e-6f), "the calibrated black");
+    reported.pattern = HdrPattern::Peak;
+    expect(hdr10_metadata(display, reported).max_luminance == 10000.0f, "a test pattern's metadata covers PQ");
 }
 
 void plans() {
@@ -164,7 +281,7 @@ void plans() {
     expect(p.aa_wanted && !p.fxaa && !p.smaa, "a failed fxaa is not replaced by smaa");
     // 6x (3840x2736) into 2560x1440: supersampled on both axes.
     p = plan_post_process(3840, 2736, 2560, 1440, with(Aa::kAuto));
-    expect(p.supersampled && !p.aa_wanted && !p.smaa && p.resample && p.resample_to_target, "auto skips supersampled");
+    expect(p.supersampled && !p.aa_wanted && !p.smaa && p.resample && p.resample_to_target && !p.copy, "auto skips supersampled");
     p = plan_post_process(3840, 2736, 2560, 1440, with(Aa::kSmaa));
     expect(p.smaa && p.resample, "forced smaa on a supersampled image");
     // 6x into 3840x2160: 1.0x horizontally, so not supersampled.
@@ -172,16 +289,20 @@ void plans() {
     expect(!p.supersampled && p.smaa && !p.easu && p.resample, "6x into 4K is not supersampled");
     // Same size: RCAS alone writes the window; without RCAS the copy does.
     p = plan_post_process(1280, 720, 1280, 720, with(Aa::kOff, 20));
-    expect(p.rcas && !p.resample && !p.easu, "same size + rcas");
+    expect(p.rcas && !p.resample && !p.easu && !p.copy, "same size + rcas");
     p = plan_post_process(1280, 720, 1280, 720, with(Aa::kOff, 0));
-    expect(!p.rcas && p.resample && p.resample_to_target, "same size copy");
+    expect(!p.rcas && p.resample && p.resample_to_target && p.copy, "same size copy");
     // Enlarging with RCAS: EASU into the intermediate, RCAS to the window.
     p = plan_post_process(640, 456, 1920, 1080, with(Aa::kOff, 20));
     expect(p.easu && p.rcas && !p.resample, "easu then rcas");
     PostProcessSettings bilinear = with(Aa::kOff, 0);
     bilinear.upscaler = PostProcessSettings::Upscaler::kBilinear;
     p = plan_post_process(640, 456, 1920, 1080, bilinear);
-    expect(!p.easu && p.resample && p.resample_to_target, "bilinear enlargement");
+    expect(!p.easu && p.resample && p.resample_to_target && !p.copy, "bilinear enlargement");
+    p = plan_post_process(1280, 720, 1280, 720, bilinear);
+    expect(!p.easu && p.resample && p.resample_to_target && p.copy, "same size copy with bilinear");
+    p = plan_post_process(1280, 720, 1280, 721, bilinear);
+    expect(p.resample_to_target && !p.copy, "one row taller is a resample");
     p = plan_post_process(0, 456, 1920, 1080, with(Aa::kSmaa));
     expect(!p.aa_wanted && !p.smaa && !p.resample, "empty source draws nothing");
 }
@@ -292,7 +413,8 @@ void self_test_on_warp() {
 }
 
 // The scene passes on a 64x64 scene target-like target with a stair-stepped edge and an alpha ramp:
-// they change colour near the edge and never the alpha.
+// they change colour near the edge and never the alpha; with the scene's image traded to them (RendererD3D12's
+// swap_scene_color) the image that takes its place ends as the copy's scene target does, every bit.
 void scene_aa_on_warp() {
     using Microsoft::WRL::ComPtr;
     ComPtr<IDXGIFactory4> factory;
@@ -319,7 +441,7 @@ void scene_aa_on_warp() {
             std::memcpy(&pattern[y * kPitch + x * 4u], &texel, sizeof(texel));
         }
     }
-    const auto run = [&](Aa aa, unsigned display, AaRun& ran) {
+    const auto run = [&](Aa aa, unsigned display, AaRun& ran, bool trade = false) {
         std::array<unsigned char, kPitch * kSize> out{};
         PostProcessSettings settings{};
         settings.aa = aa;
@@ -328,7 +450,7 @@ void scene_aa_on_warp() {
         ComPtr<ID3D12GraphicsCommandList> list;
         ComPtr<ID3D12Fence> fence;
         ComPtr<ID3D12DescriptorHeap> rtv_heap;
-        ComPtr<ID3D12Resource> target, upload, readback;
+        ComPtr<ID3D12Resource> target, other, upload, readback;
         galaxy::render::DescriptorRing ring;
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
@@ -364,6 +486,9 @@ void scene_aa_on_warp() {
             !ring.initialize(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 64u, 1u) ||
             FAILED(device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST,
                                                    nullptr, IID_PPV_ARGS(&target))) ||
+            FAILED(device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td,
+                                                   D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                   IID_PPV_ARGS(&other))) ||
             FAILED(device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd,
                                                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                    IID_PPV_ARGS(&upload))) ||
@@ -395,8 +520,23 @@ void scene_aa_on_warp() {
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         list->ResourceBarrier(1, &b);
         ring.bind(list.Get());
+        galaxy::render::PostProcessor::SceneTrade traded;
+        if (trade) {
+            // The scene's image goes to the passes shader-readable; the scene target's view takes the other image.
+            traded = [&](ComPtr<ID3D12Resource>) {
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                list->ResourceBarrier(1, &b);
+                device->CreateRenderTargetView(other.Get(), nullptr, rtv);
+                ComPtr<ID3D12Resource> scene = std::move(target);
+                target = other;
+                return scene;
+            };
+        }
         ran = post.record_scene_aa(list.Get(), ring, target.Get(), rtv, kSize, kSize, kSize, kSize, display,
-                                   display, 1u, 1u);
+                                   display, 1u, 1u, 1u, traded);
+        b.Transition.pResource = target.Get();
+        texture.pResource = target.Get();
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
         list->ResourceBarrier(1, &b);
@@ -421,8 +561,10 @@ void scene_aa_on_warp() {
         const auto out = run(aa, kSize, ran);
         bool alpha_kept = true;
         unsigned changed = 0u;
-        for (unsigned y = 0; y < kSize; ++y) {
-            for (unsigned x = 0; x < kSize; ++x) {
+        unsigned columns = 0u;
+        for (unsigned x = 0; x < kSize; ++x) {
+            bool column = false;
+            for (unsigned y = 0; y < kSize; ++y) {
                 const unsigned i = y * kPitch + x * 4u;
                 std::uint32_t got = 0u;
                 std::uint32_t was = 0u;
@@ -431,8 +573,10 @@ void scene_aa_on_warp() {
                 alpha_kept = alpha_kept && got >> 30u == was >> 30u;
                 if ((got & 0x3FFFFFFFu) != (was & 0x3FFFFFFFu)) {
                     ++changed;
+                    column = true;
                 }
             }
+            columns += column;
         }
         std::string what = std::string(name) + " runs on the scene";
         expect(ran == want, what.c_str());
@@ -440,6 +584,16 @@ void scene_aa_on_warp() {
         expect(alpha_kept, what.c_str());
         what = std::string(name) + " smooths the edge";
         expect(changed >= 8u, what.c_str());
+        if (want == AaRun::kFxaa) {
+            // The edge runs along the rows, a step down every four columns: FXAA blends across it in every column,
+            // not only at the steps.
+            what = std::string(name) + " blends along the whole edge";
+            expect(columns == kSize, what.c_str());
+        }
+        AaRun traded_ran = AaRun::kNone;
+        const auto traded = run(aa, kSize, traded_ran, true);
+        what = std::string(name) + " on the traded image ends as on the copy";
+        expect(traded_ran == want && traded == out, what.c_str());
     };
     check(Aa::kSmaa, AaRun::kSmaa, "SMAA");
     check(Aa::kFxaa, AaRun::kFxaa, "FXAA");

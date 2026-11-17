@@ -5,6 +5,7 @@
 
 #include "galaxy/platform_time.h"
 #include "galaxy/render/texture_store.h"
+#include "galaxy/render/idle_clock.h"
 #include "render/core/frame_core.h"
 
 #include <nebula_frame_list.h>
@@ -21,18 +22,6 @@
 namespace galaxy::render {
 
 using namespace mtl_detail;
-
-namespace mtl_detail {
-
-void write_ppm_async(std::string path, std::vector<std::uint8_t> rgb, unsigned width, unsigned height) {
-    std::thread([path = std::move(path), rgb = std::move(rgb), width, height] {
-        std::ofstream out(path, std::ios::binary | std::ios::trunc);
-        out << "P6\n" << width << ' ' << height << "\n255\n";
-        out.write(reinterpret_cast<const char*>(rgb.data()), static_cast<std::streamsize>(rgb.size()));
-    }).detach();
-}
-
-}  // namespace mtl_detail
 
 namespace {
 
@@ -83,9 +72,11 @@ mtl::Object RendererMtl::sampler_for(const SamplerKey& key, const RenderConfig& 
     const std::uint32_t minf = (key.filter >> 5u) & 7u;
     // The minified filter (texture_sampler.h min_filter_code): 4 linear, plus 1 the nearest level or 2 between levels.
     const bool min_linear = minf >= 4u;
-    // 3: linear without anisotropy (make_sampler_key's arbitrary levels).
-    const bool no_anisotropy = (minf & 3u) == 3u;
-    const unsigned mip_mode = no_anisotropy ? 2u : minf & 3u;
+    // 3: linear without anisotropy (make_sampler_key's arbitrary levels). Levels drawn by hand take neither anisotropy
+    // nor the settings' bias (kSamplerAuthoredLevels).
+    const bool authored = (key.filter & kSamplerAuthoredLevels) != 0u;
+    const bool no_anisotropy = (minf & 3u) == 3u || authored;
+    const unsigned mip_mode = (minf & 3u) == 3u ? 2u : minf & 3u;
     const bool use_anisotropic = anisotropy > 1u && mip_mode != 0u && min_linear && mag_linear && !no_anisotropy;
     @autoreleasepool {
         MTLSamplerDescriptor* const descriptor = [MTLSamplerDescriptor new];
@@ -104,7 +95,7 @@ mtl::Object RendererMtl::sampler_for(const SamplerKey& key, const RenderConfig& 
         }
         // The level bias: Metal's sampler takes one (its descriptor's lodBias), named in the SDK from macOS 15 and
         // iOS 18 and present before them.
-        const float bias = std::clamp(key.lod_bias + cfg_bias, -16.0f, 16.0f);
+        const float bias = std::clamp(key.lod_bias + (authored ? 0.0f : cfg_bias), -16.0f, 16.0f);
         if (bias != 0.0f && [descriptor respondsToSelector:NSSelectorFromString(@"setLodBias:")]) {
             [descriptor setValue:@(bias) forKey:@"lodBias"];
         }
@@ -322,6 +313,12 @@ bool RendererMtl::parallel_record_begin(const std::uint8_t* chunk_aux, unsigned 
     if (chunk_count == 0u || record_passes_ >= kMaxRecordPasses) {
         return false;
     }
+    // A tile-based GPU stores the targets at a pass's end and loads them at the next one's start: there every scene pass
+    // is a parallel one from now on, and chunks of the pass's own targets run inside it.
+    parallel_scene_pass_ = mtl::Context::get().caps().apple_gpu;
+    if (parallel_scene_pass_ && parallel_record_in_pass(chunk_aux, chunk_count)) {
+        return true;
+    }
     // The pass the walk had open ran its draws before; the chunks run in passes of their own.
     end_scene_pass("parallel recording");
     if (depth_clear_pending()) {
@@ -369,6 +366,48 @@ bool RendererMtl::parallel_record_begin(const std::uint8_t* chunk_aux, unsigned 
     return true;
 }
 
+bool RendererMtl::parallel_record_in_pass(const std::uint8_t* chunk_aux, unsigned chunk_count) {
+    const unsigned aux = effective_draw_aux(chunk_aux[0]);
+    for (unsigned chunk = 1; chunk < chunk_count; ++chunk) {
+        if (effective_draw_aux(chunk_aux[chunk]) != aux) {
+            return false;
+        }
+    }
+    // Held probes read the depth as it stands before the chunks, and a pass opened before parallel_scene_pass_ is a
+    // plain one: either ends here. begin_scene_pass_with keeps an open pass of these targets and settles a waiting
+    // depth clear as any opening does.
+    if (scene_pass_open_ && (!held_probe_slots_.empty() || depth_clear_pending() || scene_parallel_ == nullptr)) {
+        end_scene_pass("parallel recording");
+    }
+    begin_scene_pass_with(aux, nullptr, false, "parallel recording");
+    if (scene_parallel_ == nullptr) {
+        return false;
+    }
+    record_aux_.assign(chunk_aux, chunk_aux + chunk_count);
+    record_encoders_.assign(chunk_count, nullptr);
+    record_runs_.clear();
+    record_width_ = scene_.color->width;
+    record_height_ = scene_.color->height;
+    // The encoders run in the order they are made: the draws before, the chunks, then pass_ again for those after.
+    if (mirrored_store_ != nullptr) {
+        mirrored_store_->backend().set_open_pass(nullptr);
+    }
+    [pass_of(pass_) endEncoding];
+    drop(pass_);
+    @autoreleasepool {
+        id<MTLParallelRenderCommandEncoder> const parallel = (__bridge id<MTLParallelRenderCommandEncoder>)scene_parallel_;
+        for (mtl::Object& encoder : record_encoders_) {
+            encoder = own([parallel renderCommandEncoder]);
+        }
+        pass_ = own([parallel renderCommandEncoder]);
+    }
+    if (pass_ == nullptr) {
+        throw std::runtime_error("the scene pass could not go on after its chunks");
+    }
+    attach_scene_encoder();
+    return true;
+}
+
 void RendererMtl::parallel_record_chunk(unsigned chunk, const gpu::DrawOp* ops, std::size_t count) {
     @autoreleasepool {
         const mtl::Object pass = record_encoders_[chunk];
@@ -403,12 +442,14 @@ void RendererMtl::parallel_record_end() {
             drop(pass);
         }
     }
+    if (!record_runs_.empty()) {
+        scene_pass_closed_by_ = "parallel recording";
+    }
     for (RecordRun& run : record_runs_) {
         [(__bridge id<MTLParallelRenderCommandEncoder>)run.parallel endEncoding];
         drop(run.parallel);
     }
     record_runs_.clear();
-    scene_pass_closed_by_ = "parallel recording";
     reset_draw_bindings();
 }
 
@@ -569,6 +610,13 @@ const float* RendererMtl::screen_probes_finished(std::size_t slot) {
 
 // ---- test captures ----
 
+void RendererMtl::finish_pictures() {
+    wait_for_gpu_idle();
+    debug_log_readback();
+    debug_log_backbuffer_readback();
+    wait_picture_files();
+}
+
 void RendererMtl::set_debug_capture_paths(std::string scene_ppm_path, std::string backbuffer_ppm_path) {
     scene_capture_path_ = std::move(scene_ppm_path);
     backbuffer_capture_path_ = std::move(backbuffer_ppm_path);
@@ -600,7 +648,7 @@ void write_rgb(std::string path, const std::uint8_t* rgba, unsigned width, unsig
         rgb[i * 3u + 1u] = rgba[i * 4u + 1u];
         rgb[i * 3u + 2u] = rgba[i * 4u + 2u];
     }
-    mtl_detail::write_ppm_async(std::move(path), std::move(rgb), width, height);
+    write_ppm_async(std::move(path), std::move(rgb), width, height);
 }
 
 }  // namespace
@@ -718,7 +766,8 @@ bool RendererMtl::motion_pass_only() const {
 }
 
 void RendererMtl::prepare_temporal_upscaler() {
-    const FrameMap render_map = output_scene_active_ ? alt_scene_map_ : scene_map_;
+    // The scaler's largest render size: the scene targets' (dynamic resolution's steps are within it).
+    const FrameMap render_map = scene_extent_;
     const FrameMap output_map = upscale_output_;
     if (!temporal_mode() || output_map.empty() || render_map.width > output_map.width) {
         if (temporal_) {
@@ -769,8 +818,9 @@ bool RendererMtl::scene_temporal_begin(float& jitter_x, float& jitter_y) {
     const unsigned rw = scene_map_.width;
     const unsigned ow = temporal_output_w_;
     // The upscaler is replaced only by begin_frame (prepare_temporal_upscaler).
-    if (!temporal_ || !temporal_mode() || output_scene_active_ || target_pass_active_ || rw != temporal_render_w_ ||
-        scene_map_.height != temporal_render_h_) {
+    if (!temporal_ || !temporal_mode() || output_scene_active_ || target_pass_active_ ||
+        frame_extent_.width != temporal_render_w_ || frame_extent_.height != temporal_render_h_ || rw > temporal_render_w_ ||
+        scene_map_.height > temporal_render_h_) {
         temporal_history_valid_ = false;
         return false;
     }
@@ -787,13 +837,12 @@ bool RendererMtl::scene_temporal_begin(float& jitter_x, float& jitter_y) {
 }
 
 // Once a frame, after the slot's retired textures are freed: the temporal, output and wide targets are handed back
-// after 600 frames unused, behind the fence of the slot's frame.
+// after kIdleSteps game steps unused (idle_clock.h), behind the fence of the slot's frame.
 void RendererMtl::trim_idle_effect_targets() {
-    constexpr std::uint64_t kIdleFrames = 600u;
-    if (capture_target_ && frame_index_ > capture_used_frame_ + kIdleFrames) {
+    if (capture_target_ && idle_since(capture_used_step_)) {
         retire(std::move(capture_target_));
     }
-    if (motion_.motion && !layer_window_ && frame_index_ > motion_used_frame_ + kIdleFrames) {
+    if (motion_.motion && !layer_window_ && idle_since(motion_used_step_)) {
         retire(std::move(motion_.motion));
         retire(std::move(motion_.reactive));
         retire(std::move(motion_.layer_color));
@@ -803,19 +852,19 @@ void RendererMtl::trim_idle_effect_targets() {
     }
     // The output set and the wide set are the live scene target while a swap holds them; between scenes they are idle
     // sets of their own.
-    if (alt_scene_.color && !output_scene_active_ && !scene_.wide && frame_index_ > output_scene_used_frame_ + kIdleFrames) {
+    if (alt_scene_.color && !output_scene_active_ && !scene_.wide && idle_since(output_scene_used_step_)) {
         destroy_scene_set(alt_scene_);
-        alt_scene_map_ = FrameMap{};
+        alt_scene_map_ = alt_scene_extent_ = FrameMap{};
     }
     if (wide_scene_.color && !scene_.wide && !output_scene_active_ && !target_pass_active_ &&
-        frame_index_ > wide_scene_used_frame_ + kIdleFrames) {
+        idle_since(wide_scene_used_step_)) {
         destroy_scene_set(wide_scene_);
     }
 }
 
 bool RendererMtl::ensure_motion_targets() {
-    motion_used_frame_ = frame_index_;
-    if (motion_.motion && motion_.map == scene_map_) {
+    motion_used_step_ = idle_clock();
+    if (motion_.motion && motion_.map == frame_extent_) {
         return true;
     }
     retire(std::move(motion_.motion));
@@ -852,7 +901,7 @@ bool RendererMtl::ensure_motion_targets() {
     motion_.reactive = std::move(reactive);
     motion_.layer_color = std::move(layer_color);
     motion_.layer_trans = std::move(layer_trans);
-    motion_.map = scene_map_;
+    motion_.map = frame_extent_;
     // The layer targets start as an empty layer (nothing added, everything let through), as clear_layer_targets leaves
     // them, so a read before the first layer window sees that; the others start at zero.
     end_scene_pass("ensure_motion_targets");
@@ -901,7 +950,8 @@ void RendererMtl::clear_layer_targets() {
 bool RendererMtl::begin_cleared_motion_scene(std::uint32_t clear_rgba) {
     // scene_temporal_begin's conditions, which the scene's begin tests next.
     if (scene_pass_open_ || target_pass_active_ || output_scene_active_ || !temporal_ || !temporal_mode() ||
-        scene_map_.width != temporal_render_w_ || scene_map_.height != temporal_render_h_ || scene_.samples != 1u ||
+        frame_extent_.width != temporal_render_w_ || frame_extent_.height != temporal_render_h_ ||
+        scene_map_.width > temporal_render_w_ || scene_map_.height > temporal_render_h_ || scene_.samples != 1u ||
         !ensure_motion_targets()) {
         return false;
     }
@@ -933,7 +983,7 @@ void RendererMtl::clear_motion_targets(bool motion) {
 }
 
 bool RendererMtl::ensure_output_set(const FrameMap& output, bool storage) {
-    output_scene_used_frame_ = frame_index_;
+    output_scene_used_step_ = idle_clock();
     if (alt_scene_.color && alt_scene_map_ == output && (alt_scene_storage_ || !storage)) {
         return true;
     }
@@ -944,10 +994,10 @@ bool RendererMtl::ensure_output_set(const FrameMap& output, bool storage) {
     const bool made = create_scene_set(alt_scene_, output);
     scene_set_storage_ = false;
     if (!made) {
-        alt_scene_map_ = FrameMap{};
+        alt_scene_map_ = alt_scene_extent_ = FrameMap{};
         return false;
     }
-    alt_scene_map_ = output;
+    alt_scene_map_ = alt_scene_extent_ = output;
     alt_scene_storage_ = storage;
     return true;
 }
@@ -956,9 +1006,12 @@ bool RendererMtl::record_temporal_upscale(const FrameMap& output) {
     end_scene_pass();
     settle_depth_clear();
     const GpuPassScope scope{*this, GpuPass::Upscale};
-    if (!temporal_ || !motion_.motion || !scene_.color || !alt_scene_.color || scene_map_.width != temporal_render_w_ ||
-        scene_map_.height != temporal_render_h_ || output.width != temporal_output_w_ || output.height != temporal_output_h_ ||
-        scene_.wide) {
+    // The scene's rectangle within the scaler's render size (dynamic resolution's step: the upscale names the size it
+    // reads).
+    if (!temporal_ || !motion_.motion || !scene_.color || !alt_scene_.color || frame_extent_.width != temporal_render_w_ ||
+        frame_extent_.height != temporal_render_h_ || scene_map_.width > temporal_render_w_ ||
+        scene_map_.height > temporal_render_h_ || scene_map_.empty() || output.width != temporal_output_w_ ||
+        output.height != temporal_output_h_ || scene_.wide) {
         temporal_history_valid_ = false;
         return false;
     }
@@ -1017,29 +1070,45 @@ bool RendererMtl::begin_output_scene(bool resolve_msaa_only) {
         temporal_history_valid_ = false;
     }
     const FrameMap output = temporal && !upscale_output_.empty() ? upscale_output_ : output_frame_for_window();
-    // Nebula's screens with small text are drawn at the window's resolution whatever the HUD's.
-    const bool full = temporal || (get_render_config().hud_output_resolution || render_internal_height(get_render_config()) != 0u) ||
-                      sharp_2d_requested();
-    if (!full || output.empty() || output.width < scene_map_.width || (!temporal && output.width == scene_map_.width)) {
+    // Nebula's screens with small text are drawn at the window's resolution whatever the HUD's. Dynamic resolution's
+    // rectangle: the rest of the frame (post AA's result, the 2D layer, the display picture) at the output's size,
+    // whatever the step (the HUD never follows it).
+    const bool rectangle = scene_map_ != frame_extent_;
+    const bool full = temporal || rectangle || render_hud_at_output(get_render_config()) || sharp_2d_requested();
+    if (!full || output.empty() || (output.width < scene_map_.width && !rectangle) ||
+        (!temporal && !rectangle && output.width == scene_map_.width)) {
         return false;
     }
     return enter_output_scene(output);
 }
 
-// The whole scene target resampled into the output scene target with the display copy's identity settings (no
-// filter, gamma 1.0, alpha kept), which then takes the scene target's place with its depth cleared to the far plane.
+// The output scene target takes the scene target's place, its pass opening cleared (colour, depth to the far plane,
+// stencil) with the whole scene target resampled into it as the first draw, with the display copy's identity settings
+// (no filter, gamma 1.0, alpha kept; record_conversion_blit's shaders and constants). The resampled picture stays in
+// tile memory for the 2D layer, where a copy pass of its own stored it and the scene pass loaded it.
 bool RendererMtl::enter_output_scene(const FrameMap& output) {
     if (!ensure_output_set(output, false)) {
         return false;
     }
-    const unsigned width = output.width;
-    const unsigned height = output.height;
-    const FramePassGeometry sampling = frame_pass_geometry(width, height, scene_map_);
-    record_conversion_blit(*alt_scene_.color, width, height, kCopyLayoutDisplay, sampling.src_x, sampling.src_y, sampling.step_x,
-                           sampling.step_y);
+    const FramePassGeometry sampling = frame_pass_geometry(output.width, output.height, scene_map_);
+    const bool display_filter = sampling.step_x == 1.0f && sampling.step_y == 1.0f;
+    // The drawn part (dynamic resolution's rectangle) bounds every sample.
+    const FrameMap part = scene_part();
+    const SceneConversionShaderConstants constants =
+        make_scene_conversion_constants(kCopyLayoutDisplay, sampling.src_x, sampling.src_y, sampling.step_x, sampling.step_y,
+                                        static_cast<float>(part.width), static_cast<float>(part.height));
     swap_scene_sets();
     bind_scene();
-    clear_scene(0u, false, false, true);
+    const SceneClearValues clear = make_scene_clear_values(0u, 0u);
+    begin_scene_pass(&clear, "enter_output_scene");
+    utility_draw(pass_,
+                 scene_pass_pipeline(display_filter ? mtl::UtilityShader::DisplayFilterPs : mtl::UtilityShader::SceneConversionPs,
+                                     static_cast<std::uint8_t>(kWriteAll)),
+                 DepthUse::None, pass_width_, pass_height_,
+                 gpu::rect(0, 0, static_cast<std::int32_t>(pass_width_), static_cast<std::int32_t>(pass_height_)), &constants,
+                 sizeof(constants), alt_scene_.color->texture);
+    reset_draw_bindings();
+    bind_scene();
     return true;
 }
 
@@ -1074,7 +1143,7 @@ RendererMtl::TemporalInterpKey RendererMtl::temporal_interp_key() const {
     TemporalInterpKey key{};
     key.upscaler = cfg.upscaler;
     key.quality = cfg.temporal_quality;
-    key.scene_map = output_scene_active_ ? alt_scene_map_ : scene_map_;
+    key.scene_map = scene_extent_;  // the render scene target's size (a dynamic resolution step is not a new key)
     key.output_map = upscale_output_;
     key.max_fps = presented_max_fps(cfg);
     key.vsync = cfg.vsync_interval;

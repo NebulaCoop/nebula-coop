@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // The programs' file for the Metal renderer: tools/dev/compile_programs.py's SPIR-V file with every stage turned to
 // MSL text (runtime/src/render/mtl/shader_msl.cpp). The same header and rows (core/program_table.cpp reads either);
-// a stage's bytes are its MSL and a terminating zero. The ray tracer's forms (kProgramPrepass on) are left out: the Metal
-// renderer never traces (mtl/rt_backend_mtl.cpp), so their rows' entries are written empty.
+// a stage's bytes are its MSL and a terminating zero.
 //
 //   programs_msl <programs_spirv.bin> <programs_msl.bin> macos|ios
 #include "galaxy/render/mtl/shader_msl.h"
-#include "galaxy/render/program_table.h"
 
 #include <atomic>
 #include <cstdint>
@@ -24,12 +22,9 @@
 namespace {
 
 constexpr std::size_t kHeader = 64u;
-// The layout core/program_table.cpp reads, from its own header, so a new variant there cannot leave this behind.
-constexpr char kMagic[] = "NBPROG03";
-constexpr unsigned kStored = galaxy::render::kProgramStored;
-constexpr unsigned kBoundOffset = galaxy::render::kProgramBoundOffset;
-constexpr unsigned kConverted = galaxy::render::kProgramPrepass;  // the variants Metal draws with: the rest are traced
-static_assert(kConverted <= kStored);
+constexpr unsigned kStored = 16u;       // kProgramStored
+constexpr unsigned kBoundOffset = 5u;   // kProgramBoundOffset: a pixel program's bound-table forms, 5 to 9
+constexpr unsigned kTracedOffset = 10u; // kProgramPrepass: the traced forms, 10 to 15 (array forms)
 constexpr std::size_t kRow = 16u + 8u * kStored;
 
 std::uint32_t word(const std::vector<unsigned char>& bytes, std::size_t at) {
@@ -55,7 +50,7 @@ int main(int argc, char** argv) {
     const bool ios = std::strcmp(argv[3], "ios") == 0;
     std::ifstream input(argv[1], std::ios::binary);
     std::vector<unsigned char> in((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    if (in.size() < kHeader || std::memcmp(in.data(), kMagic, 8u) != 0) {
+    if (in.size() < kHeader || std::memcmp(in.data(), "NBPROG03", 8u) != 0) {
         std::fprintf(stderr, "%s is not a programs file\n", argv[1]);
         return 1;
     }
@@ -70,7 +65,7 @@ int main(int argc, char** argv) {
     std::vector<Stage> stages;
     for (std::size_t row = 0; row < rows; ++row) {
         const bool pixel = row >= vertex_rows;
-        for (unsigned variant = 0; variant < kConverted; ++variant) {
+        for (unsigned variant = 0; variant < kStored; ++variant) {
             const std::size_t at = kHeader + row * kRow + 16u + variant * 8u;
             const std::uint32_t offset = word(in, at), size = word(in, at + 4u);
             if (size == 0u) {
@@ -85,7 +80,7 @@ int main(int argc, char** argv) {
                 stage.offset = offset;
                 stage.size = size;
                 stage.pixel = pixel;
-                stage.bound = pixel && variant >= kBoundOffset;
+                stage.bound = pixel && variant >= kBoundOffset && variant < kTracedOffset;
                 stages.push_back(std::move(stage));
             }
         }
@@ -137,10 +132,6 @@ int main(int argc, char** argv) {
         for (unsigned variant = 0; variant < kStored; ++variant) {
             const std::size_t at = kHeader + row * kRow + 16u + variant * 8u;
             const std::uint32_t offset = word(in, at), size = word(in, at + 4u);
-            if (variant >= kConverted) {
-                std::memset(out.data() + at, 0, 8u);
-                continue;
-            }
             if (size == 0u) {
                 continue;
             }

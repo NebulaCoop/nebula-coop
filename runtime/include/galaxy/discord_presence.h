@@ -6,10 +6,12 @@
 #include <string>
 #include <string_view>
 
-// Discord Rich Presence over the Discord desktop app's local IPC (the named pipe discord-ipc-N): what the player is
-// doing, in the game's own words (its galaxy and star names, in the played language), and in an online room its
-// party (how many play, of how many) with a Join button, as sm64coopdx's Discord activity has. A worker thread does
-// all of it; while Discord is not running it retries every 15 s and the game never waits on it.
+// Discord Rich Presence over the Discord desktop app's local IPC (discord-ipc-N: a named pipe on Windows, a Unix
+// socket on macOS and Linux): what the player is doing, in the game's own words (its galaxy and star names, in the
+// played language), and in an online room its party (how many play, of how many) with a Join button, as sm64coopdx's
+// Discord activity has. A worker thread does all of it; while Discord is not running it retries every 15 s and the
+// game never waits on it.
+
 namespace galaxy::discord {
 
 // An online room, as Discord shows it: "(2 of 8)" beside the status, and a Join button when `join_secret` is set.
@@ -29,6 +31,9 @@ struct Activity {
     Party party;
 };
 
+// Whether this system has the Discord desktop app's IPC (Windows, macOS, Linux; not Android or iOS): the GENERAL page
+// offers DISCORD STATUS only then.
+[[nodiscard]] bool supported() noexcept;
 // Once, at start. An empty client id (no Discord application) keeps presence off.
 void start(std::string client_id);
 // The GENERAL page's DISCORD STATUS, read by the worker each second (off clears the status and closes the pipe).

@@ -14,6 +14,7 @@ on:
       - .github/workflows/release.yml
       - installer/**
       - native/build.ps1
+      - tools/enter_msvc_environment.ps1
       - tools/release_check.ps1
       - tools/release-allow.txt
   workflow_dispatch:
@@ -27,6 +28,8 @@ permissions:
   contents: read
 
 env:
+  # The LLVM the game module is built with (its row generator needs libclang 21 or later), as upstream's releases use.
+  LLVM_VERSION: '22.1.6'
   # The DirectX Shader Compiler Setup ships (a mod's shaders are built with it): the release cmake/rt_shaders.cmake pins.
   DXC_URL: https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip
   DXC_SHA256: ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1
@@ -74,68 +77,109 @@ jobs:
           echo "Nebula $version: $setup (pre-release: $prerelease, publish: $publish)"
 
   host:
-    name: Host
-    # Visual Studio 2022's MSVC, as the Build workflow's host job uses.
+    name: Windows programs (${{ matrix.level }})
+    # Visual Studio 2022's MSVC, as the Build workflow's host job uses. Each CPU level builds the three renderers'
+    # programs (Nebula, NebulaVk, NebulaD11); the AVX2 run also brings D3D12\ and glslang\.
     runs-on: windows-2022
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - level: avx2
+            baseline: 'OFF'
+          - level: x86-64-v2
+            baseline: 'ON'
     steps:
       - uses: actions/Checkout@v7
       # The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake).
       - name: Built-in mods
         run: git submodule update --init --depth 1 lumalink
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-      # The libraries CMake builds at configure time, from the Build workflow's Direct3D 12 job: restored only, so a
-      # release never writes the cache.
-      - name: Configure-time dependencies
-        uses: actions/cache/restore@v6
-        with:
-          path: |
-            build/host/archive-deps
-            build/host/fidelityfx.built
-            build/host/_deps
-          key: host-deps-OFF-${{ hashFiles('cmake/**', 'third_party/archive/**') }}
-      - name: Configure
+      - name: Build Nebula, NebulaVk and NebulaD11
         # A release build: cross-file optimization on (NEBULA_HOST_IPO's default). There is one build kind: tests
         # attach their hooks from outside (tools/release_check.ps1 checks no source names a build kind).
-        run: cmake -S . -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release
-      - name: Build
-        # The program Setup ships, not the tests.
-        run: cmake --build build/host --target NebulaNative
+        shell: pwsh
+        run: |
+          . .\tools\enter_msvc_environment.ps1 | Out-Null
+          $build = Join-Path $env:RUNNER_TEMP 'host'
+          cmake -S . -B $build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNEBULA_VULKAN=ON -DNEBULA_D3D11=ON `
+            "-DNEBULA_HOST_BASELINE=${{ matrix.baseline }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build $build --target Nebula NebulaVk NebulaD11 nebula_glslang
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $out = Join-Path $env:RUNNER_TEMP 'out'
+          New-Item -ItemType Directory -Force $out, (Join-Path $out 'glslang'), (Join-Path $out 'symbols') | Out-Null
+          Get-ChildItem -LiteralPath $build -Filter 'Nebula*.exe' | Copy-Item -Destination $out
+          Get-ChildItem -LiteralPath $build -Filter 'Nebula*.pdb' | Copy-Item -Destination (Join-Path $out 'symbols')
+          Copy-Item -Recurse -LiteralPath (Join-Path $build 'D3D12') -Destination (Join-Path $out 'D3D12')
+          Copy-Item (Join-Path $build 'glslang-tool\glslang.exe'), (Join-Path $build 'glslang-tool\LICENSE.txt') (Join-Path $out 'glslang')
+          Get-ChildItem -Recurse -File $out | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.FullName.Substring($out.Length + 1) }
       - uses: actions/upload-artifact@v7
         with:
-          name: release-host
-          path: build/host/NebulaNative.exe
+          name: release-host-${{ matrix.level }}
+          path: ${{ runner.temp }}/out
           retention-days: 1
           if-no-files-found: error
       # Kept for reading crash dumps of this release (docs/DIAGNOSTICS.md); not published.
       - uses: actions/upload-artifact@v7
         with:
-          name: release-symbols
-          path: build/host/NebulaNative.pdb
+          name: release-symbols-${{ matrix.level }}
+          path: ${{ runner.temp }}/out/symbols
           retention-days: 90
           if-no-files-found: warn
 
   game:
     name: Game module
-    runs-on: windows-2025
+    runs-on: windows-2022
+    timeout-minutes: 300
     steps:
       - uses: actions/Checkout@v7
       # The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake).
       - name: Built-in mods
         run: git submodule update --init --depth 1 lumalink
-      - name: Configure-time dependencies
-        uses: actions/cache/restore@v6
-        with:
-          path: |
-            build/game/archive-deps
-          key: game-archive-deps-${{ hashFiles('cmake/**', 'third_party/archive/**') }}
-      - name: Build
-        run: .\native\build.ps1 -Petari native\petari -Build build\game
+      - name: LLVM
+        # The row generator needs libclang 21 or later (tools/lumacore/instrument.py), the runner's may be older.
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o llvm.tar.xz \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/clang+llvm-$LLVM_VERSION-x86_64-pc-windows-msvc.tar.xz"
+          mkdir llvm
+          tar -xJf llvm.tar.xz -C llvm --strip-components=1
+          rm llvm.tar.xz
+          llvm/bin/clang --version
+      - name: Build the game module
+        shell: pwsh
+        run: |
+          $build = Join-Path $env:RUNNER_TEMP 'game'
+          $llvm = Join-Path $env:RUNNER_TEMP 'llvm\bin'
+          # The players' build: ThinLTO with the profile in native/pgo. Both modules, the self-description and the
+          # services list, for both CPU levels.
+          foreach ($target in 'smg_game', 'smg_game_plain', 'luma_self_description', 'luma_services_file') {
+            & .\native\build.ps1 -Petari native\petari -Build $build -Pgo -Llvm $llvm -Target $target
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $out = Join-Path $env:RUNNER_TEMP 'out'
+          $names = Join-Path $out 'names'
+          New-Item -ItemType Directory -Force (Join-Path $out 'bin\x86-64-v2'), (Join-Path $names 'luma_types') | Out-Null
+          Copy-Item (Join-Path $build 'smg_game.dll'), (Join-Path $build 'smg_game_plain.dll') (Join-Path $out 'bin')
+          Copy-Item (Join-Path $build 'x86-64-v2\smg_game.dll'), (Join-Path $build 'x86-64-v2\smg_game_plain.dll') (Join-Path $out 'bin\x86-64-v2')
+          # The game build folder's self-description, as build-native-setup.ps1 -Names and LumaLink's --names read it.
+          Copy-Item -Recurse -LiteralPath (Join-Path $build 'luma') -Destination (Join-Path $names 'luma')
+          foreach ($file in 'luma_types.json', 'luma_functions.json', 'luma_numbers.json', 'luma_services.json') {
+            Copy-Item (Join-Path $build "luma_types\$file") (Join-Path $names 'luma_types')
+          }
+          Copy-Item (Join-Path $build 'smg_game.luma-placement.json'), (Join-Path $build 'smg_game.luma-self.json') $names
+          # names/ holds some 15,000 small files: as one tar, the artifact downloads as one file.
+          Push-Location $out
+          tar -cf names.tar names
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          Remove-Item -Recurse -Force $names
       - uses: actions/upload-artifact@v7
         with:
           name: release-game
-          path: build/game/smg_game.dll
+          path: ${{ runner.temp }}/out
           retention-days: 1
           if-no-files-found: error
 
@@ -155,12 +199,34 @@ jobs:
       # Outside the tree, so that build-native-setup.ps1 records a clean commit.
       - uses: actions/download-artifact@v8
         with:
-          name: release-host
-          path: ${{ runner.temp }}/bin
+          name: release-host-avx2
+          path: ${{ runner.temp }}/avx2
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-host-x86-64-v2
+          path: ${{ runner.temp }}/v2
       - uses: actions/download-artifact@v8
         with:
           name: release-game
-          path: ${{ runner.temp }}/bin
+          path: ${{ runner.temp }}/game
+      - name: Bin folder
+        # The AVX2 programs with D3D12\ and glslang\, the x86-64-v2 programs beside them, the game modules; the
+        # game's self-description as names\; LumaKit (installer/lumakit) as the mod that ships with the game.
+        shell: pwsh
+        run: |
+          $temp = $env:RUNNER_TEMP
+          Push-Location (Join-Path $temp 'game')
+          tar -xf names.tar
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          $bin = Join-Path $temp 'bin'
+          New-Item -ItemType Directory -Force $bin | Out-Null
+          Copy-Item -Recurse -Path (Join-Path $temp 'avx2\*') -Destination $bin -Exclude 'symbols'
+          Copy-Item (Join-Path $temp 'v2\*-x86-64-v2.exe') $bin
+          Copy-Item -Recurse -Path (Join-Path $temp 'game\bin\*') -Destination $bin -Force
+          $shipped = New-Item -ItemType Directory -Force (Join-Path $temp 'shipped')
+          Copy-Item installer\lumakit\lumakit.luma $shipped
+          Get-ChildItem -Recurse -File $bin | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.FullName.Substring($bin.Length + 1) }
       - name: DirectX Shader Compiler
         run: |
           $zip = Join-Path $env:RUNNER_TEMP 'dxc.zip'
@@ -168,17 +234,6 @@ jobs:
           $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($hash -ne $env:DXC_SHA256) { throw "dxc.zip is $hash, not the pinned $env:DXC_SHA256" }
           Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'dxc')
-      - name: Ray tracing tables
-        # The tables describe the game's own data, so they are kept outside the repository (docs/RAY_TRACING_STATUS.md)
-        # and nothing traces yet: Setup ships them with a header and no rows, as the test builds run without them.
-        # Not empty: Setup refuses to install an empty file (InstallEngine.Install).
-        run: |
-          $tables = New-Item -ItemType Directory -Force (Join-Path $env:RUNNER_TEMP 'bin\tables')
-          $headers = @{ 'material-names.tsv' = "model`tmaterial`ttexture"; 'rt-materials.tsv' = "hash`tclass"; 'rt-suns.tsv' = "stage`tsource" }
-          foreach ($name in $headers.Keys) {
-              $text = "# No rows: this release ships no ray-tracing tables.`n" + $headers[$name] + "`n"
-              [IO.File]::WriteAllText((Join-Path $tables $name), $text, (New-Object Text.UTF8Encoding $false))
-          }
       - name: Private terms
         # release_check.ps1 expects .nebula-release-key\private-terms.txt (one term per line).
         # An empty file means no personal terms to check — the file just needs to exist.
@@ -201,7 +256,8 @@ jobs:
       - name: Setup
         run: >-
           .\installer\build-native-setup.ps1 -Version $env:VERSION -Bin (Join-Path $env:RUNNER_TEMP 'bin')
-          -Dxc (Join-Path $env:RUNNER_TEMP 'dxc') -OutputDirectory (Join-Path $env:RUNNER_TEMP 'dist')
+          -Names (Join-Path $env:RUNNER_TEMP 'game\names') -ShippedMods (Join-Path $env:RUNNER_TEMP 'shipped') -Dxc (Join-Path $env:RUNNER_TEMP 'dxc')
+          -OutputDirectory (Join-Path $env:RUNNER_TEMP 'dist')
           -SetupName $env:SETUP -Repository $env:GITHUB_REPOSITORY
       - name: Release check
         # Defender isn't run here: the runner's definitions say nothing about players' PCs.

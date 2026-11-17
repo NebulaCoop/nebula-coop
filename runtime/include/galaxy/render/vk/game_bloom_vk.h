@@ -25,11 +25,16 @@ public:
     GameBloomVk& operator=(const GameBloomVk&) = delete;
     ~GameBloomVk() { shutdown(); }
 
-    // Starts compiling the passes.
-    void initialize();
+    // A scene target pass the composite draws in, and log2 of its samples.
+    struct ScenePass {
+        VkRenderPass pass = VK_NULL_HANDLE;
+        unsigned samples_log2 = 0;
+    };
+    // Starts compiling the passes; the composite's pipelines are made for each of `scene_passes` (every scene target pass
+    // the renderer can open), so none is made in the middle of play.
+    void initialize(std::vector<ScenePass> scene_passes);
     void shutdown() noexcept;
-    // Once the worker has finished: builds the compute pipelines (the composite's are made per scene target pass at first use).
-    // True when ready.
+    // Builds the compute pipelines and the composite's. True when ready.
     bool poll_ready();
     [[nodiscard]] bool ready() const noexcept { return ready_; }
 
@@ -48,9 +53,14 @@ public:
     };
     struct Inputs {
         Texture* color = nullptr;   // the scene target's single-sample colour (COLOR_ATTACHMENT_OPTIMAL, no render pass open)
-        unsigned frame_width = 0;   // the frame in scene target pixels
+        unsigned frame_width = 0;   // the frame in scene target pixels (the part of it drawn in)
         unsigned frame_height = 0;
+        unsigned extent_width = 0;  // the scene target's size (0: the frame's)
+        unsigned extent_height = 0;
+        unsigned lowest_sixteenths = 16u;  // the smallest dynamic resolution step the frame may take (16: none)
         float scale = 1.0f;
+        [[nodiscard]] unsigned whole_width() const noexcept { return extent_width != 0u ? extent_width : frame_width; }
+        [[nodiscard]] unsigned whole_height() const noexcept { return extent_height != 0u ? extent_height : frame_height; }
     };
     // BloomEffect::preDraw, BloomEffectSimple::draw with the game's own chain: the scene before the bloom works over it.
     bool keep(VkCommandBuffer commands, const Inputs& in);
@@ -58,12 +68,25 @@ public:
     // does not fit), and its picture is the kept scene. The composite writes the kept scene's alpha with its colour.
     [[nodiscard]] std::shared_ptr<Texture> take_kept_image();
     void keep_picture(std::shared_ptr<Texture> picture);
+    // The simple bloom's source without a copy: the scene target continues on the image this returns (the hand-over makes
+    // one when it does not fit), and give_source takes the scene's picture as the source; prepare() copies nothing then.
+    // Only where the composite covers all of the target that is read (the whole target, or dynamic resolution's
+    // rectangle), which it then writes from the source.
+    [[nodiscard]] std::shared_ptr<Texture> take_source_image();
+    void give_source(VkCommandBuffer commands, std::shared_ptr<Texture> picture);
     // The chain before its composite, recorded with no render pass open; false when there is nothing to draw.
     bool prepare(VkCommandBuffer commands, const Inputs& in, const Params& params, const SetAllocator& allocate);
     // The composite prepare() set up, in the open scene target pass `pass` of 2^samples_log2 samples (RGB; the game's alpha
     // stays).
     void finish(VkCommandBuffer commands, VkRenderPass pass, unsigned samples_log2, const SetAllocator& allocate);
-    // Once a frame, outside a submission being recorded: hands back the images no pass has asked for in 600 frames (the
+    // A picture of the scene target's own format drawn back over the frame, each pixel's channels as they were (the
+    // composite's kind 0, which loads the pixel): a capture that took the scene target's image continues the scene from
+    // it. prepare_draw_back with no render pass open (it may make the composite and the unused slot's image); false: the
+    // capture copies instead. draw_back in the open scene target pass `pass`, `picture` shader-readable.
+    [[nodiscard]] bool prepare_draw_back(VkCommandBuffer commands, VkRenderPass pass, unsigned samples_log2);
+    void draw_back(VkCommandBuffer commands, VkRenderPass pass, unsigned samples_log2, const SetAllocator& allocate,
+                   const Texture& picture, unsigned width, unsigned height);
+    // Once a frame, outside a submission being recorded: hands back the images no pass has asked for in kIdleSteps game steps (the
     // bloom switched off, a scene without one, the other bloom's kind); prepare() makes them again. The images go
     // through the context's deferred destruction, behind the fence of any submission naming them.
     void trim_idle();
@@ -84,6 +107,8 @@ private:
     [[nodiscard]] VkPipeline composite_pipeline(VkRenderPass pass, unsigned samples_log2);
     bool ensure(std::shared_ptr<Texture>& target, unsigned width, unsigned height, VkFormat format, bool work,
                 const char* name);
+    // The unused slots' image, in GENERAL as their descriptors name it (no render pass open).
+    bool ensure_unused_slot(VkCommandBuffer commands);
     // The scene target colour's frame into `target` (its format), left shader-readable.
     bool copy_frame(VkCommandBuffer commands, const Inputs& in, std::shared_ptr<Texture>& target, const char* name);
     // Set 0 for a pass: t0-t2 and u0-u2 (null: the unused slot's image); `first_layout` the first's when given.
@@ -95,6 +120,7 @@ private:
 
     bool ready_ = false;
     bool kept_ = false;
+    bool source_given_ = false;  // give_source ran since the last prepare
     bool to_build_ = false;  // initialized: poll_ready makes the passes
 
     VkDescriptorSetLayout image_layout_ = VK_NULL_HANDLE;    // set 0: t0-t2 sampled, u0-u2 storage
@@ -104,9 +130,13 @@ private:
     VkDescriptorPool sampler_pool_ = VK_NULL_HANDLE;
     VkDescriptorSet sampler_set_ = VK_NULL_HANDLE;
     std::array<VkPipeline, 3> compute_{};  // down, box, blur
-    // The composite per scene target pass (by log2 of its samples) and the pass it was made for.
-    std::array<VkPipeline, 4> composite_{};
-    std::array<VkRenderPass, 4> composite_pass_{};
+    // The composite per scene target pass (the renderer's passes live as long as it does).
+    struct Composite {
+        VkRenderPass pass = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+    };
+    std::vector<ScenePass> scene_passes_;  // initialize's: made with the compute passes
+    std::vector<Composite> composites_;
 
     // The pending composite (prepare to finish).
     bool pending_ = false;
@@ -122,9 +152,8 @@ private:
     std::array<std::shared_ptr<Texture>, 3> blur_h_;
     std::array<std::shared_ptr<Texture>, 3> blur2_h_;
 
-    // trim_idle() calls, and the clock at the last use of each group: the kept scene, the level 1 images, the normal
+    // idle_clock() at the last use of each group: the kept scene, the level 1 images, the normal
     // bloom's level 2 and second blur, the simple bloom's source.
-    std::uint64_t clock_ = 0;
     std::uint64_t keep_used_ = 0;
     std::uint64_t work_used_ = 0;
     std::uint64_t normal_used_ = 0;

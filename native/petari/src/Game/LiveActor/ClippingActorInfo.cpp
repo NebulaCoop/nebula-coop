@@ -8,20 +8,17 @@
 #include "Game/NameObj/NameObjExecuteHolder.hpp"
 #include "Game/Util.hpp"
 #include "Game/System/NebulaHost.hpp"
-#include "Game/Util/Tunable.hpp"
-
-NEBULA_TUNABLE_NAMED(f32, cNum_ClippingActorInfo_f1, "ClippingActorInfo.f1", 300.0f);
 
 namespace {
     // Distance a clipping sphere must pass beyond the view volume before an actor that runs is clipped (or stops being
     // drawn while clipped); about the width of a large enemy, more than any camera or actor jitter at an edge.
-    NEBULA_TUNABLE(f32, sClipLeaveMargin, 150.0f);
+    const f32 sClipLeaveMargin = 150.0f;
 };  // namespace
 
 ClippingActorInfo::ClippingActorInfo(LiveActor* pActor)
     : mActor(pActor), mCenter(), mRadius(0.0f), mInfo(), mFarClipLevel(6), mViewGroupId(-1), mViewGroup(), mGround(), mGroundFound(false), mList(),
       mIndex(-1) {
-    setTypeToSphere(cNum_ClippingActorInfo_f1, nullptr);
+    setTypeToSphere(300.0f, nullptr);
 }
 
 void ClippingActorInfo::judgeClipping() {
@@ -50,7 +47,7 @@ bool ClippingActorInfo::isJudgedToClip() const {
 // another scenario uses them (Space Junk's web coins), relying on their staying clipped there. Never over a planet that
 // is not there: view cubes and switches hide a planet and leave what stands on it to its distance.
 // A clipped actor already drawn stays so until its sphere is a margin outside the frustum (same reason as isJudgedToClip).
-// While the host traces, the judge's margin more (RT-MASTER-PLAN 5.3 G-1): what stands just off screen stays drawn,
+// While the host traces, the judge's margin more: what stands just off screen stays drawn,
 // stopped, for the tracer's shadows and mirrors; the host leaves it out of its raster passes.
 bool ClippingActorInfo::isDrawnWhileClipped() const {
     const f32 radius = (mActor->mFlag.mIsDrawnClipped ? mRadius + ::sClipLeaveMargin : mRadius) + MR::getClippingJudge()->getTracedDrawMargin();

@@ -45,7 +45,7 @@ Use a Windows user that never ran Nebula, a mid-range PC and a low-end one, and 
 | W18 | Internal resolution, anti-aliasing, frame rate limit and Match refresh rate on 60, 120 and variable-refresh displays | The picture changes; speed is the game's own; motion smooth |
 | W18b | A laptop on battery: play ten minutes at a 60 frame rate limit, then minimise for five; watch Task Manager's Power usage column | Playing: the limit holds and power usage is no higher than with Nebula's previous release; minimised: very low |
 | W19 | Interpolation on and off | On: smooth, HUD and cuts clean. Off: the game's own rate |
-| W20 | Run `NebulaNative.exe` (Direct3D 12) and `NebulaNativeVk.exe` (Vulkan) through title to a galaxy; pick the other graphics card | Same picture on both; the card chosen is the card used |
+| W20 | Run `Nebula.exe` (Direct3D 12) and `NebulaVk.exe` (Vulkan) through title to a galaxy; pick the other graphics card | Same picture on both; the card chosen is the card used |
 | W21 | DLSS, FSR, XeSS where the machine has them | Each loads; the licence is asked before a download; off returns the plain picture |
 | W22 | Force a driver reset | Recovers or shows NEB-G01 with a report; no hang |
 | W23 | Volumes, Mono / Stereo / Surround, unplug and replug headphones | Each volume moves only its sound; output follows without a restart |

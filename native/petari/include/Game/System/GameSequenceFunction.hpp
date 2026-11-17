@@ -43,6 +43,8 @@ namespace GameSequenceFunction {
     void reflectStageResultSequenceCoin();
     void resetStageResultSequenceParam();
     void startPreLoadSaveDataSequence();
+    // The save read again as the start reads it (SaveDataHandleSequence::startReload).
+    void startReloadSaveDataSequence();
     void startGameDataLoadSequence(int, bool);
     void startCreateUserFileSequence(int);
     void startDeleteUserFileSequence(int);
@@ -61,7 +63,4 @@ namespace GameSequenceFunction {
     void startGameDataSaveSequence(bool, bool);
     // After startGameDataSaveSequence: the caller opens a system window once the save is done (SaveDataHandleSequence).
     void setGameDataSaveWindowFollows();
-    // The save data read again from the NAND, as at the start, nothing of the last read kept: online co-op's save
-    // folder changed (a missing file reads as a new console's).
-    void startReloadSaveDataSequence();
 };  // namespace GameSequenceFunction

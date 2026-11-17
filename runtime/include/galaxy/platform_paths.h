@@ -3,7 +3,9 @@
 // Android app passes its private files folder), else %LOCALAPPDATA%\NebulaCoop on Windows (the variable, so a test's
 // private one holds everything; the shell's folder without it), ~/Library/Application Support/NebulaCoop on Apple's
 // systems, else $XDG_DATA_HOME/NebulaCoop, else ~/.local/share/NebulaCoop. NebulaCoop, not upstream Nebula's "Nebula":
-// the co-op fork keeps its own saves, settings and mods, and never touches an installed Nebula's.
+// the co-op fork keeps its own saves, settings and mods, and never touches an installed Nebula's. A portable copy (Setup's
+// portable choice: portable.txt in its folder, the program in it or in versions/<version> inside it) keeps everything
+// in its data folder.
 #pragma once
 
 #include "galaxy/launch_args.h"
@@ -32,10 +34,30 @@ namespace galaxy {
 inline constexpr char kDataFolderName[] = "NebulaCoop";
 inline constexpr wchar_t kDataFolderNameWide[] = L"NebulaCoop";
 
+[[nodiscard]] inline std::filesystem::path program_directory();
+
+// A portable copy's data folder: <copy>/data beside portable.txt; empty when this program is not in one.
+[[nodiscard]] inline std::filesystem::path portable_data_directory() {
+    const std::filesystem::path program = program_directory();
+    if (program.empty()) {
+        return {};
+    }
+    for (const std::filesystem::path& root : {program, program.parent_path().parent_path()}) {
+        std::error_code error;
+        if (!root.empty() && std::filesystem::is_regular_file(root / "portable.txt", error)) {
+            return root / "data";
+        }
+    }
+    return {};
+}
+
 // Empty when the platform gives no folder.
 [[nodiscard]] inline std::filesystem::path nebula_data_directory() {
     if (!launch_args().data.empty()) {
         return launch_args().data;
+    }
+    if (std::filesystem::path portable = portable_data_directory(); !portable.empty()) {
+        return portable;
     }
 #if defined(_WIN32)
     const std::wstring local = windows::environment_text(L"LOCALAPPDATA");
@@ -104,6 +126,19 @@ inline constexpr wchar_t kDataFolderNameWide[] = L"NebulaCoop";
     const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", error);
     return error ? std::filesystem::path{} : exe.parent_path();
 #endif
+}
+
+// The folder of the files a package installs for the program (luma/: the game's self-description, its SDK and the mods
+// that come with it): the program's folder, or in a Mac app its Resources folder (Contents/Resources beside the
+// program's Contents/MacOS). Empty when the program's folder is unknown.
+[[nodiscard]] inline std::filesystem::path package_directory() {
+    const std::filesystem::path program = program_directory();
+#if defined(__APPLE__)
+    if (program.filename() == "MacOS" && program.parent_path().filename() == "Contents") {
+        return program.parent_path() / "Resources";
+    }
+#endif
+    return program;
 }
 
 // fopen on a path (UTF-16 on Windows); null on failure, with errno set.

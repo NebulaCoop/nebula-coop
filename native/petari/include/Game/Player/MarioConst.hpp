@@ -507,6 +507,9 @@ struct MarioConstTable {
     u8 mBrakeSlide;      // 1: braking starts from a slower run, its animation plays at half speed with a sliding
                          // sound, and running into a wall stops it (Luigi's long brake, with mBrakeFirstTimer)
     u8 mSwimSpinOxygen;  // 1: a spin while swimming costs a sixteenth of the oxygen (Luigi's)
+    // Nebula: sizes the game wrote as numbers in MarioActor, named so a mod can scale the player (LumaKit forms).
+    f32 mBinderRadius;  // the body's ground collision radius standing (60); squatting 40/60 of it, as a Boo 100/60
+    f32 mSensorRadius;  // the body's hit sensor radius (100); hanging 60/100 of it
 };
 
 // Mario's (0) or Luigi's (1) table, as the game and mods change it.

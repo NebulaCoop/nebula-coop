@@ -69,6 +69,26 @@ public:
     [[nodiscard]] gpu::TextureRef create_texture(
         std::uint32_t width, std::uint32_t height, unsigned levels, std::uint64_t& allocation_bytes,
         TexelFormat format = TexelFormat::Rgba8, bool writable = false);
+    // create_texture in two steps (gpu_texture_backend.h): make_texture on any thread (the allocator and the device's
+    // create calls are thread-safe), adopt_texture on the render thread. With `fill`, an image made for host copies is
+    // written there and then (`filled`: record_upload is not called for it).
+    // The staged levels make_texture may write (as record_upload takes them).
+    struct Levels {
+        const UploadChunk* staging = nullptr;
+        std::uint64_t offset = 0u;
+        const std::uint64_t* offsets = nullptr;
+        const std::uint32_t* pitches = nullptr;
+    };
+    struct MadeTexture {
+        gpu::TextureRef texture;
+        std::uint64_t allocation_bytes = 0u;
+        bool filled = false;  // its levels are written
+    };
+    static constexpr bool kMakesAnywhere = true;
+    [[nodiscard]] MadeTexture make_texture(std::uint32_t width, std::uint32_t height, unsigned levels,
+                                           TexelFormat format = TexelFormat::Rgba8, bool writable = false,
+                                           const Levels* fill = nullptr) const;
+    void adopt_texture(const MadeTexture& made);
     // VK_EXT_host_image_copy is in use for some formats.
     [[nodiscard]] bool host_writes() const noexcept { return host_formats_ != 0u; }
     // A texture create_texture made for host copies: it is never uploaded again in place.
@@ -76,6 +96,9 @@ public:
         return texture != nullptr && (texture->usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) != 0u;
     }
     [[nodiscard]] static bool supports_bc1();
+    [[nodiscard]] static bool supports_astc4x4();
+    // R5G6B5 sampled with linear filtering and written by copies (Vulkan 1.0's mandatory formats hold it; asked anyway).
+    [[nodiscard]] static bool supports_rgb565();
     [[nodiscard]] static bool poolable(vk::Texture* texture, std::uint32_t& width, std::uint32_t& height,
                                        std::uint32_t& levels);
     void record_upload(vk::Texture* texture, bool reused, const UploadChunk& staging, std::uint64_t offset,

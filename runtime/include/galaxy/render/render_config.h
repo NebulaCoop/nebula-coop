@@ -10,16 +10,22 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "galaxy/game_step.h"
+#include "galaxy/render/renderer_choice.h"
 
 namespace galaxy::render {
 
 inline constexpr float kMinFrameRate = 1.0f;
-inline constexpr float kMaxFrameRate = 1000.0f;
+// The frame-rate setting's Unlimited (config.ini max_fps=unlimited). Only the game's step is fixed (60 a second); the
+// pictures between steps have no cap: without VSync, every picture the device makes, each showing the moment it is
+// drawn for; with VSync, the display's rate.
+inline constexpr float kUnlimitedFrameRate = std::numeric_limits<float>::infinity();
+[[nodiscard]] constexpr bool unlimited_frame_rate(float max_fps) noexcept { return max_fps == kUnlimitedFrameRate; }
 // The bloom settings' top (percent of the game's and the camera's own strength).
 inline constexpr unsigned kMaxBloom = 200;
 
@@ -42,10 +48,8 @@ struct RenderConfig {
     // ray tracing.
     unsigned msaa_samples        = 1;
 
-    // Not implemented; always clamped false.
-    bool     taa_enabled         = false;
-
-    // Frames per second presented (0: the display's rate, at least 60; see present_frame_rate).
+    // Frames per second presented (0: the display's rate, at least 60; kUnlimitedFrameRate: no cap; see
+    // present_frame_rate).
     float    max_fps             = static_cast<float>(kGameStepsPerSecond);
 
     // Submits the game's records at their own 60 Hz cadence instead of one present per game frame.
@@ -57,9 +61,6 @@ struct RenderConfig {
     // Anisotropic filtering for mipmapped samplers: 1 off, 2/4/8/16 D3D12_SAMPLER_DESC::MaxAnisotropy.
     unsigned anisotropic_filtering = 1;
 
-    // Generates mip chains for color textures the game samples with linear filtering but without authored mips.
-    // Authored mips are decoded unchanged.
-    bool     enhanced_mipmaps    = false;
     // Curved models rounded once when loaded (shapes::refine_curved, curved_surfaces.h).
     bool     curved_surfaces     = true;
 
@@ -83,6 +84,10 @@ struct RenderConfig {
     // internal resolution is lower. Off by default: the scene then takes two resamples (to the integer output
     // scale, then to the window) instead of one.
     bool     hud_output_resolution = false;
+    // With an internal height (render_internal_height): the 2D layer drawn into the scene at the internal size, and the
+    // picture enlarged once at present, instead of the scene enlarged into a window-size target the 2D layer is drawn over
+    // (render_hud_at_output). Faster, text softer; hud_output_resolution wins. Off: as without it.
+    bool     hud_internal_resolution = false;
 
     // Presentation image quality (post_process.h), applied to the presented frame on the render thread; false
     // presents with the plain bilinear blit.
@@ -110,17 +115,25 @@ struct RenderConfig {
     // count. Width follows the current content aspect, including a fold or window resize. Ignored with an upscaler on
     // (render_internal_height).
     unsigned internal_height     = 0;
+    // Dynamic resolution (resolution_governor.h): the 3D scene drawn in a part of its targets, from internal_height's size
+    // down to half its lines, as the GPU's measured time asks. Off: every picture as without it. Taken only where the back
+    // end offers it (dynamic_resolution_offered).
+    bool     dynamic_resolution  = false;
     // RCAS strength 0-100; 0 skips the pass.
     unsigned sharpness           = 0;
     // HDR10 output (post_process_settings.h): offered only while the display reports HDR mode, and written only then
     // (get_display_hdr); the picture is otherwise the SDR one, bit for bit. paper_white is the luminance of the picture's white
-    // in nits (kPaperWhiteMin..kPaperWhiteMax).
+    // in nits (kPaperWhiteMin..kPaperWhiteMax). hdr_peak is the display's brightest level in nits as the HDR calibration
+    // found it (kHdrPeakMin..kHdrPeakMax), 0 the display's own report; hdr_black its darkest visible level, a step of
+    // hdr_black_nits (0 to kHdrBlackSteps; 0 a true black).
     bool     hdr                 = false;
     unsigned paper_white         = 200;
+    unsigned hdr_peak            = 0;
+    unsigned hdr_black           = 0;
 
     // Ray tracing, on a device that can trace (rt_caps.h); ignored elsewhere.
     bool     ray_tracing_enabled = false;
-    // The preset (plan 19.1): 0 medium, 1 high, 2 low, 3 reference (path traced, to compare), 4 custom (the parts as
+    // The preset: 0 medium, 1 high, 2 low, 3 reference (path traced, to compare), 4 custom (the parts as
     // set one by one). A preset sets every part (rt_apply_preset).
     unsigned rt_quality          = 0;
     // The parts, each its own setting, in RtPart's order (sun shadows, local lights, sky and bounce light, reflections,
@@ -131,8 +144,14 @@ struct RenderConfig {
     // low) unless the player chose one: rt_chosen, set by the Settings rows.
     float    rt_probe_ms         = 0.0f;
     bool     rt_chosen           = false;
+    // The lighting style: 0 painted (the art's own light, relit by the tracer's ratios), 1 physical (where
+    // a painted mesh's paint is one light, the real sun takes its place).
+    unsigned rt_style            = 1;
     // Light the lens scatters around every bright surface.
     bool     rt_lens_bloom       = true;
+    // A soft shadow under the player while ray tracing, to judge a landing (the game's own drop shadow is left out
+    // then).
+    bool     rt_landing_shadow   = true;
 
     // Texture packs (texture_pack.h): replacements from the mods'
     // textures/ folders. preload loads the whole pack at start instead of each texture at its first
@@ -158,6 +177,9 @@ struct RenderConfig {
     // GPU that is not present, picks one automatically (the high-performance GPU first). Set at start-up from
     // config.ini (GALAXY_GPU overrides) and kept for the session; see next_start_gpu().
     std::array<char, 32> gpu{};
+    // The renderer this session's start chose (config.ini renderer, a RendererKind: 0 the automatic choice); see
+    // next_start_renderer().
+    unsigned renderer = 0;
     // Game picture aspect, an index of kAspectRatios (0 follows the window's shape). Applied at the next video
     // frame.
     unsigned aspect_mode         = 0;
@@ -171,9 +193,15 @@ struct RenderConfig {
     return config.per_pixel_lighting || config.enhanced_lighting || config.ray_tracing_enabled;
 }
 
+// Whether the 3D scene is drawn in the wide (FP16) target with its camera: for the enhanced lighting, or while tracing
+// (the relit scene goes over 1). `tracing`: ray tracing on and the tracer started.
+[[nodiscard]] inline bool scene_wide(const RenderConfig& config, bool tracing) noexcept {
+    return (config.enhanced_lighting || tracing) && config.wide_scene;
+}
+
 // Frames per second the game picture is presented at. The game renders 60; lower rates present the newest frame on
-// their own cadence, higher rates add interpolated frames between game frames. Unlimited (0) is the display rate (at
-// least 60). VSync limits the rate to the display's.
+// their own cadence, higher rates add interpolated frames between game frames. 0 is the display's rate (at least 60);
+// kUnlimitedFrameRate is infinite (no slot clock). VSync limits the rate to the display's.
 inline double present_frame_rate(float max_fps, unsigned vsync_interval, double refresh_hz) {
     double rate = max_fps > 0.0f ? static_cast<double>(max_fps)
                                  : (refresh_hz > 1.0 ? std::max(refresh_hz, kGameStepRate) : kGameStepRate);
@@ -181,12 +209,18 @@ inline double present_frame_rate(float max_fps, unsigned vsync_interval, double 
     return rate;
 }
 
+// Interpolated frames between two game frames with no bound: an unlimited present rate, where the GPU and the next game
+// frame end each sequence (RenderCore::advance_interp_sequence).
+inline constexpr unsigned kUnboundedGeneratedFrames = std::numeric_limits<unsigned>::max();
+
 // The most interpolated frames one game frame needs at a present rate: ceil(rate / 60) - 1 (75 Hz shows one between
-// most pairs of game frames, 144 Hz two between some), none at 60 and below, at most 7.
+// most pairs of game frames, 144 Hz two between some), none at 60 and below, kUnboundedGeneratedFrames for an
+// unlimited rate.
 inline unsigned interpolated_frames_per_game_frame(double rate) {
     if (!(rate > kGameStepRate + 1.0)) return 0u;
     const double frames = std::ceil(rate / kGameStepRate - 1e-3) - 1.0;
-    return static_cast<unsigned>(std::clamp(frames, 1.0, 7.0));
+    if (!(frames < static_cast<double>(kUnboundedGeneratedFrames))) return kUnboundedGeneratedFrames;
+    return std::max(1u, static_cast<unsigned>(frames));
 }
 
 inline constexpr std::array<unsigned, 9> kInternalHeights{0, 144, 240, 360, 480, 720, 1080, 1440, 2160};
@@ -197,6 +231,11 @@ inline unsigned normalized_internal_height(unsigned height) {
 // scale instead (upscaler_render_fraction), so the two never multiply.
 inline unsigned render_internal_height(const RenderConfig& cfg) {
     return cfg.upscaler == 0u ? normalized_internal_height(cfg.internal_height) : 0u;
+}
+// Whether the 2D layer is drawn at the window's resolution over the enlarged scene (begin_output_scene): asked for
+// (hud_output_resolution), or an internal height without hud_internal_resolution.
+inline bool render_hud_at_output(const RenderConfig& cfg) {
+    return cfg.hud_output_resolution || (render_internal_height(cfg) != 0u && !cfg.hud_internal_resolution);
 }
 // A common sizing rule for both encoders. Bounds preserve aspect and fit `max_dimension`, the device's largest 2D
 // texture (D3D12's required 16384, Vulkan's maxImageDimension2D).
@@ -212,16 +251,17 @@ inline std::pair<unsigned, unsigned> internal_extent(unsigned output_width, unsi
 
 inline constexpr unsigned kDisplayWindowed = 0u;
 inline constexpr unsigned kDisplayBorderless = 1u;
-inline constexpr unsigned kAspectModeCount = 7u;
-// Width:height of each aspect_mode (0 = follow the window), narrowest first.
+inline constexpr unsigned kAspectModeCount = 8u;
+// Width:height of each aspect_mode (0 = follow the window), narrowest first. 48:9 is three 16:9 panels.
 inline constexpr unsigned kAspectRatios[kAspectModeCount][2] = {
-    {0u, 0u}, {4u, 3u}, {3u, 2u}, {16u, 10u}, {16u, 9u}, {21u, 9u}, {32u, 9u}};
+    {0u, 0u}, {4u, 3u}, {3u, 2u}, {16u, 10u}, {16u, 9u}, {21u, 9u}, {32u, 9u}, {48u, 9u}};
 // Their names in config.ini (aspect=). A number there is an index of the list before 3:2 (auto, 4:3, 16:10, 16:9,
 // 21:9, 32:9).
-inline constexpr const char* kAspectNames[kAspectModeCount] = {"auto", "4:3", "3:2", "16:10", "16:9", "21:9", "32:9"};
+inline constexpr const char* kAspectNames[kAspectModeCount] = {"auto", "4:3", "3:2", "16:10", "16:9", "21:9", "32:9",
+                                                               "48:9"};
 
 // Window sizes of exactly an aspect_mode's shape that fit max_width x max_height, smallest first; none for
-// aspect_mode 0. The launcher's GraphicsSettings.AspectWindowSizes lists the same sizes.
+// aspect_mode 0.
 inline std::vector<std::pair<unsigned, unsigned>> aspect_window_sizes(
     unsigned aspect_mode, unsigned max_width, unsigned max_height) {
     static constexpr unsigned kHeights[] = {
@@ -284,9 +324,10 @@ struct RenderFeatureCaps {
     const char* reason);
 
 // The settings as the renderer runs them, a copy taken under the lock (never a partial update): the player's, except
-// while the tracer runs, when the scene renders single-sampled and is anti-aliased temporally (plan 16.3: the tracer
+// while the tracer runs, when the scene renders single-sampled and is anti-aliased temporally (the tracer
 // reads one depth and one item a pixel): MSAA is set aside and, without a temporal upscaler chosen, FSR 3 runs, in its
-// native anti-aliasing mode or at FSR 1's chosen scale.
+// native anti-aliasing mode or at FSR 1's chosen scale. On a surface that presents only at its refresh
+// (present_waits_for_refresh) VSync is on whatever was chosen.
 [[nodiscard]] RenderConfig get_render_config();
 // The player's settings as chosen and saved (Nebula Settings, config.ini): ray tracing off gives them back whole.
 [[nodiscard]] RenderConfig get_render_config_chosen();
@@ -301,6 +342,11 @@ void set_render_tracing(bool tracing, bool fsr3) noexcept;
 // raise the rate.
 void set_frame_generation_running(bool running) noexcept;
 [[nodiscard]] bool frame_generation_running() noexcept;
+// The display surface presents only at its refresh: no present mode shows a picture before the next refresh (a Vulkan
+// surface with FIFO alone, Metal on iOS). Set by the renderer each time it makes its swap chain; VSync off cannot be
+// honoured there (get_render_config, the settings' VSYNC row and Unlimited).
+void set_present_waits_for_refresh(bool waits) noexcept;
+[[nodiscard]] bool present_waits_for_refresh() noexcept;
 // The game's report each frame (NEBULA_CONTEXT_FRAME_GENERATION): play is on screen, so generated frames may be
 // added. A report older than 100 ms (loading, other scenes, a game that never reports) counts as no.
 void note_frame_generation_allowed(bool allowed) noexcept;
@@ -313,17 +359,33 @@ void note_camera_water(float depth) noexcept;
 [[nodiscard]] inline float presented_max_fps(const RenderConfig& cfg) noexcept {
     return frame_generation_running() ? static_cast<float>(kGameStepsPerSecond) : cfg.max_fps;
 }
+
+// The rate the present pacer holds presents to (0: no hold), from the cap (presented_max_fps: 0 matches the refresh,
+// kUnlimitedFrameRate none). A variable refresh display with VSync on never gets presents past its refresh (they would
+// leave its range); with VSync off the cap chosen stands, tearing past the refresh accepted as on any display: Unlimited
+// holds nothing, match refresh holds to the refresh.
+[[nodiscard]] inline float paced_present_rate(float max_fps, unsigned vsync_interval, bool variable_refresh,
+                                              double refresh_hz) noexcept {
+    if (!variable_refresh) {
+        return max_fps;
+    }
+    const auto refresh = static_cast<float>(refresh_hz);
+    if (vsync_interval == 0u) {
+        return max_fps > 0.0f ? max_fps : refresh;
+    }
+    return max_fps > 0.0f ? std::min(max_fps, refresh) : refresh;
+}
 void set_render_config(const RenderConfig& cfg);
 
-// Ray tracing's parts (plan 19.1), in RenderConfig::rt_parts' order; each 0 off, 1 low, 2 medium, 3 high.
+// Ray tracing's parts, in RenderConfig::rt_parts' order; each 0 off, 1 low, 2 medium, 3 high.
 enum class RtPart : std::uint8_t { Sun, Lights, Indirect, Reflect, Transmit, Volume, Count };
 inline constexpr unsigned kRtPresetReference = 3u, kRtPresetCustom = 4u;
 inline unsigned rt_part(const RenderConfig& cfg, RtPart part) noexcept {
     return part < RtPart::Count ? std::min<unsigned>(cfg.rt_parts[static_cast<std::size_t>(part)], 3u) : 0u;
 }
 
-// The presets' parts (plan 19.1): low leaves the painted reflections; reference takes high's parts and the reference
-// path tracer draws the picture (FB's 22.9).
+// The presets' parts: low leaves the painted reflections; reference takes high's parts and the reference
+// path tracer draws the picture.
 inline void rt_apply_preset(RenderConfig& cfg) noexcept {
     constexpr std::uint8_t kParts[4][6] = {
         {2u, 2u, 2u, 2u, 2u, 2u},  // medium
@@ -340,6 +402,10 @@ inline void rt_apply_preset(RenderConfig& cfg) noexcept {
 // RenderConfig::curved_surfaces takes effect.
 void set_curved_surfaces_offered(bool offered) noexcept;
 [[nodiscard]] bool curved_surfaces_offered() noexcept;
+// Whether the renderer draws the scene in a part of its targets: the DYNAMIC RESOLUTION row is offered and
+// RenderConfig::dynamic_resolution takes effect.
+void set_dynamic_resolution_offered(bool offered) noexcept;
+[[nodiscard]] bool dynamic_resolution_offered() noexcept;
 
 // The scene target scale config.ini keeps for the next start. The overlay sets it with the live value so config.ini and the
 // running renderer agree.
@@ -354,23 +420,76 @@ void set_render_feature_caps(const RenderFeatureCaps& caps);
 // missing keys keep their defaults. Called once by the host before initialize().
 void load_render_config_from_file();
 
-// Writes the implemented settings to the same config.ini; unimplemented ones are omitted.
+// Writes the settings to the same config.ini.
 bool save_render_config_to_file();
+
+// load_render_config_from_file found no config.ini: this is the first start, and nothing the player chose exists yet.
+[[nodiscard]] bool render_config_first_start() noexcept;
+// The first start's internal height before it is measured (render_core.cpp's calibration): 480 on a GPU that shares the
+// system's memory, else 1080; 0 (match display) when the output has no more lines than that.
+[[nodiscard]] unsigned first_start_internal_height(bool shared_memory, unsigned output_lines) noexcept;
+// The PERFORMANCE preset: the 3D scene and the 2D layer at 480 lines and one enlarge at present, every optional pass off.
+void apply_performance_preset(RenderConfig& cfg) noexcept;
+// The benchmark's standard settings, the same on every device so their results compare: the scene at 1920 x 1080 (16:9
+// at 1080 lines, whatever the window's shape), MSAA 4x, SMAA high, ambient occlusion, enhanced and per-pixel lighting,
+// bloom and 16x anisotropic filtering; no upscaler, dynamic resolution, frame generation, ray tracing
+// or HDR, and the benchmark's presenting (apply_benchmark_presenting). The window, display and GPU stay as they are.
+inline constexpr unsigned kBenchmarkStandardLines = 1080u;
+inline constexpr unsigned kBenchmarkStandardAspect = 4u;  // kAspectRatios: 16:9
+void apply_benchmark_standard(RenderConfig& cfg) noexcept;
+// How the benchmark presents, at every step: the game at its own pace and Nebula's interpolated frames between its
+// frames as fast as the device makes them, without VSync (kUnlimitedFrameRate). While a benchmark runs the GPU's
+// generated-frame budget is not applied (RenderCore::interp_gpu_governor): each picture shows the moment it is drawn
+// for, so the frame rate is what the device can show.
+void apply_benchmark_presenting(RenderConfig& cfg) noexcept;
 
 // A GPU's identity in config.ini's gpu key: PCI vendor, device and subsystem id in lowercase hex,
 // "vvvv:dddd:ssssssss". The subsystem tells two boards of the same chip apart.
 std::string gpu_identity(unsigned vendor_id, unsigned device_id, unsigned subsys_id);
 
-// The gpu config.ini names, which the next start renders on. Nebula Settings owns the key: a reload
-// takes it here and leaves RenderConfig::gpu as the session started, and every save writes the value
-// the file has at that moment (this one when it cannot be read), never GALAXY_GPU.
+// The gpu config.ini names, which the next start renders on. A reload takes it here and leaves RenderConfig::gpu as
+// the session started; a save writes the one choose_next_start_gpu chose, else the value the file has at that moment
+// (an edit made outside the game; this one when it cannot be read), never GALAXY_GPU.
 std::string next_start_gpu();
 
-// Records the adapter the renderer runs on (adapter.ini beside config.ini) for the launcher, which offers DLSS only
+// A GPU the renderer could run on: its gpu_identity() and its name (UTF-8).
+struct GpuChoice {
+    std::string identity;
+    std::string name;
+};
+// The GPUs the renderer found at its start, in the order its automatic choice takes them (software renderers left
+// out). Each backend records them as it chooses its device.
+void record_gpu_choices(std::vector<GpuChoice> choices) noexcept;
+[[nodiscard]] std::vector<GpuChoice> gpu_choices();
+// The GPU the next start renders on: one of gpu_choices()' identities, or empty for the automatic choice, and the
+// renderer it starts with (the newest that card runs, renderer_choice.h preferred_renderer; kAuto where that is not
+// known). Written to config.ini at once; this session keeps the GPU and the renderer it started with.
+bool choose_next_start_gpu(const std::string& identity, RendererKind renderer = RendererKind::kAuto);
+
+// The renderer config.ini names, which the next start takes (Windows: Nebula.exe hands the start to that renderer's
+// program), as next_start_gpu keeps the gpu key; kAuto: the newest renderer the card runs.
+[[nodiscard]] RendererKind next_start_renderer();
+bool choose_next_start_renderer(RendererKind renderer);
+// The renderer key as config.ini has it now, read before the rest of the settings load (a start's choice of program).
+[[nodiscard]] RendererKind renderer_in_settings_file();
+
+// Records the adapter the renderer runs on (adapter.ini beside config.ini) for the settings, which offer DLSS only
 // on an NVIDIA RTX adapter: description (UTF-8), PCI vendor and device id, its gpu_identity() and whether it runs
 // Nebula's ray tracing.
 void record_render_adapter(const char* description, unsigned vendor_id, unsigned device_id,
                            unsigned subsys_id, bool ray_tracing) noexcept;
+// The adapter record_render_adapter was last given (empty before the renderer starts).
+struct RenderAdapter {
+    std::string description;
+    unsigned vendor_id = 0u;
+    unsigned device_id = 0u;
+    std::string driver;  // the driver's version as its maker writes it (record_render_driver); empty when not known
+};
+[[nodiscard]] RenderAdapter render_adapter();
+// The driver's version for render_adapter(), after record_render_adapter (DXGI's user-mode driver version on Windows,
+// VK_KHR_driver_properties' text or the decoded driverVersion with Vulkan; Metal has none: the system's version is the
+// driver's).
+void record_render_driver(std::string version) noexcept;
 // When config.ini changed on disk since this process last read or wrote it (Nebula Settings saved it while the game
 // runs), reads it over the live settings, as the in-game menu would apply them, and returns true.
 bool reload_render_config_if_changed();

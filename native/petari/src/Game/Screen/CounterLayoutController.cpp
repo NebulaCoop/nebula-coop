@@ -15,11 +15,10 @@
 #include "Game/Util/ObjUtil.hpp"
 #include "Game/Util/PlayerUtil.hpp"
 #include "Game/Util/StarPointerUtil.hpp"
-#include "Game/Util/Tunable.hpp"
 #include "Game/System/LumaCore.hpp"
 
 namespace {
-    NEBULA_TUNABLE(s32, cJudgeNotMovingFrame, 60);
+    const s32 cJudgeNotMovingFrame = 60;
     const s32 cShowWaitFrame = NebulaFrameClock::stepsOfSeconds(4);
 };  // namespace
 
@@ -49,14 +48,9 @@ void CounterLayoutController::init(const TableIter& /*rIter*/) {
     mPlayerLeft->initWithoutIter();
     mStarCounter = new StarCounter();
     mStarCounter->initWithoutIter();
-    mCoinCounter->mFlag.mHudPart = NEBULA_HUD_COINS;
-    mStarPieceCounter->mFlag.mHudPart = NEBULA_HUD_STAR_BITS;
-    mPlayerLeft->mFlag.mHudPart = NEBULA_HUD_LIVES;
-    mStarCounter->mFlag.mHudPart = NEBULA_HUD_STARS;
     for (s32 i = 0; i < NEBULA_HUD_COUNTER_LINES; i++) {
         mHudCounters[i] = new NebulaHudCounter(i + 1);
         mHudCounters[i]->initWithoutIter();
-        mHudCounters[i]->mFlag.mHudPart = NEBULA_HUD_STARS;
     }
 
     appear();

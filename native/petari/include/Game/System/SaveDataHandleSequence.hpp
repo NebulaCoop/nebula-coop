@@ -18,18 +18,31 @@ public:
     void update();
     void draw() const;
     void startPreLoad();
+    // The save read again as the start reads it, every file in memory blank first (a file it has none of stays blank).
+    void startReload();
     void startCreateUserFile(int);
     void startDeleteUserFile(int);
     void startSave(bool, bool);
     void startSaveBackup(bool, bool);
     void startSaveAll();
+    // LumaCore's FORGET (services/save.md 5): the stored files written as they are in memory, no window, no sound, no
+    // question. False, nothing started: a sequence is running, the save was not read yet, or saves are off.
+    bool startQuietSave();
+    // True when startQuietSave never writes: the start read nothing usable, saves are off, or the save is damaged.
+    bool isQuietSaveOff() const {
+        return mPreLoadState == 2 || mIsNoSaveMode || mIsCorrupted;
+    }
+    void exeQuietSave();
+    // A save was read at the start or written since (1), or the start read none (2: no file, damaged, or saves off);
+    // 0 before.
+    int getPreLoadState() const {
+        return mPreLoadState;
+    }
     // The caller opens a system window when the save is done (the pause menu's question): the done message hands the
     // screen dim to it (SysInfoWindow::setDimHandOver). Until the next start.
     void setWindowFollows(bool follows) {
         mWindowFollows = follows;
     }
-    // startPreLoad from a new console's save data: a missing file leaves none of the last one read.
-    void startReload();
     void startLoad(int, bool);
     void storeMiiOrIconId(int, const void*, const u32*);
     void storeCopyUserFile(int, int);
@@ -83,11 +96,9 @@ public:
     bool mIsNoSaveMode;
     UserFile* mWorkUserFile;
     const Nerve* mNerveForError;
-    u8* mTempBuffer;
     SaveIcon* mSaveIcon;
     bool mWindowFollows;
     int mSaveCopyLoading = 0;
-    // A new console's user file, never changed: what startReload starts from.
-    UserFile* mNewUserFile;
     bool mSaveDamaged = false;
+    int mPreLoadState = 0;
 };

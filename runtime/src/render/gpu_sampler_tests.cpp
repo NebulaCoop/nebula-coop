@@ -31,31 +31,37 @@ int main() {
     mode.wrap_s = TexWrap::Repeat; mode.wrap_t = TexWrap::Mirror;
     mode.mag_linear = mode.min_linear = true; mode.mip = 2;
     mode.min_lod = 0.001f; mode.max_lod = 23.75f; mode.lod_bias = -7.12345f;
-    const auto key = make_sampler_key(mode, false, 32);
+    const auto key = make_sampler_key(mode, 32);
     RenderConfig cfg{}; cfg.anisotropic_filtering = 1; cfg.texture_lod_bias = 0;
     const auto desc = build_sampler_desc_from_key(key, cfg);
     passed &= expect(desc.MinLOD == mode.min_lod && desc.MaxLOD == mode.max_lod && desc.MipLODBias == mode.lod_bias,
                      "LOD values survive to the native descriptor without byte ranges or fixed-point rounding");
     passed &= expect(desc.AddressU == D3D12_TEXTURE_ADDRESS_MODE_WRAP && desc.AddressV == D3D12_TEXTURE_ADDRESS_MODE_MIRROR,
                      "authored wrapping reaches the descriptor");
-    mode.mip = 0; mode.max_lod = 0;
-    auto generated = make_sampler_key(mode, true, 32);
-    passed &= expect(generated.max_lod == 31.0f, "generated chains retain all 32 levels");
     cfg.anisotropic_filtering = 16;
-    passed &= expect(build_sampler_desc_from_key(generated, cfg).Filter == D3D12_FILTER_ANISOTROPIC,
-                     "linear generated levels use configured anisotropy");
+    passed &= expect(build_sampler_desc_from_key(key, cfg).Filter == D3D12_FILTER_ANISOTROPIC,
+                     "linear filtering between authored levels uses configured anisotropy");
     cfg.texture_lod_bias = 2u;
-    const auto biased = build_sampler_desc_from_key(generated, cfg);
-    passed &= expect(biased.MaxAnisotropy == 16u && std::fabs(biased.MipLODBias - (generated.lod_bias + 1.0f)) < 1e-6f,
+    const auto biased = build_sampler_desc_from_key(key, cfg);
+    passed &= expect(biased.MaxAnisotropy == 16u && std::fabs(biased.MipLODBias - (key.lod_bias + 1.0f)) < 1e-6f,
                      "configured anisotropy and bias reach the descriptor");
     cfg.anisotropic_filtering = 1u;
-    passed &= expect(build_sampler_desc_from_key(generated, cfg).MaxAnisotropy == 1u,
+    passed &= expect(build_sampler_desc_from_key(key, cfg).MaxAnisotropy == 1u,
                      "disabling anisotropy restores one sample");
-    auto nearest = mode;
-    nearest.mag_linear = false;
-    const auto nearest_key = make_sampler_key(nearest, true, 6u);
-    passed &= expect(nearest_key.max_lod == 0.0f && ((nearest_key.filter >> 5u) & 7u) == 4u,
-                     "nearest magnification keeps authored mip selection");
+    {
+        // Levels drawn by hand: the level the game showed, whatever anisotropy and LOD bias the settings ask for.
+        const auto drawn = make_sampler_key(mode, 32, 0.0f, false, 1.0f, -0.5f, true);
+        RenderConfig sharp{}; sharp.anisotropic_filtering = 16u; sharp.texture_lod_bias = 2u;
+        const auto drawn_desc = build_sampler_desc_from_key(drawn, sharp);
+        passed &= expect(drawn_desc.Filter == D3D12_FILTER_MIN_MAG_MIP_LINEAR && drawn_desc.MaxAnisotropy == 1u &&
+                             std::fabs(drawn_desc.MipLODBias - (mode.lod_bias + 1.0f)) < 1e-5f,
+                         "levels drawn by hand take no anisotropy, scene bias or settings bias");
+    }
+    auto unmipped = mode;
+    unmipped.mip = 0; unmipped.max_lod = 0; unmipped.mag_linear = false;
+    const auto unmipped_key = make_sampler_key(unmipped, 6u);
+    passed &= expect(unmipped_key.max_lod == 0.0f && ((unmipped_key.filter >> 5u) & 7u) == 4u,
+                     "a sampler without mip filtering keeps to the first level, whatever levels the texture has");
     const auto a = make_sampler_slot_key(key, cfg);
     auto biased_key = key;
     biased_key.lod_bias += 0.0001f;
@@ -149,6 +155,35 @@ int main() {
         passed &= expect(pipelines.failures() == 2, "pipeline IDs past 32 bits reach separate cache cells");
         pipelines.shutdown();
     }
+    {
+        // texture_table: one id per list content, from the lookup or this thread's remembered answer alike.
+        NebulaFrameTexture la[2]{}, lb[2]{}, wide[9]{};
+        la[0].texture = 5u; la[1].texture = 6u; la[1].lod_bias = -0.5f;
+        lb[0] = la[0]; lb[1] = la[1]; lb[1].wrap_s = 1u;
+        for (std::uint32_t i = 0; i < 9u; ++i) wide[i].texture = 10u + i;
+        core::Registries regs, other;
+        const std::uint32_t ta = regs.texture_table(la, 2u);
+        const std::uint32_t tb = regs.texture_table(lb, 2u);
+        passed &= expect(ta != 0u && tb != 0u && ta != tb, "lists differing in one sampler field are two tables");
+        passed &= expect(regs.texture_table(la, 2u) == ta && regs.texture_table(lb, 2u) == tb && regs.texture_table(la, 2u) == ta,
+                         "a list asked again is the same table");
+        passed &= expect(regs.texture_table(la, 1u) != ta && regs.texture_table(la, 1u) == regs.texture_table(la, 1u),
+                         "a shorter list is its own table");
+        const std::uint32_t tw = regs.texture_table(wide, 9u);
+        passed &= expect(regs.texture_table(wide, 9u) == tw, "a list longer than the remembered ones is found by the lookup");
+        passed &= expect(regs.texture_table(nullptr, 0u) == regs.texture_table(nullptr, 0u), "the empty list is one table");
+        const std::uint32_t sb = other.texture_table(lb, 2u);
+        passed &= expect(sb == 1u && other.texture_table(la, 2u) == 2u && regs.texture_table(lb, 2u) == tb,
+                         "each registries object keeps its own ids on one thread");
+        std::vector<gpu::Table> retired;
+        const std::uint32_t freed[] = {6u};
+        regs.forget_textures(freed, retired);
+        const std::uint32_t anew = regs.texture_table(la, 2u);
+        passed &= expect(anew != ta && anew != tb && regs.texture_table(la, 2u) == anew,
+                         "a list dropped with its texture is registered anew, not answered from memory");
+        const auto ops = regs.take_ops();
+        passed &= expect(ops.tables.size() == 6u, "every new table reaches the render thread once");
+    }
     if (device) {
         TextureBackend backend;
         passed &= expect(backend.initialize(device.Get(), 65536u), "texture view page setup");
@@ -183,6 +218,24 @@ int main() {
         passed &= expect(grown > initial && ring.initialize(device.Get(), "preflight-test", UploadRing::budget(grown, 2u), 2u, grown), "oversized first frame receives a larger ring");
         ring.begin_frame(0u);
         passed &= expect(ring.allocate(requested, 256u).cpu != nullptr && !ring.spilled(), "the first oversized frame fits its segment without a spill failure");
+        {
+            // A ring without chunks, past its segment and spill: try_allocate answers empty and takes nothing; allocate throws.
+            const std::size_t cursor = ring.cursor();
+            const UploadRing::Allocation refused = ring.try_allocate(ring.total_bytes() + 1u, 256u);
+            passed &= expect(refused.cpu == nullptr && refused.gpu == 0u && refused.resource == nullptr && ring.cursor() == cursor &&
+                                 !ring.spilled(),
+                             "try_allocate past the segment and the spill is empty and consumes nothing");
+            passed &= expect(ring.try_allocate(16u, 3u).cpu == nullptr, "try_allocate with a bad alignment is empty");
+            bool threw = false;
+            try {
+                (void)ring.allocate(ring.total_bytes() + 1u, 256u);
+            } catch (const std::runtime_error&) {
+                threw = true;
+            }
+            passed &= expect(threw && ring.cursor() == cursor, "allocate past the segment and the spill still throws");
+            const UploadRing::Allocation fits = ring.try_allocate(256u, 256u);
+            passed &= expect(fits.cpu != nullptr && ring.cursor() == fits.offset + 256u, "try_allocate places what fits as allocate does");
+        }
         ring.reset();
     }
     if (passed) { std::cout << "Sampler tests passed\n"; }

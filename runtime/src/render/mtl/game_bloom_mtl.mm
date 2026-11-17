@@ -5,7 +5,9 @@
 #include "galaxy/render/mtl/game_bloom_mtl.h"
 
 #include "galaxy/render/game_bloom_shape.h"
+#include "galaxy/render/frame_pass.h"
 #include "galaxy/render/mtl/utility_msl.h"
+#include "galaxy/render/idle_clock.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -188,8 +190,10 @@ bool GameBloom::ensure(std::shared_ptr<Texture>& target, unsigned width, unsigne
     return target != nullptr;
 }
 
+// The frame's pixels of the scene target into `target`, made at the scene target's size (the frame is the part of it
+// drawn in): a kept or source image trades places with the scene target's own (take_kept_image, take_source_image).
 bool GameBloom::copy_frame(Object commands, const Inputs& in, std::shared_ptr<Texture>& target, const char* name) {
-    if (!ensure(target, in.frame_width, in.frame_height, in.color->format, false, name)) {
+    if (!ensure(target, in.whole_width(), in.whole_height(), in.color->format, false, name)) {
         return false;
     }
     @autoreleasepool {
@@ -215,14 +219,22 @@ std::shared_ptr<Texture> GameBloom::take_kept_image() {
 
 void GameBloom::keep_picture(std::shared_ptr<Texture> picture) {
     keep_ = std::move(picture);
-    keep_used_ = clock_;
+    keep_used_ = idle_clock();
     kept_ = true;
 }
 
+std::shared_ptr<Texture> GameBloom::take_source_image() {
+    return std::move(source_);
+}
+
+void GameBloom::give_source(std::shared_ptr<Texture> picture) {
+    source_ = std::move(picture);
+    simple_used_ = idle_clock();
+    source_given_ = true;
+}
+
 void GameBloom::trim_idle() {
-    constexpr std::uint64_t kIdleFrames = 600u;
-    ++clock_;
-    const auto idle = [&](std::uint64_t used) { return clock_ > used + kIdleFrames; };
+    const auto idle = [&](std::uint64_t used) { return idle_since(used); };
     if (idle(keep_used_)) keep_.reset();
     if (idle(work_used_)) {
         for (std::shared_ptr<Texture>* t : {&work_, &box_tmp_, &mask_, &level1_, &blur_h_[0]}) t->reset();
@@ -239,7 +251,7 @@ void GameBloom::trim_idle() {
 bool GameBloom::keep(Object commands, const Inputs& in) {
     kept_ = ready_ && in.color != nullptr && in.frame_width != 0u && in.frame_height != 0u &&
             copy_frame(commands, in, keep_, "bloom kept scene");
-    keep_used_ = clock_;
+    keep_used_ = idle_clock();
     return kept_;
 }
 
@@ -259,15 +271,16 @@ void GameBloom::dispatch(Object compute_encoder, Program program, const Constant
 bool GameBloom::prepare(Object commands, const Inputs& in, const Params& p) {
     pending_ = false;
     const bool kept = std::exchange(kept_, false);
+    const bool given = std::exchange(source_given_, false);
     const bool restore = p.kind == Kind::Restore;
     const bool normal = p.kind == Kind::Normal;
     if (!ready_ || in.color == nullptr || in.frame_width == 0u || in.frame_height == 0u || ((normal || restore) && !kept)) {
         return false;
     }
-    keep_used_ = clock_;
+    keep_used_ = idle_clock();
     if (!restore) {
-        work_used_ = clock_;
-        (normal ? normal_used_ : simple_used_) = clock_;
+        work_used_ = idle_clock();
+        (normal ? normal_used_ : simple_used_) = idle_clock();
     }
     composite_width_ = in.frame_width;
     composite_height_ = in.frame_height;
@@ -278,25 +291,39 @@ bool GameBloom::prepare(Object commands, const Inputs& in, const Params& p) {
         pending_ = true;
         return true;
     }
+    if (bloom::adds_nothing(p.threshold, normal ? 0u : p.channel, p.tap1, p.intensity, p.strength)) {
+        // The scene alone (kind 0), no level made: the kept scene, or a copy of the frame (multisampled, where the
+        // composite writes every sample from the resolved frame). A given source is drawn back by the caller.
+        if (!normal && (given || !copy_frame(commands, in, source_, "bloom source"))) {
+            return false;
+        }
+        const Texture* const scene = normal ? keep_.get() : source_.get();
+        composite_inputs_[0] = composite_inputs_[1] = composite_inputs_[2] = scene;
+        pending_ = true;
+        return true;
+    }
     const bloom::Shape s = bloom::shape_of(in.frame_width, in.frame_height, in.scale);
+    // The images at the largest shape of every step the frame may take: a step change makes none again.
+    const bloom::Capacity cap = bloom::largest_shape(in.whole_width(), in.whole_height(), kAuthoredLines,
+                                                     in.lowest_sixteenths);
     const unsigned blurs1 = normal ? 2u : 1u;
     bool made = ensure(dummy_, 1u, 1u, kWorkFormat, true, "bloom unused slot") &&
                 ensure(dummy_out_, 1u, 1u, kWorkFormat, true, "bloom unused slot") &&
-                ensure(work_, s.w1, s.h1, kWorkFormat, true, "bloom work") &&
-                ensure(box_tmp_, s.w1, s.h1, kWorkFormat, true, "bloom box") &&
-                ensure(mask_, s.w1, s.h1, kWorkFormat, true, "bloom mask") &&
-                ensure(level1_, s.w1, s.h1, kWorkFormat, true, "bloom level 1");
+                ensure(work_, cap.w1, cap.h1, kWorkFormat, true, "bloom work") &&
+                ensure(box_tmp_, cap.w1, cap.h1, kWorkFormat, true, "bloom box") &&
+                ensure(mask_, cap.w1, cap.h1, kWorkFormat, true, "bloom mask") &&
+                ensure(level1_, cap.w1, cap.h1, kWorkFormat, true, "bloom level 1");
     for (unsigned i = 0; made && i < blurs1; ++i) {
-        made = ensure(blur_h_[i], s.w1, s.h1, kWorkFormat, true, "bloom level 1 blur");
+        made = ensure(blur_h_[i], cap.w1, cap.h1, kWorkFormat, true, "bloom level 1 blur");
     }
     if (made && normal) {
-        made = ensure(level2_in_, s.w2, s.h2, kWorkFormat, true, "bloom level 2 source") &&
-               ensure(level2_, s.w2, s.h2, kWorkFormat, true, "bloom level 2");
+        made = ensure(level2_in_, cap.w2, cap.h2, kWorkFormat, true, "bloom level 2 source") &&
+               ensure(level2_, cap.w2, cap.h2, kWorkFormat, true, "bloom level 2");
         for (unsigned i = 0; made && i < 3u; ++i) {
-            made = ensure(blur2_h_[i], s.w2, s.h2, kWorkFormat, true, "bloom level 2 blur");
+            made = ensure(blur2_h_[i], cap.w2, cap.h2, kWorkFormat, true, "bloom level 2 blur");
         }
     }
-    if (!made || (!normal && !copy_frame(commands, in, source_, "bloom source"))) {
+    if (!made || (!normal && !given && !copy_frame(commands, in, source_, "bloom source"))) {
         return false;
     }
     const bloom::Widths w = bloom::widths_of(normal, s, in.frame_width, in.frame_height, p.ring_x, p.ring_y);
@@ -383,15 +410,41 @@ bool GameBloom::prepare(Object commands, const Inputs& in, const Params& p) {
     c.params[0] = static_cast<float>(std::min(p.intensity, 255u)) / 255.0f;
     c.params[1] = std::max(p.strength, 0.0f);
     c.params[2] = normal ? 1.0f : 2.0f;
-    c.uv[0] = 1.0f / static_cast<float>(s.f * s.w1);
-    c.uv[1] = 1.0f / static_cast<float>(s.f * s.h1);
-    c.uv[2] = 1.0f / static_cast<float>(s.f * s.n * std::max(s.w2, 1u));
-    c.uv[3] = 1.0f / static_cast<float>(s.f * s.n * std::max(s.h2, 1u));
+    // The simple bloom's second level is level 1 again.
+    const bloom::CompositeUv uv = bloom::composite_uv(s, normal ? cap : bloom::Capacity{cap.w1, cap.h1, cap.w1, cap.h1});
+    std::copy(std::begin(uv.uv), std::end(uv.uv), c.uv);
+    std::copy(std::begin(uv.limit), std::end(uv.limit), c.sigma);
     composite_inputs_[0] = normal ? keep_.get() : source_.get();
     composite_inputs_[1] = level1_.get();
     composite_inputs_[2] = normal ? level2_.get() : level1_.get();
     pending_ = true;
     return true;
+}
+
+bool GameBloom::prepare_draw_back(Format color_format, unsigned samples) {
+    return ready_ && composite_pipeline(color_format, samples) != nullptr;
+}
+
+void GameBloom::draw_back(Object encoder, Format color_format, unsigned samples, const Texture& picture, unsigned width,
+                          unsigned height) {
+    const Object pipeline = composite_pipeline(color_format, samples);  // made by prepare_draw_back
+    const Constants constants{};  // kind 0: the picture alone
+    id<MTLRenderCommandEncoder> const pass = (__bridge id<MTLRenderCommandEncoder>)encoder;
+    [pass setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)pipeline];
+    [pass setDepthStencilState:(__bridge id<MTLDepthStencilState>)no_depth_];
+    [pass setCullMode:MTLCullModeNone];
+    [pass setTriangleFillMode:MTLTriangleFillModeFill];
+    [pass setDepthClipMode:MTLDepthClipModeClip];
+    [pass setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
+    for (unsigned i = 0; i < 3u; ++i) {
+        [pass setFragmentTexture:metal(&picture) atIndex:i];
+    }
+    [pass setFragmentSamplerState:(__bridge id<MTLSamplerState>)sampler_ atIndex:kLinearSampler];
+    [pass setVertexBytes:&constants length:sizeof(Constants) atIndex:kUtilityPushBuffer];
+    [pass setFragmentBytes:&constants length:sizeof(Constants) atIndex:kUtilityPushBuffer];
+    [pass setViewport:MTLViewport{0.0, 0.0, static_cast<double>(width), static_cast<double>(height), 0.0, 1.0}];
+    [pass setScissorRect:MTLScissorRect{0u, 0u, width, height}];
+    [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 }
 
 void GameBloom::finish(Object encoder, Format color_format, unsigned samples) {

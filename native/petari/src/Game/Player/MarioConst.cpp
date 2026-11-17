@@ -498,7 +498,9 @@ static const MarioConstTable cMarioConstDefault = {
     /* mLookShoulderMoveMax */ 8.0f,
     /* mRushInBlendTimer */ 4,
     /* mBrakeSlide */ 0,
-    /* mSwimSpinOxygen */ 0};
+    /* mSwimSpinOxygen */ 0,
+    /* mBinderRadius */ 60.0f,
+    /* mSensorRadius */ 100.0f};
 
 // Luigi plays as Mario does: both tables start from the same numbers. SMG's own for Luigi (lower traction, a longer
 // brake, a floatier jump, his Boo form's) are the built-in Character Movesets mod's (LumaLink-coop's
@@ -545,8 +547,7 @@ namespace {
         return NebulaCharacters::constTable(character);
     }
 
-    // A whole number of the field's kind: held at its ends (a cast past them is undefined), halves away from zero, as
-    // tunables store (Tunable.cpp).
+    // A whole number of the field's kind: held at its ends (a cast past them is undefined), halves away from zero.
     template < typename T >
     T clampTo(f32 value, f64 low, f64 high) {
         const f64 wide = value;

@@ -1,13 +1,15 @@
 #include "galaxy/portable.h"
 #include "galaxy/runtime_settings.h"
-
-#include <nebula_palette.hpp>
 #include "galaxy/atomic_file.h"
+#include "galaxy/benchmark.h"
 #include "galaxy/input_bindings.h"
+#include "galaxy/input/mod_actions.h"
 #include "galaxy/launch_args.h"
 #include "galaxy/platform_paths.h"
 #include "galaxy/game_instance.h"
 #include "galaxy/c_locale_number.h"
+
+#include <nebula_palette.hpp>
 
 #include <algorithm>
 #include <array>
@@ -170,12 +172,12 @@ RuntimeSettings sanitize_settings(RuntimeSettings settings) {
     if (settings.coop.character > CoopCharacter::Luigi) {
         settings.coop.character = CoopCharacter::Mario;
     }
-    settings.coop.character_id = clean_character_id(settings.coop.character_id);
     if (const auto palette = parse_coop_palette(settings.coop.palette)) {
         settings.coop.palette = format_coop_palette(*palette);
     } else {
         settings.coop.palette.clear();
     }
+    settings.coop.character_id = clean_character_id(settings.coop.character_id);
     if (settings.coop.character_id == "mario" || settings.coop.character_id == "luigi") settings.coop.character_id.clear();
     settings.coop.join_address = sanitize_coop_text(settings.coop.join_address, kCoopAddressLimit);
     // Only a web address: it is only ever connected to, never shown.
@@ -321,10 +323,10 @@ void apply_kv(RuntimeSettings& settings, const char* key, const char* value) {
         for (const CoopCharacter character : {CoopCharacter::Mario, CoopCharacter::Luigi}) {
             if (::galaxy::text_iequal(value, coop_character_key(character))) settings.coop.character = character;
         }
-    } else if (std::strcmp(key, "coop_character_id") == 0) {
-        settings.coop.character_id = value;
     } else if (std::strcmp(key, "coop_palette") == 0) {
         settings.coop.palette = value;
+    } else if (std::strcmp(key, "coop_character_id") == 0) {
+        settings.coop.character_id = value;
     } else if (std::strcmp(key, "coop_join_address") == 0) {
         settings.coop.join_address = value;
     } else if (std::strcmp(key, "coop_network") == 0) {
@@ -460,7 +462,8 @@ void parse_settings_file(RuntimeSettings& settings, input::ControlsConfig& contr
         const std::string value_text(trim(record.substr(equals + 1u)));
         if (key_text == "controls_version") {
             controls_version = static_cast<unsigned>(std::strtoul(value_text.c_str(), nullptr, 10));
-        } else if (!input::apply_controls_setting(controls, key_text, value_text)) {
+        } else if (!input::mod_actions::apply_setting(key_text, value_text) &&
+                   !input::apply_controls_setting(controls, key_text, value_text)) {
             apply_kv(settings, key_text.c_str(), value_text.c_str());
         }
     }
@@ -697,6 +700,9 @@ void load_runtime_settings_from_file() {
 }
 
 bool save_runtime_settings_to_file() {
+    if (galaxy::bench::running()) {
+        return false;  // a benchmark's settings are its own, never the player's file
+    }
     try {
         const RuntimeSettings settings = get_runtime_settings();
         const std::filesystem::path path = settings_path();
@@ -736,13 +742,13 @@ bool save_runtime_settings_to_file() {
             contents << "coop_max_players=" << settings.coop.max_players << '\n';
         }
         if (!settings.coop.player_name.empty()) contents << "coop_player_name=" << settings.coop.player_name << '\n';
+        if (!settings.coop.palette.empty()) contents << "coop_palette=" << settings.coop.palette << '\n';
         if (!settings.coop.room_name.empty()) contents << "coop_room_name=" << settings.coop.room_name << '\n';
         if (!settings.coop.password.empty()) contents << "coop_password=" << settings.coop.password << '\n';
         if (settings.coop.character != defaults.character) {
             contents << "coop_character=" << coop_character_key(settings.coop.character) << '\n';
         }
         if (!settings.coop.character_id.empty()) contents << "coop_character_id=" << settings.coop.character_id << '\n';
-        if (!settings.coop.palette.empty()) contents << "coop_palette=" << settings.coop.palette << '\n';
         if (!settings.coop.join_address.empty()) {
             contents << "coop_join_address=" << settings.coop.join_address << '\n';
         }
@@ -782,7 +788,7 @@ bool save_runtime_settings_to_file() {
             for (std::size_t i = 0; i < list->size(); ++i) contents << (i == 0u ? "" : ",") << (*list)[i];
             contents << '\n';
         }
-        contents << input::format_controls_settings(input::get_controls_config());
+        contents << input::format_controls_settings(input::get_controls_config()) << input::mod_actions::format_settings();
         if (!contents) {
             return false;
         }

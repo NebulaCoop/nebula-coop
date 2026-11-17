@@ -7,7 +7,7 @@
 /.vs/
 *.user
 
-# Anything derived from a game dump stays local (see docs/CONTENT_POLICY.md)
+# Anything derived from a game dump stays local (tools/audit_repo.ps1)
 /generated/
 # Co-op test instance (shared binary dir) and saves (repo-root, one per session)
 /instances/
@@ -27,3 +27,7 @@
 # Ignore generated coop script
 launch-coop.sh
 launch-coop.ps1
+# The developer's diagnostics endpoint and public key (runtime/include/galaxy/diag_endpoint.h).
+runtime/include/galaxy/diag_endpoint_local.h
+# Wrangler's local state (tools/telemetry/worker): the account it signed in with, its cache.
+.wrangler/

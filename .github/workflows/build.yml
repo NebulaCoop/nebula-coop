@@ -33,10 +33,12 @@ env:
 
 jobs:
   # Sorts the changed files into what they affect:
-  #   game:      the host, the game module, the disc import tool and the Windows, Linux and Android test builds;
-  #   installer: the launcher, Nebula Settings and Setup (installer/), and their tests.
+  #   game:      the host, the game module, the disc import tool and the Windows, Linux and macOS test builds;
+  #   android:   the Android test build: shared code and platform/android. A change to platform/android alone
+  #              builds Android only;
+  #   installer: Nebula Setup and the install root's Nebula.exe (installer/native), compiled.
   # Documentation, the other workflows, NebulaNet and tools/ affect neither. A file both use (the icon the host and
-  # the launcher are both built with, the save format version the launcher reads) and this workflow itself run both.
+  # Setup are both built with, the store version Setup writes) and this workflow itself run both.
   # Run workflow builds everything.
   changes:
     name: Changes
@@ -48,6 +50,7 @@ jobs:
     outputs:
       game: ${{ steps.filter.outputs.game }}
       installer: ${{ steps.filter.outputs.installer }}
+      android: ${{ steps.filter.outputs.android }}
     steps:
       - uses: actions/Checkout@v7
         if: github.event_name != 'workflow_dispatch'
@@ -61,7 +64,7 @@ jobs:
         run: |
           all() {
             echo "Building everything: $1"
-            { echo game=true; echo installer=true; } >> "$GITHUB_OUTPUT"
+            { echo game=true; echo installer=true; echo android=true; } >> "$GITHUB_OUTPUT"
             exit 0
           }
           # The commit of the newest finished Build of main whose Build result passed. A push is compared with it, not
@@ -98,22 +101,25 @@ jobs:
           esac
           game=false
           installer=false
+          android=false
           while IFS= read -r file; do
             case "$file" in
               "") ;;
-              .github/workflows/build.yml) game=true; installer=true ;;
+              .github/workflows/build.yml) game=true; installer=true; android=true ;;
+              # The Android port alone: nothing else is built for it.
+              platform/android/*) android=true ;;
               # The lumalink submodule's commit carries the built-in mods the host embeds.
-              lumalink) game=true ;;
+              lumalink) game=true; android=true ;;
               *.md | docs/* | LICENSE | .github/* | nebulanet/* | web/* | tools/*) ;;
-              installer/assets/* | runtime/include/galaxy/store_version.inc) game=true; installer=true ;;
+              installer/assets/* | runtime/include/galaxy/store_version.inc) game=true; installer=true; android=true ;;
               installer/*) installer=true ;;
-              *) game=true ;;
+              *) game=true; android=true ;;
             esac
           done <<< "$files"
           echo "$(printf '%s\n' "$files" | grep -c .) changed files, the first 100:"
           printf '%s\n' "$files" | head -n 100 | sed 's/^/  /'
-          echo "Game: $game. Installer: $installer."
-          { echo "game=$game"; echo "installer=$installer"; } >> "$GITHUB_OUTPUT"
+          echo "Game: $game. Installer: $installer. Android: $android."
+          { echo "game=$game"; echo "installer=$installer"; echo "android=$android"; } >> "$GITHUB_OUTPUT"
 
   import:
     name: Disc import tool (Rust)
@@ -199,8 +205,8 @@ jobs:
         with:
           name: windows-hosts
           path: |
-            build/host/NebulaNative.exe
-            build/host/NebulaNativeVk.exe
+            build/host/Nebula.exe
+            build/host/NebulaVk.exe
           retention-days: 1
           if-no-files-found: error
       # The shader tools the Android build runs on this machine (platform/sdl's NEBULA_HOST_TOOLS).
@@ -222,13 +228,24 @@ jobs:
     env:
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       SCCACHE_GHA_ENABLED: "true"
+      LLVM_VERSION: '22.1.6'
     steps:
       - uses: actions/Checkout@v7
       # The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake).
       - name: Built-in mods
         run: git submodule update --init --depth 1 lumalink
-      - name: Clang version
-        run: '& "C:\Program Files\LLVM\bin\clang.exe" --version'
+      - name: LLVM
+        # The row generator needs libclang 21 or later (tools/lumacore/instrument.py); the runner's is older. The
+        # release's LLVM, as release.yml's game job takes it.
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o llvm.tar.xz \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/clang+llvm-$LLVM_VERSION-x86_64-pc-windows-msvc.tar.xz"
+          mkdir llvm
+          tar -xJf llvm.tar.xz -C llvm --strip-components=1
+          rm llvm.tar.xz
+          llvm/bin/clang --version
       # Archive deps (zlib, xz, libarchive) built at configure time: skip when already built.
       - name: Cache configure-time dependencies
         uses: actions/cache@v6
@@ -240,7 +257,7 @@ jobs:
       - name: Start sccache
         run: sccache --start-server
       - name: Build
-        run: .\native\build.ps1 -Petari native\petari -Build build\game
+        run: .\native\build.ps1 -Petari native\petari -Build build\game -Llvm (Join-Path $env:RUNNER_TEMP 'llvm\bin')
       - uses: actions/upload-artifact@v7
         with:
           name: windows-game-module
@@ -316,12 +333,21 @@ jobs:
         run: |
           cmake -S platform/sdl -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release "-DNEBULA_DEPS=$PWD/deps"
           cmake --build build/host --target main
+      - name: LLVM 22
+        # The game module's row generator needs libclang 22, as the release's game build uses (tools/lumacore/gen_types.py reads some member types
+        # differently with 21); Ubuntu 24.04 has 18.
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm-22.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-22 libclang1-22 libclang-common-22-dev
       - name: Game module
         env:
-          CC: clang
-          CXX: clang++
+          CC: clang-22
+          CXX: clang++-22
         run: |
-          cmake -S native -B build/game -G Ninja -DCMAKE_BUILD_TYPE=Release
+          # apt.llvm.org names its libclang libclang-22.so.1, which the row generator does not find beside the compiler.
+          cmake -S native -B build/game -G Ninja -DCMAKE_BUILD_TYPE=Release -DNEBULA_LIBCLANG=/usr/lib/llvm-22/lib/libclang-22.so.1
           cmake --build build/game --target smg_game
       - name: Disc import tool
         run: cargo build --release --locked -p nebula-import --bin nebula-import
@@ -329,9 +355,9 @@ jobs:
         # The program finds libSDL3 and the game module beside it.
         run: |
           mkdir -p dist
-          cp build/host/nebula dist/NebulaNative
-          cp -L build/host/SDL3/libSDL3.so.0 build/game/libsmg_game.so target/release/nebula-import dist/
-          patchelf --set-rpath '$ORIGIN' dist/NebulaNative
+          cp build/host/nebula dist/Nebula
+          cp -L build/host/libSDL3.so.0 build/game/libsmg_game.so target/release/nebula-import dist/
+          patchelf --set-rpath '$ORIGIN' dist/Nebula
           cp LICENSE THIRD-PARTY-NOTICES.md docs/TEST_BUILDS.md dist/
           # Artifacts drop file modes: a tar keeps the programs executable.
           tar -C dist -czf nebula-linux-x64.tar.gz .
@@ -344,10 +370,12 @@ jobs:
 
   android:
     name: Android
-    # The Vulkan host build's shader tools compile the SPIR-V the APK carries.
-    # Also needs the game module: if it doesn't build, the APK is useless.
+    # The Vulkan host build's shader tools compile the SPIR-V the APK carries; on a change to platform/android alone
+    # the host isn't built, so this job builds the two tools itself. A failed host or game module stops it.
     needs: [changes, host, game]
-    if: needs.changes.outputs.game == 'true'
+    if: >-
+      always() && needs.changes.outputs.android == 'true' &&
+      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: windows-2025
     steps:
       - uses: actions/Checkout@v7
@@ -378,10 +406,33 @@ jobs:
           clone KhronosGroup/glslang "$GLSLANG_TAG" glslang-src
           pin KhronosGroup/SPIRV-Tools "$SPIRV_TOOLS_COMMIT" glslang-src/External/spirv-tools
           pin KhronosGroup/SPIRV-Headers "$SPIRV_HEADERS_COMMIT" glslang-src/External/spirv-tools/external/spirv-headers
-      - uses: actions/download-artifact@v8
+      - if: needs.host.result == 'success'
+        uses: actions/download-artifact@v8
         with:
           name: spirv-tools
           path: build/spirv-tools
+      - if: needs.host.result != 'success'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - if: needs.host.result != 'success'
+        name: Cache configure-time dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/host/archive-deps
+            build/host/fidelityfx.built
+            build/host/_deps
+          key: host-deps-ON-${{ hashFiles('cmake/**', 'third_party/archive/**') }}
+      - if: needs.host.result != 'success'
+        name: Shader tools
+        run: |
+          cmake -S . -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release -DNEBULA_VULKAN=ON -DNEBULA_HOST_IPO=OFF
+          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
+          cmake --build build/host --target galaxy_native_spirv galaxy_utility_spirv
+          if ($LASTEXITCODE -ne 0) { throw "the shader tools did not build" }
+          New-Item -ItemType Directory -Force build/spirv-tools | Out-Null
+          Copy-Item build/host/galaxy_native_spirv.exe, build/host/galaxy_utility_spirv.exe build/spirv-tools
       - name: APK
         # Debug-signed: no -Signing.
         run: |
@@ -405,7 +456,7 @@ jobs:
 
   macos:
     name: macOS
-    # Apple silicon only (the runner's own processor), as platform/apple/build_macos.sh builds it (docs/APPLE.md):
+    # Apple silicon only (the runner's own processor), as platform/apple/build_macos.sh builds it:
     # the Metal renderer, Apple's host and the game module, packed as Nebula.app. Not in Build result's needs: the
     # Mac port isn't finished, so it doesn't block a merge.
     # Also needs the game module job: if it doesn't build, the app is useless.
@@ -413,7 +464,7 @@ jobs:
     if: needs.changes.outputs.game == 'true'
     runs-on: macos-15
     env:
-      # docs/APPLE.md, "Toolchain": LLVM 19 (LLVM's own macOS package), and libc++ built from the same release.
+      # LLVM 19 (LLVM's own macOS package), and libc++ built from the same release.
       LLVM_VERSION: 19.1.7
       MOLTENVK_TAG: v1.4.2
     steps:
@@ -483,22 +534,38 @@ jobs:
     needs: changes
     if: needs.changes.outputs.installer == 'true'
     runs-on: windows-2025
-    # Windows PowerShell, as the scripts are run by hand: they compile with the in-box .NET Framework csc.exe and load
-    # its System.Drawing.
-    defaults:
-      run:
-        shell: powershell
     steps:
       - uses: actions/Checkout@v7
-      # The launcher's first start, settings form, launch arguments and folder moves, Setup's cases, and nebula.ico in
-      # every executable: against a stub game, with its own %LOCALAPPDATA%.
-      - name: Launcher and Setup
-        run: .\installer\tests\run-launcher-tests.ps1
-      - name: Update channels
-        run: .\installer\tests\run-beta-updater-tests.ps1
-      # The update path end to end on a local release server, with a signing key made for the run.
-      - name: Update flow
-        run: .\installer\tests\run-update-flow-tests.ps1
+      # Setup and the install root's Nebula.exe (installer/native) compiled as build-native-setup.ps1 compiles them, with
+      # warnings as errors, against a stand-in build_info.h: the release build needs a whole game to pack, this does not.
+      - name: Native Setup compiles
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\tools\enter_msvc_environment.ps1
+          $gen = Join-Path $env:RUNNER_TEMP 'setup-gen'
+          $obj = Join-Path $env:RUNNER_TEMP 'setup-obj'
+          New-Item -ItemType Directory -Force $gen, $obj | Out-Null
+          $key = (Get-Content -Raw installer\release-public-key.xml).Trim().Replace('\', '\\').Replace('"', '\"')
+          $store = (Get-Content -Raw runtime\include\galaxy\store_version.inc).Trim()
+          Set-Content -Encoding utf8 (Join-Path $gen 'build_info.h') @"
+          #pragma once
+          namespace nebula::build {
+          inline constexpr const wchar_t kVersion[] = L"0.0.0-ci";
+          inline constexpr const wchar_t kFileVersion[] = L"0.0.0.0";
+          inline constexpr const wchar_t kCommit[] = L"$env:GITHUB_SHA";
+          inline constexpr const wchar_t kRepository[] = L"$env:GITHUB_REPOSITORY";
+          inline constexpr const wchar_t kReleasePublicKeyXml[] = L"$key";
+          inline constexpr unsigned kStoreVersion = $store;
+          }
+          "@
+          $cxx = @('/nologo', '/c', '/std:c++20', '/O2', '/MT', '/DNDEBUG', '/EHsc', '/W4', '/WX', '/permissive-', '/utf-8', '/Zc:__cplusplus',
+              '/GS', '/guard:cf', '/DUNICODE', '/D_UNICODE', '/D_WIN32_WINNT=0x0A00', '/DWINVER=0x0A00', "/I$gen", '/Iinstaller\native',
+              '/Ithird_party\miniz')
+          foreach ($name in 'common', 'archive', 'ui', 'text', 'setup', 'setup_engine', 'start') {
+              & cl.exe @cxx "/Fo$(Join-Path $obj "$name.obj")" "installer\native\$name.cpp"
+              if ($LASTEXITCODE -ne 0) { throw "$name.cpp did not compile" }
+          }
 
   # The one check to require before merging: it fails when the Windows build (host, game module, disc import tool and
   # the test build put together from them) or the installer tests failed or were cancelled, and passes when they passed

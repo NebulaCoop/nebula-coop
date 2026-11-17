@@ -6,6 +6,7 @@
 
 #include "galaxy/windows_api.h"
 
+#include "galaxy/render/block4_astc.h"
 #include "galaxy/render/render_core.h"
 #include "galaxy/render/texture_store.h"
 #include "galaxy/render/texture_pack.h"
@@ -157,26 +158,142 @@ void test_png(const std::filesystem::path& root) {
                pixels.height == 5u && pixels.levels.size() == 3u && pixels.levels[0] == rgba &&
                pixels.levels[1].size() == 3u * 2u * 4u && pixels.levels[2].size() == 4u,
            "PNG round trip, levels down to 1x1");
+    // Generated levels, exact: an opaque box (rounded mean), a mixed-alpha box (alpha-weighted colour), then a 2x1 to 1x1 edge.
+    const std::vector<std::uint8_t> boxes{10, 20, 30, 255, 14, 24, 34, 255, 255, 0, 0, 128, 0, 255, 0, 0,
+                                          12, 22, 32, 255, 16, 26, 36, 255, 0, 0, 255, 64, 0, 0, 0, 0};
+    expect(write_png(root / "boxes.png", 4u, 2u, boxes.data()), "PNG written");
+    expect(load_texture_pack_image(root / "boxes.png", false, pixels, &error) && pixels.levels.size() == 3u &&
+               pixels.levels[1] == std::vector<std::uint8_t>{13, 23, 33, 255, 170, 0, 85, 48} &&
+               pixels.levels[2] == std::vector<std::uint8_t>{38, 19, 41, 152},
+           "generated levels box the level above exactly");
     { std::ofstream out(root / "bad.png"); out << "not a png"; }
     expect(!load_texture_pack_image(root / "bad.png", false, pixels, &error) && !error.empty(),
            "a broken PNG is refused with a reason");
 }
 
+// The pictures the mod check reads (crates/nebula-import cook/pack_texture.rs), each taken or refused by the pack
+// reader as answers.tsv says, so the check says what this reader does.
+void test_pack_pictures() {
+    const std::filesystem::path folder = NEBULA_PACK_PICTURES;
+    std::ifstream answers(folder / "answers.tsv");
+    std::string line;
+    std::getline(answers, line);
+    int count = 0;
+    while (std::getline(answers, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const std::size_t tab = line.find('\t');
+        if (tab == std::string::npos) continue;
+        const std::string file = line.substr(0, tab);
+        const bool taken = line.substr(tab + 1u) == "1";
+        const bool dds = file.size() > 4u && file.substr(file.size() - 4u) == ".dds";
+        TexturePackPixels pixels;
+        std::string error;
+        const bool loaded = load_texture_pack_image(folder / file, dds, pixels, &error);
+        if (loaded != taken) std::cerr << "pack picture " << file << ": " << (loaded ? "taken" : error) << '\n';
+        expect(loaded == taken, "a pack picture is taken or refused as the mod check says");
+        ++count;
+    }
+    expect(count == 23, "every pack picture is read");
+}
+
 void test_sampler_shift() {
     TextureSampler mode{};
     mode.mag_linear = mode.min_linear = true;
-    auto key = make_sampler_key(mode, false, 9u, 2.0f);
+    auto key = make_sampler_key(mode, 9u, 2.0f);
     expect(key.max_lod == 2.0f && key.min_lod == 0.0f && ((key.filter >> 5u) & 7u) == 6u,
            "mip-less texture replacement samples down to its source size");
     mode.mip = 2; mode.min_lod = 0.5f; mode.max_lod = 3.0f;
-    key = make_sampler_key(mode, false, 9u, 2.0f);
+    key = make_sampler_key(mode, 9u, 2.0f);
     expect(key.min_lod == 2.5f && key.max_lod == 5.0f, "authored LOD range follows the replacement scale");
     mode.min_lod = 0.0f;
-    key = make_sampler_key(mode, false, 9u, 2.0f);
+    key = make_sampler_key(mode, 9u, 2.0f);
     expect(key.min_lod == 0.0f, "close-up replacement base level remains visible");
-    key = make_sampler_key(mode, false, 11u, 3.0f, true, 2.0f);
+    key = make_sampler_key(mode, 11u, 3.0f, true, 2.0f);
     expect(key.lod_bias == -1.0f && key.max_lod == 10.0f && ((key.filter >> 5u) & 7u) == 7u,
            "arbitrary replacement levels pair by authored index across the full chain");
+    key = make_sampler_key(mode, 11u, 3.0f, true, 2.0f, -1.5f);
+    expect(key.lod_bias == -1.0f && (key.filter & kSamplerAuthoredLevels) != 0u,
+           "arbitrary replacement levels leave out the scene's bias and are marked drawn by hand");
+}
+
+// Levels drawn by hand: found by their mean colour and coverage, and sampled as the game sampled them.
+void test_authored_levels() {
+    // A 16x16 RGBA8 chain of three levels (16, 8, 4) from a fill per level.
+    const auto chain = [](const std::vector<RGBA8>& fills) {
+        std::vector<std::uint8_t> texels;
+        for (std::uint32_t l = 0; l < fills.size(); ++l) {
+            const std::uint32_t side = 16u >> l;
+            for (std::uint32_t i = 0; i < side * side; ++i) {
+                // A checker in the first level whose smaller copies are its mean.
+                RGBA8 c = fills[l];
+                if (l == 0u && ((i % side) + i / side) % 2u == 1u) {
+                    c = RGBA8{static_cast<std::uint8_t>(c.r + 20u), static_cast<std::uint8_t>(c.g + 20u),
+                              static_cast<std::uint8_t>(c.b + 20u), c.a};
+                } else if (l == 0u) {
+                    c = RGBA8{static_cast<std::uint8_t>(c.r - 20u), static_cast<std::uint8_t>(c.g - 20u),
+                              static_cast<std::uint8_t>(c.b - 20u), c.a};
+                }
+                texels.insert(texels.end(), {c.r, c.g, c.b, c.a});
+            }
+        }
+        return texels;
+    };
+    const RGBA8 sand{200, 180, 120, 255};
+    auto texels = chain({sand, sand, sand});
+    expect(!detail::authored_levels(NEBULA_TEXTURE_RGBA8, texels.data(), 16u, 16u, 3u),
+           "smaller copies of the first level are not drawn by hand");
+    texels = chain({sand, sand, RGBA8{60, 140, 200, 255}});
+    expect(detail::authored_levels(NEBULA_TEXTURE_RGBA8, texels.data(), 16u, 16u, 3u),
+           "a level tinted for the distance is drawn by hand");
+    texels = chain({sand, RGBA8{200, 180, 120, 120}, RGBA8{200, 180, 120, 40}});
+    expect(detail::authored_levels(NEBULA_TEXTURE_RGBA8, texels.data(), 16u, 16u, 3u),
+           "levels fading out for the distance are drawn by hand");
+    // An 8x8 first level of 2x2 tiles from `tile` and a 4x4 second level of `second`.
+    const auto tiles = [](const RGBA8 (&tile)[4], RGBA8 second) {
+        std::vector<std::uint8_t> out;
+        for (std::uint32_t i = 0; i < 64u; ++i) {
+            const RGBA8 c = tile[(i / 8u % 2u) * 2u + i % 2u];
+            out.insert(out.end(), {c.r, c.g, c.b, c.a});
+        }
+        for (std::uint32_t i = 0; i < 16u; ++i) {
+            out.insert(out.end(), {second.r, second.g, second.b, second.a});
+        }
+        return out;
+    };
+    const RGBA8 black{0, 0, 0, 255}, white{255, 255, 255, 255}, red{255, 0, 0, 255}, clear{255, 255, 255, 0};
+    texels = tiles({black, white, white, black}, RGBA8{188, 188, 188, 255});
+    expect(!detail::authored_levels(NEBULA_TEXTURE_RGBA8, texels.data(), 8u, 8u, 2u),
+           "a copy made in linear light (half black, half white: 188) is not drawn by hand");
+    texels = tiles({black, white, white, black}, RGBA8{40, 40, 40, 255});
+    expect(detail::authored_levels(NEBULA_TEXTURE_RGBA8, texels.data(), 8u, 8u, 2u),
+           "a level darker than any copy is drawn by hand");
+    texels = tiles({red, clear, clear, red}, red);
+    expect(!detail::authored_levels(NEBULA_TEXTURE_RGBA8, texels.data(), 8u, 8u, 2u),
+           "a premultiplied copy whose one-bit alpha is cut at half again is not drawn by hand");
+    texels = chain({sand, sand, RGBA8{0, 0, 0, 0}});
+    expect(detail::authored_levels(NEBULA_TEXTURE_RGBA8, texels.data(), 16u, 16u, 2u) == false,
+           "a level past the record's count is not read");
+    // L8 whose second level is darker (its alpha too).
+    std::vector<std::uint8_t> l8(16u * 16u + 8u * 8u, 200u);
+    std::fill(l8.begin() + 16 * 16, l8.end(), 120u);
+    expect(detail::authored_levels(NEBULA_TEXTURE_L8, l8.data(), 16u, 16u, 2u), "an L8 level drawn darker is found");
+    expect(!detail::authored_levels(NEBULA_TEXTURE_L8, l8.data(), 16u, 16u, 1u), "one level is never drawn by hand");
+
+    TextureSampler mode{};
+    mode.mag_linear = mode.min_linear = true;
+    mode.mip = 1;
+    mode.max_lod = 4.0f;
+    mode.lod_bias = 0.25f;
+    const SamplerKey key = make_sampler_key(mode, 5u, 0.0f, false, 1.5f, -1.0f, true);
+    expect(key.lod_bias == 1.75f && key.max_lod == 4.0f && ((key.filter >> 5u) & 7u) == 5u &&
+               (key.filter & kSamplerAuthoredLevels) != 0u,
+           "the game's levels drawn by hand keep its range and level filter at the authored lines, without the scene's bias");
+    const SamplerKey plain = make_sampler_key(mode, 5u, 0.0f, false, 1.5f, -1.0f, false);
+    expect(plain.lod_bias == -0.75f && (plain.filter & kSamplerAuthoredLevels) == 0u,
+           "smaller copies take the scene's bias and no authored lines");
+    mode.mip = 0;
+    expect((make_sampler_key(mode, 5u, 0.0f, false, 1.5f, -1.0f, true).filter & kSamplerAuthoredLevels) == 0u,
+           "a sampler reading the first level only has no levels to choose");
 }
 
 struct Gpu {
@@ -501,6 +618,49 @@ void test_cache(Gpu& gpu, const std::filesystem::path& root) {
 
 }  // namespace
 
+// BLOCK4 blocks as ASTC 4x4: two blocks against bytes an independent decoder of the ASTC specification decodes to the
+// record's colours (within the header's bound), and every block back to itself.
+void test_block4_astc() {
+    namespace astc = galaxy::render::block4_astc;
+    const std::uint8_t four[8] = {0x00, 0xF8, 0x1F, 0x00, 0xE4, 0xE4, 0xE4, 0xE4};
+    const std::uint8_t four_astc[16] = {0x43, 0x00, 0xFF, 0x01, 0x00, 0x00, 0x00, 0xFE,
+                                        0x01, 0x00, 0x40, 0x39, 0x8D, 0x70, 0xA4, 0x70};
+    const std::uint8_t three[8] = {0x1F, 0x00, 0x00, 0xF8, 0x24, 0x49, 0x92, 0x24};
+    const std::uint8_t three_astc[16] = {0x51, 0x00, 0x01, 0xFE, 0x01, 0x00, 0xFE, 0x01,
+                                         0x00, 0x00, 0x00, 0x00, 0x00, 0x63, 0xE4, 0x1E};
+    std::uint8_t out[16];
+    astc::from_block4(four, out);
+    expect(std::memcmp(out, four_astc, 16) == 0, "a four-colour block as ASTC");
+    astc::from_block4(three, out);
+    expect(std::memcmp(out, three_astc, 16) == 0, "a three-colour block as ASTC");
+    std::uint32_t state = 12345u;
+    bool round_trip = true;
+    for (unsigned n = 0; n < 20000u; ++n) {
+        std::uint8_t block[8];
+        for (auto& byte : block) {
+            state = state * 1664525u + 1013904223u;
+            byte = static_cast<std::uint8_t>(state >> 24);
+        }
+        if (n % 4u == 0u) {
+            block[2] = block[0];
+            block[3] = block[1];
+        }
+        // The record's blocks are opaque (texture.rs blocks_opaque): a three-colour block has no index 3.
+        const unsigned c0 = block[0] | block[1] << 8, c1 = block[2] | block[3] << 8;
+        if (c0 <= c1) {
+            for (unsigned k = 4; k < 8u; ++k) {
+                const unsigned threes = block[k] & block[k] >> 1 & 0x55u;
+                block[k] = static_cast<std::uint8_t>(block[k] & ~threes);
+            }
+        }
+        std::uint8_t back[8];
+        astc::from_block4(block, out);
+        astc::to_block4(out, back);
+        round_trip = round_trip && std::memcmp(back, block, 8) == 0;
+    }
+    expect(round_trip, "every block back to itself");
+}
+
 // A category off leaves its textures out of a pack's index; the others stay.
 void test_categories_off() {
     const std::filesystem::path root = galaxy::test_temp_path("nebula_pack_categories");
@@ -531,7 +691,10 @@ int main() {
     std::filesystem::create_directories(root);
     test_dds(root);
     test_png(root);
+    test_pack_pictures();
     test_sampler_shift();
+    test_authored_levels();
+    test_block4_astc();
     test_priority(root);
     Gpu gpu;
     if (!gpu.create()) {

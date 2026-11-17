@@ -35,6 +35,12 @@ public:
                     VkRenderPass window_pass);
     // The swap chain's render pass (made again when its format changes): the chain's last pass draws in it.
     void set_present_pass(VkRenderPass pass);
+    // The pictures between passes and the passes into the scene target: RGBA16F while `wide` (HDR output, the scene's light
+    // past white kept to the last write), else the scene's 10-bit format; `scene_pass` and `color_pass` are the
+    // renderer's passes over that format. Between frames with the GPU done with the old pipelines (they are destroyed
+    // deferred), the chain ready.
+    void set_wide(bool wide, VkRenderPass scene_pass, VkRenderPass color_pass);
+    [[nodiscard]] bool wide() const noexcept { return color_format_ == VK_FORMAT_R16G16B16A16_SFLOAT; }
     void shutdown() noexcept;
     // Once the worker has finished: builds the pipelines and runs the SMAA and FXAA self-tests (a submission the
     // render thread waits for), so status() is final. True when the chain is ready.
@@ -45,15 +51,27 @@ public:
     // New settings between frames; an SMAA quality change rebuilds its two pipelines.
     void apply_settings(const PostProcessSettings& settings);
 
+    // The scene target's image traded for `spare` (RendererVk::swap_scene_color): the scene's own image comes back,
+    // shader-readable, and the scene target goes on in `spare` (or one made for it), its old contents dropped.
+    using SceneTrade = std::function<std::shared_ptr<Texture>(std::shared_ptr<Texture> spare)>;
+
     // Scene AA of the scene target colour `color` (RGBA8, COLOR_ATTACHMENT_OPTIMAL, no render pass open), in two parts
     // around the renderer beginning its scene target pass again: prepare_scene_aa records the passes before (a copy of the
     // scene, SMAA's edges and weights) and returns the pass to finish with; finish_scene_aa draws the result into the
-    // open scene target pass, RGB only (the alpha the game left there stays).
+    // open scene target pass, RGB only (the alpha the game left there stays). With `trade` (a single-sample scene) a pass
+    // that runs reads the scene's own image instead of a copy, and finish_scene_aa writes every pixel and channel of
+    // the image that took its place (the alpha the scene's): the scene target pass may open without loading it.
+    // `width` x `height` is the scene target's size, `picture_width` x `picture_height` the part of it the picture is
+    // drawn in from its top left (dynamic resolution's rectangle; the whole target without it): the passes work in that
+    // part and read no further, their targets staying the target's size so a step change makes none again.
     AaRun prepare_scene_aa(VkCommandBuffer commands, const Texture& color, unsigned width, unsigned height,
                            unsigned picture_width, unsigned picture_height, unsigned display_width,
-                           unsigned display_height, const SetAllocator& allocate);
+                           unsigned display_height, const SetAllocator& allocate, const SceneTrade& trade = {});
     void finish_scene_aa(VkCommandBuffer commands, AaRun pass, unsigned width, unsigned height,
                          const SetAllocator& allocate, VkRenderPass scene_pass, unsigned samples_log2);
+    // The last prepare_scene_aa traded the scene's image: its finish writes all of the scene target that is read (the
+    // picture's part).
+    [[nodiscard]] bool scene_traded() const noexcept { return scene_traded_; }
     // The scaling chain from `source` (shader-readable) to a `target_width` x `target_height` picture: prepare
     // records the passes outside the target's render pass (into the window-sized intermediate); finish draws the
     // last one in the target's pass (the present pass when `present`, else the RGBA8 pass, dithered either way) at `viewport`, whose
@@ -63,17 +81,22 @@ public:
         VkPipeline pipeline = VK_NULL_HANDLE;
         VkImageView input = VK_NULL_HANDLE;
         PostConstants constants{};
+        unsigned width = 0;  // the target size prepare_present was given
+        unsigned height = 0;
     };
     PresentStep prepare_present(VkCommandBuffer commands, const Texture& source, unsigned source_width,
                                 unsigned source_height, unsigned target_width, unsigned target_height,
                                 bool present, const SetAllocator& allocate);
     // `output.hdr`: the target is an HDR10 swap chain image (the present pass made for its format); the default is the 8-bit
-    // window's write.
+    // window's write. `quarter_turns`: the target is turned by 1-3 quarter turns clockwise (a pre-rotated swap chain image;
+    // `viewport` is then the turned rectangle), and the pass writes each of its pixels from the picture's turned-back one.
     void finish_present(VkCommandBuffer commands, const PresentStep& step, const VkRect2D& viewport,
-                        const SetAllocator& allocate, const PostOutput& output = PostOutput{});
+                        const SetAllocator& allocate, const PostOutput& output = PostOutput{},
+                        unsigned quarter_turns = 0u);
     // The chain's pipelines into the present pass exist (an HDR10 swap chain needs them: nothing else writes its encoding).
     [[nodiscard]] bool present_ready() const noexcept {
-        return to_present_.rcas != VK_NULL_HANDLE && to_present_.rcas_scaled != VK_NULL_HANDLE && to_present_.resample != VK_NULL_HANDLE;
+        return to_present_.rcas != VK_NULL_HANDLE && to_present_.rcas_scaled != VK_NULL_HANDLE && to_present_.resample != VK_NULL_HANDLE &&
+               to_present_.copy != VK_NULL_HANDLE;
     }
 
 private:
@@ -88,7 +111,7 @@ private:
         std::shared_ptr<Texture> texture;  // its framebuffer is the pass's (with the stencil for edges and weights)
         unsigned width = 0;
         unsigned height = 0;
-        std::uint64_t used = 0;  // clock_ when a pass last asked for it
+        std::uint64_t used = 0;  // idle_clock() when a pass last asked for it
     };
     // Target pipelines by the render pass they draw in.
     struct PassPipelines {
@@ -96,6 +119,7 @@ private:
         VkPipeline rcas = VK_NULL_HANDLE;
         VkPipeline rcas_scaled = VK_NULL_HANDLE;
         VkPipeline resample = VK_NULL_HANDLE;
+        VkPipeline copy = VK_NULL_HANDLE;  // the resample at 1:1 (PostProcessPlan::copy)
     };
 
     VkShaderModule module(Program program) const;
@@ -110,11 +134,15 @@ private:
                        bool with_stencil);
     // SMAA's edges and weights with the stencil both their framebuffers hold, made together.
     bool ensure_smaa_targets(unsigned width, unsigned height);
-    // Hands back the targets no pass has asked for in 600 scene AA calls (SMAA's after a switch to FXAA or off, the scaling
+    // Hands back the targets no pass has asked for in kIdleSteps game steps (idle_clock.h) (SMAA's after a switch to FXAA or off, the scaling
     // intermediate after a window size that needs none); the next pass that wants one makes it again.
     void trim_idle_targets();
+    // SMAA's edges and weights over the picture's part (`part_width` x `part_height`) of a `width` x `height` input.
     bool record_aa(VkCommandBuffer commands, AaRun pass, VkImageView source, unsigned width, unsigned height,
-                   const SetAllocator& allocate);
+                   unsigned part_width, unsigned part_height, const SetAllocator& allocate);
+    // The picture's part the last prepare_scene_aa worked in, which its finish draws.
+    unsigned part_width_ = 0u;
+    unsigned part_height_ = 0u;
     void begin_pass(VkCommandBuffer commands, VkRenderPass pass, const Target& target, bool clear_stencil) const;
     void draw(VkCommandBuffer commands, VkPipeline pipeline, std::initializer_list<VkImageView> inputs,
               const VkRect2D& viewport, const PostConstants& constants, const SetAllocator& allocate,
@@ -127,9 +155,12 @@ private:
     bool built_ = false;
     bool to_build_ = false;  // initialized: poll_ready makes the pipelines
     unsigned spirv_quality_ = 0;  // the SMAA quality module() takes the quality-dependent programs at
-    bool easu_ = false;  // the device has EASU's single-channel gathers
     VkRenderPass scene_pass_ = VK_NULL_HANDLE;
     VkRenderPass color_pass_ = VK_NULL_HANDLE;
+    VkFormat color_format_ = VK_FORMAT_A2B10G10R10_UNORM_PACK32;  // the pictures between passes (set_wide)
+    // The pipelines into the colour and scene target passes (made with them, by set_wide again).
+    void build_scene_pipelines();
+    void destroy_scene_pipelines() noexcept;
     VkRenderPass window_pass_ = VK_NULL_HANDLE;
     VkRenderPass present_pass_ = VK_NULL_HANDLE;
     VkFormat stencil_format_ = VK_FORMAT_UNDEFINED;
@@ -150,6 +181,9 @@ private:
     VkPipeline smaa_blend_rgb_ = VK_NULL_HANDLE;  // scene target pass, RGB only
     VkPipeline fxaa_ = VK_NULL_HANDLE;
     VkPipeline fxaa_rgb_ = VK_NULL_HANDLE;
+    // The same last passes writing every channel, after a trade (prepare_scene_aa).
+    VkPipeline smaa_blend_scene_ = VK_NULL_HANDLE;
+    VkPipeline fxaa_scene_ = VK_NULL_HANDLE;
     // FXAA's, SMAA's last pass over MSAA: per sample count (log2).
     VkPipeline scene_pass_ms_[2][4]{};
     PassPipelines to_color_{};
@@ -163,8 +197,11 @@ private:
     Target stencil_;  // shared by edges and weights
     Target antialiased_;
     Target scaled_;
-    std::uint64_t clock_ = 0;      // scene AA calls so far
-    std::uint64_t smaa_used_ = 0;  // clock_ when SMAA's three targets were last asked for
+    // The scene's image traded out this frame (prepare_scene_aa with a trade): the passes' source, the next trade's spare.
+    std::shared_ptr<Texture> traded_;
+    std::uint64_t traded_used_ = 0;  // idle_clock() at the last trade
+    bool scene_traded_ = false;  // this frame's passes read traded_
+    std::uint64_t smaa_used_ = 0;  // idle_clock() when SMAA's three targets were last asked for
 };
 
 }  // namespace galaxy::render::vk

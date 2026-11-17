@@ -74,15 +74,28 @@ public:
     // then keeps its 8-bit swap chain, since record() with output.hdr writes nothing a different target format could take.
     [[nodiscard]] bool prepare_hdr();
 
+    // The pictures between passes and the passes that write them: kSceneHdrColorFormat while `wide` (HDR output, the
+    // scene's light past white kept to the last write), else kSceneColorFormat. Between frames with the GPU drained.
+    // False when the pipelines cannot be made: the chain stays as it was.
+    [[nodiscard]] bool set_wide(bool wide);
+    [[nodiscard]] bool wide() const noexcept { return color_format_ != DXGI_FORMAT_R10G10B10A2_UNORM; }
+
+    // The scene target's image traded for `spare` (RendererD3D12::swap_scene_color): the scene's own image comes back,
+    // shader-readable, and the scene target goes on in `spare` (or one made for it), RENDER_TARGET state, its old
+    // contents dropped.
+    using SceneTrade = std::function<Microsoft::WRL::ComPtr<ID3D12Resource>(Microsoft::WRL::ComPtr<ID3D12Resource> spare)>;
+
     // SMAA or FXAA of the 3D scene in `color` (RGBA8, RENDER_TARGET state, `width` x `height`) in
     // place: RGB only, the alpha the game left there stays. `picture_*` is the part the display
     // copy shows and `display_*` its size on screen (kAuto skips a supersampled scene). Returns
-    // the pass that ran.
+    // the pass that ran. With `trade` the passes read the scene's own image instead of a copy of it and write every
+    // pixel of the image that took its place at `color_rtv`, its alpha the scene's.
     AaRun record_scene_aa(ID3D12GraphicsCommandList* list, DescriptorRing& srv_ring,
                           ID3D12Resource* color, D3D12_CPU_DESCRIPTOR_HANDLE color_rtv,
                           unsigned width, unsigned height, unsigned picture_width,
                           unsigned picture_height, unsigned display_width, unsigned display_height,
-                          std::uint64_t frame_index, unsigned frames_in_flight, unsigned samples = 1u);
+                          std::uint64_t frame_index, unsigned frames_in_flight, unsigned samples = 1u,
+                          const SceneTrade& trade = {});
 
     [[nodiscard]] const PostProcessSettings& settings() const noexcept { return settings_; }
 
@@ -99,7 +112,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
         gpu::Use use = gpu::Use::PixelRead;
-        std::uint64_t used_frame = 0;  // the last frame ensure_target was asked for it
+        std::uint64_t used_step = 0;  // idle_clock() when last asked for
     };
     struct Retired {
         Microsoft::WRL::ComPtr<ID3D12Resource> resource;
@@ -139,11 +152,12 @@ private:
               const Constants& constants);
     void note_aa_run(const PostProcessPlan& plan, AaRun ran);
     void release_retired(std::uint64_t frame_index) noexcept;
-    // Hands back the targets no pass has asked for in kTargetIdleFrames frames (SMAA's after a switch to FXAA or off, the
+    // Hands back the targets no pass has asked for in kIdleSteps game steps (idle_clock.h) (SMAA's after a switch to FXAA or off, the
     // scaling intermediate after a window size that needs none); the next pass that wants one makes it again.
     void trim_idle_targets(std::uint64_t frame_index, unsigned frames_in_flight);
 
     ID3D12Device* device_ = nullptr;
+    DXGI_FORMAT color_format_ = DXGI_FORMAT_R10G10B10A2_UNORM;  // the pictures between passes (kSceneColorFormat; set_wide)
     PostProcessSettings settings_{};
     bool ready_ = false;
     PostProcessStatus status_{};
@@ -162,14 +176,17 @@ private:
     // Into the window (8 bits, dithered), and into a picture for a pass after it (the scene's format).
     Microsoft::WRL::ComPtr<ID3D12PipelineState> easu_window_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> resample_window_;
+    // The resample at 1:1 (PostProcessPlan::copy).
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> copy_window_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> rcas_;
     // Bilinear enlargement and RCAS in one pass (no window-sized intermediate).
     Microsoft::WRL::ComPtr<ID3D12PipelineState> rcas_scaled_;
-    // The same four last writes into an R10G10B10A2 HDR10 swap chain buffer (prepare_hdr).
+    // The same last writes into an R10G10B10A2 HDR10 swap chain buffer (prepare_hdr).
     Microsoft::WRL::ComPtr<ID3D12PipelineState> easu_hdr_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> rcas_hdr_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> rcas_scaled_hdr_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> resample_hdr_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> copy_hdr_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> resample_;
     Microsoft::WRL::ComPtr<ID3D12Resource> area_texture_;
     Microsoft::WRL::ComPtr<ID3D12Resource> search_texture_;
@@ -180,6 +197,9 @@ private:
     Target weights_;
     Target antialiased_;
     Target scaled_;
+    // The scene's last image traded out (record_scene_aa with a trade): the next trade's spare.
+    Microsoft::WRL::ComPtr<ID3D12Resource> traded_;
+    std::uint64_t traded_step_ = 0;  // idle_clock() at the last trade
     // SMAA's edge mask: the weight pass runs only where edge detection kept a
     // pixel. `rtv` holds its DSV.
     Target stencil_;

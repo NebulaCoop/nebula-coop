@@ -64,9 +64,14 @@ public:
         D3D12_CPU_DESCRIPTOR_HANDLE rtv{};       // the scene target's render target (multisampled with MSAA)
         unsigned samples = 1;
         bool hdr = false;                        // the colour is the HDR scene scene target
-        unsigned frame_width = 0;                // the frame in scene target pixels
+        unsigned frame_width = 0;                // the frame in scene target pixels (the part of it drawn in)
         unsigned frame_height = 0;
+        unsigned extent_width = 0;               // the scene target's size (0: the frame's)
+        unsigned extent_height = 0;
+        unsigned lowest_sixteenths = 16u;        // the smallest dynamic resolution step the frame may take (16: none)
         float scale = 1.0f;                      // scene target pixels per game pixel
+        [[nodiscard]] unsigned whole_width() const noexcept { return extent_width != 0u ? extent_width : frame_width; }
+        [[nodiscard]] unsigned whole_height() const noexcept { return extent_height != 0u ? extent_height : frame_height; }
     };
     // BloomEffect::preDraw, and BloomEffectSimple::draw with the game's own chain: the scene before the bloom's work
     // over it.
@@ -77,6 +82,21 @@ public:
                                                                          std::uint64_t frame_index,
                                                                          unsigned frames_in_flight);
     void keep_picture(Microsoft::WRL::ComPtr<ID3D12Resource> picture, const Inputs& in);
+    // A normal bloom that adds nothing (bloom::adds_nothing) over a scene kept by a trade: the kept picture becomes the
+    // scene target's colour again (take_kept_back, kept_by_trade first: same size, format and flags as the scene target),
+    // and the image the glowing models were drawn on waits for the next trade (set_aside).
+    [[nodiscard]] bool kept_by_trade(const Inputs& in) const;
+    [[nodiscard]] Microsoft::WRL::ComPtr<ID3D12Resource> take_kept_back(ID3D12GraphicsCommandList* list);
+    void set_aside(Microsoft::WRL::ComPtr<ID3D12Resource> image, const Inputs& in);
+    // The simple bloom's source without a copy: the scene target continues on the image this returns (null: it makes one),
+    // and give_source takes the scene's picture as the source; apply() copies nothing then, and with nothing else to draw
+    // draws the frame back from it. Only where the composite covers the whole target, which it then writes from the
+    // source; can_take_source first (the composite is there to draw).
+    [[nodiscard]] bool can_take_source(const Inputs& in);
+    [[nodiscard]] Microsoft::WRL::ComPtr<ID3D12Resource> take_source_image(ID3D12GraphicsCommandList* list, const Inputs& in,
+                                                                           std::uint64_t frame_index,
+                                                                           unsigned frames_in_flight);
+    void give_source(Microsoft::WRL::ComPtr<ID3D12Resource> picture, const Inputs& in);
     // The game's own chain (the NATIVE setting) where it draws its kept copy back: the kept scene over the frame, as
     // the scene target held it (RGB; the game's alpha stays). Leaves this pass's root signature, pipeline and render target
     // bound.
@@ -86,7 +106,7 @@ public:
     // scene): the bloom over the frame. Leaves this pass's root signature, pipeline and render target bound.
     bool apply(ID3D12GraphicsCommandList* list, DescriptorRing& ring, const Inputs& in, const Params& params,
                std::uint64_t frame_index, unsigned frames_in_flight);
-    // Once a frame: frees what the passes released, and hands back the images no pass has asked for in 600 frames (the
+    // Once a frame: frees what the passes released, and hands back the images no pass has asked for in kIdleSteps game steps (idle_clock.h) (the
     // bloom switched off or a scene without one), at the frame's fence; the next bloom makes them again.
     void trim_idle(std::uint64_t frame_index, unsigned frames_in_flight);
 
@@ -97,7 +117,7 @@ private:
         unsigned height = 0;
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         gpu::Use use = gpu::Use::CopyDest;
-        std::uint64_t used_frame = 0;   // the last frame a pass asked for it
+        std::uint64_t used_step = 0;  // idle_clock() when last asked for
     };
     struct Retired {
         Microsoft::WRL::ComPtr<ID3D12Resource> resource;
@@ -120,6 +140,7 @@ private:
     ID3D12Device* device_ = nullptr;
     bool ready_ = false;
     bool kept_ = false;   // keep() ran since the last normal apply
+    bool source_given_ = false;  // give_source ran since the last apply
     std::uint64_t frame_ = 0;  // the frame of the last pass call, what keep_picture() stamps the kept image with
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> down_;
@@ -127,7 +148,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D12PipelineState> blur_;
     // 1, 2, 4, 8 samples; then HDR.
     std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 8> composite_{};
-    Target keep_;         // the scene (the scene target's format, the frame's size)
+    unsigned composite_failed_ = 0u;  // composite_ entries the device would not make (not tried again)
+    Target keep_;         // the scene (the scene target's format and size)
     Target source_;       // the simple bloom's scene, its source (as keep_)
     Target work_;         // level 1's resolution: the frame in boxes
     Target box_tmp_;      // the footprint's horizontal box

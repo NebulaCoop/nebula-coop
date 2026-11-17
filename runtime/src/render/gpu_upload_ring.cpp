@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -11,7 +12,7 @@
 #include <string>
 
 
-#if !defined(NEBULA_GPU_VULKAN) && !defined(NEBULA_GPU_METAL)
+#if !defined(NEBULA_GPU_VULKAN) && !defined(NEBULA_GPU_METAL) && !defined(NEBULA_GPU_D3D11)
 #include "galaxy/windows_api.h"
 #include <d3d12.h>
 #endif
@@ -122,15 +123,25 @@ void UploadRing::begin_frame(unsigned frame_slot) {
     if (mapped_ == nullptr || frame_slot >= frames_in_flight_) {
         throw std::runtime_error("UploadRing frame slot is out of range");
     }
-    // The frame before: what it took (segment, spill and chunks) joins the quiet window. A window of kQuietFrames frames whose
-    // peak stayed within a quarter of the budget lets the ring shrink (wants_shrink); a busier one does not.
+    // The frame before: what it took (segment, spill and chunks) joins the quiet window. A window of kQuietFrames frames and
+    // kQuietNs whose peak stayed within a quarter of the budget lets the ring shrink (wants_shrink); a busier one does not.
     if (frame_ready_) {
         window_peak_ = std::max(window_peak_, cursor_ - segment_base_ + frame_spill_);
-        if (++window_frames_ >= kQuietFrames) {
+        const auto now_ns = [] {
+            return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now().time_since_epoch())
+                                                  .count());
+        };
+        if (window_frames_ == 0u) {
+            window_start_ns_ = now_ns();
+        }
+        if (++window_frames_ >= kQuietFrames && now_ns() - window_start_ns_ >= kQuietNs) {
             shrink_ready_ = capacity_ > floor_capacity_ && window_peak_ <= bytes_per_frame_ / 4u;
             shrink_peak_ = window_peak_;
             window_peak_ = 0u;
             window_frames_ = 0u;
+        } else if (window_peak_ > bytes_per_frame_ / 4u) {
+            shrink_ready_ = false;  // busier since the quiet window: no shrink at the next moment
         }
     }
     active_slot_ = frame_slot;
@@ -147,7 +158,7 @@ void UploadRing::begin_frame(unsigned frame_slot) {
 
 // A request past the segment and the spill: a chunk of this frame slot (the newest if it has room, else a new buffer at least
 // twice the one before, and at least the request), counted into the frame's use so the ring grows at the next boundary.
-UploadRing::Allocation UploadRing::allocate_in_chunk(std::size_t size, std::size_t alignment) {
+UploadRing::Allocation UploadRing::allocate_in_chunk(std::size_t size, std::size_t alignment, std::size_t& wanted) {
     std::vector<Chunk>& chunks = chunk_slots_[active_slot_];
     const auto place = [&](Chunk& chunk) -> Allocation {
         const std::size_t at = chunk.used + ((std::size_t{0} - chunk.used) & (alignment - 1u));
@@ -163,12 +174,11 @@ UploadRing::Allocation UploadRing::allocate_in_chunk(std::size_t size, std::size
         }
     }
     constexpr std::size_t kFirstChunk = std::size_t{4} << 20u;
-    const std::size_t wanted = std::max({size + alignment, kFirstChunk, chunks.empty() ? std::size_t{0} : chunks.back().size * 2u});
+    wanted = std::max({size + alignment, kFirstChunk, chunks.empty() ? std::size_t{0} : chunks.back().size * 2u});
     Chunk chunk;
     chunk.memory = gpu::create_upload_memory(device_, wanted, name_, place_);
     if (!chunk.memory) {
-        throw std::runtime_error(std::string("UploadRing '") + name_ + "' out of upload memory for a chunk of " +
-                                 std::to_string(wanted) + " B");
+        return {};
     }
     chunk.size = wanted;
     chunk_bytes_made_ += wanted;
@@ -178,11 +188,45 @@ UploadRing::Allocation UploadRing::allocate_in_chunk(std::size_t size, std::size
 }
 
 UploadRing::Allocation UploadRing::allocate(std::size_t size, std::size_t alignment) {
-    if (!frame_ready_) {
+    Allocation out;
+    std::size_t wanted = 0u;
+    switch (take(size, alignment, out, wanted)) {
+    case Miss::None:
+        return out;
+    case Miss::NotReady:
         throw std::runtime_error("UploadRing allocation before begin_frame");
+    case Miss::Alignment:
+        throw std::runtime_error("UploadRing alignment is not a nonzero power of two");
+    case Miss::NoChunk:
+        throw std::runtime_error(std::string("UploadRing '") + name_ + "' out of upload memory for a chunk of " +
+                                 std::to_string(wanted) + " B");
+    case Miss::Exhausted:
+        break;
+    }
+    throw std::runtime_error(
+        std::string("UploadRing '") + name_ + "' exhausted: request " +
+        std::to_string(size) + " B at frame-used " +
+        std::to_string(cursor_ - segment_base_ + frame_spill_) + "/" +
+        std::to_string(bytes_per_frame_) + " B and spill " +
+        std::to_string(capacity_ - spill_base()) + " B");
+}
+
+UploadRing::Allocation UploadRing::try_allocate(std::size_t size, std::size_t alignment) noexcept {
+    try {
+        Allocation out;
+        std::size_t wanted = 0u;
+        return take(size, alignment, out, wanted) == Miss::None ? out : Allocation{};
+    } catch (...) {
+        return {};
+    }
+}
+
+UploadRing::Miss UploadRing::take(std::size_t size, std::size_t alignment, Allocation& out, std::size_t& wanted) {
+    if (!frame_ready_) {
+        return Miss::NotReady;
     }
     if (alignment == 0u || (alignment & (alignment - 1u)) != 0u) {
-        throw std::runtime_error("UploadRing alignment is not a nonzero power of two");
+        return Miss::Alignment;
     }
     // Padding by unsigned negation cannot overflow; padding and payload are checked before any address is formed.
     const auto fits = [&](std::size_t at, std::size_t end) {
@@ -201,16 +245,14 @@ UploadRing::Allocation UploadRing::allocate(std::size_t size, std::size_t alignm
         frame_spill_ += aligned + size - spill_cursor_;
         spill_cursor_ = aligned + size;
     } else if (chunks_ && device_ != nullptr && active_slot_ < chunk_slots_.size()) {
-        chunked = allocate_in_chunk(size, alignment);
+        chunked = allocate_in_chunk(size, alignment, wanted);
+        if (chunked.cpu == nullptr) {
+            return Miss::NoChunk;
+        }
         chunk_resource = chunked.resource;
         frame_spill_ += size + alignment;
     } else {
-        throw std::runtime_error(
-            std::string("UploadRing '") + name_ + "' exhausted: request " +
-            std::to_string(size) + " B at frame-used " +
-            std::to_string(cursor_ - segment_base_ + frame_spill_) + "/" +
-            std::to_string(bytes_per_frame_) + " B and spill " +
-            std::to_string(capacity_ - spill_base()) + " B");
+        return Miss::Exhausted;
     }
     // Bytes this frame has handed out: the floor for its budget.
     const std::size_t frame_used = cursor_ - segment_base_ + frame_spill_;
@@ -225,19 +267,56 @@ UploadRing::Allocation UploadRing::allocate(std::size_t size, std::size_t alignm
         segment_allocation_pending_ = false;
     }
     if (chunk_resource != nullptr) {
-        return chunked;
+        out = chunked;
+        return Miss::None;
     }
-    return Allocation{
+    out = Allocation{
         mapped_ + aligned,
         gpu_base_ + static_cast<gpu::Address>(aligned),
         aligned,
         nullptr
     };
+    return Miss::None;
+}
+
+bool remake_upload_rings(gpu::Device* device, std::span<const UploadRingSlot> rings, bool all, bool& failed,
+                         std::vector<gpu::BufferRef>& old) {
+    bool made = false;
+    for (const UploadRingSlot& slot : rings) {
+        UploadRing& ring = *slot.ring;
+        if (!all && !ring.wants_new_size()) {
+            continue;
+        }
+        const std::size_t had = ring.capacity();
+        std::size_t capacity = ring.wants_shrink() ? ring.shrunk_capacity(slot.segments)
+                                                   : failed ? had : ring.grown_capacity(slot.segments);
+        if (capacity == 0u) {
+            failed = true;
+            capacity = had;
+        }
+        if (capacity != had) {
+            std::cerr << "[gpu-rings] " << (capacity > had ? "grow " : "shrink ") << slot.name
+                      << " frame-high-water-kb=" << (ring.high_water() >> 10u) << " budget-kb=" << (ring.bytes_per_frame() >> 10u)
+                      << " mb=" << (had >> 20u) << "->" << (capacity >> 20u) << '\n';
+        }
+        ring.release_into(old);
+        made = true;
+        if (ring.initialize(device, slot.name, UploadRing::budget(capacity, slot.segments), slot.segments, capacity, slot.chunks)) {
+            continue;
+        }
+        // Out of upload memory: the size it had, and no further growth.
+        failed = true;
+        std::cerr << "[gpu-rings] grow " << slot.name << " failed\n";
+        if (!ring.initialize(device, slot.name, UploadRing::budget(had, slot.segments), slot.segments, had, slot.chunks)) {
+            throw std::runtime_error("upload ring resize failed");
+        }
+    }
+    return made;
 }
 
 }  // namespace galaxy::render
 
-#if !defined(NEBULA_GPU_VULKAN) && !defined(NEBULA_GPU_METAL)
+#if !defined(NEBULA_GPU_VULKAN) && !defined(NEBULA_GPU_METAL) && !defined(NEBULA_GPU_D3D11)
 namespace galaxy::render::gpu {
 
 bool device_removed(Device* device) noexcept {

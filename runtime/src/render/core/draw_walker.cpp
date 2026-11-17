@@ -8,12 +8,32 @@
 #include "galaxy/launch_args.h"
 #include "galaxy/loss_report.h"
 #include "galaxy/render/render_config.h"
+#include "galaxy/render/scene_camera_shape.h"
 
 #include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <set>
+#include <utility>
+
+namespace {
+
+// --diagnostics programs-drawn: the program pairs draws asked for, each logged once.
+std::mutex g_drawn_lock;
+std::set<std::pair<std::uint64_t, std::uint64_t>> g_drawn;
+
+void note_program_drawn(std::uint64_t vertex, std::uint64_t pixel) {
+    const std::lock_guard guard(g_drawn_lock);
+    if (g_drawn.emplace(vertex, pixel).second) {
+        std::fprintf(stderr, "[programs-drawn] %llx %llx\n", static_cast<unsigned long long>(vertex),
+                     static_cast<unsigned long long>(pixel));
+    }
+}
+
+}  // namespace
 
 namespace galaxy::render {
 
@@ -26,9 +46,6 @@ using core::WalkTime;
 namespace {
 
 // The state word's fields (nebula_model.h).
-constexpr std::uint32_t blend_op(std::uint32_t s) noexcept { return s & 3u; }
-constexpr std::uint32_t blend_src(std::uint32_t s) noexcept { return (s >> 2u) & 15u; }
-constexpr bool state_depth_test(std::uint32_t s) noexcept { return (s & (1u << 10u)) != 0u; }
 constexpr bool state_stencil(std::uint32_t s) noexcept { return ((s >> 20u) & 3u) != 0u; }
 constexpr bool state_color_write(std::uint32_t s) noexcept { return (s & NEBULA_STATE_COLOR_WRITE) != 0u; }
 
@@ -36,22 +53,6 @@ constexpr bool state_color_write(std::uint32_t s) noexcept { return (s & NEBULA_
 // Two constants entries are one material when they are one entry or name one registered slot.
 inline bool same_material(const NebulaFrameList& list, std::uint32_t a, std::uint32_t b) noexcept {
     return a == b || (list.constants[a].slot != NEBULA_NONE32 && list.constants[a].slot == list.constants[b].slot);
-}
-
-// Which targets a draw of the 3D scene writes beside the colour: an opaque surface the motion, a blended draw the reactive
-// mask, and a blended draw whose factors never read the scene the effects layer too.
-std::uint8_t scene_aux(std::uint32_t state, bool layer_window) noexcept {
-    if (!state_color_write(state)) {
-        return 0u;
-    }
-    const std::uint32_t op = blend_op(state);
-    if (op == 0u) {
-        return state_depth_test(state) ? 1u : 0u;
-    }
-    if (layer_window && (op == NEBULA_BLEND_SUBTRACT || (blend_src(state) != NEBULA_FACTOR_DST_COLOR && blend_src(state) != NEBULA_FACTOR_INV_DST_COLOR))) {
-        return 3u;
-    }
-    return 2u;
 }
 
 inline Affine34 affine_of(const float (*rows)[4]) noexcept {
@@ -91,7 +92,7 @@ void RenderCore::scan_list(ListData& now) {
     }
     for (std::uint32_t p = 0; p < list.pass_count; ++p) {
         const NebulaFramePass& pass = list.passes[p];
-        if (pass.kind != NEBULA_PASS_DRAW) {
+        if (pass.kind != NEBULA_PASS_DRAW && pass.kind != NEBULA_PASS_TRACED_DRAW) {
             continue;
         }
         for (std::uint32_t i = pass.first_item; i < pass.first_item + pass.item_count; ++i) {
@@ -118,6 +119,61 @@ void RenderCore::scan_list(ListData& now) {
     }
 }
 
+void RenderCore::count_coverage(const ListData& now, const ListData& before) noexcept {
+    const NebulaFrameList& list = *now.list;
+    const NebulaFrameList& last = *before.list;
+    ++coverage_lists_;
+    try {
+        coverage_slots_.resize(last.item_count);
+    } catch (...) {
+        return;
+    }
+    for (std::uint32_t i = 0; i < last.item_count; ++i) coverage_slots_[i] = last.items[i].slot;
+    std::sort(coverage_slots_.begin(), coverage_slots_.end());
+    for (std::uint32_t i = 0; i < list.item_count; ++i) {
+        const NebulaFrameItem& item = list.items[i];
+        CoverageCount& count = coverage_[(item.flags & NEBULA_ITEM_CATEGORY_MASK) >> NEBULA_ITEM_CATEGORY_SHIFT];
+        ++count.items;
+        const std::uint32_t pair = now.item_before[i];
+        const bool ring = (item.flags & NEBULA_ITEM_RING) != 0u && (item.flags & NEBULA_ITEM_PARTICLE) == 0u;
+        if ((item.flags & NEBULA_ITEM_DISCRETE_VERTICES) != 0u) {
+            ++count.discrete;
+        } else if (pair == NEBULA_NONE32 && (item.block >= now.block_before.size() || now.block_before[item.block] == NEBULA_NONE32)) {
+            ++count.new_items;
+            if (std::binary_search(coverage_slots_.begin(), coverage_slots_.end(), item.slot)) {
+                ++count.missed;
+                std::uint8_t& logged = coverage_misses_logged_[(item.flags & NEBULA_ITEM_CATEGORY_MASK) >> NEBULA_ITEM_CATEGORY_SHIFT];
+                if (logged < 6u) {
+                    // The item of the same slot and part before (else of the slot), and what of it differs.
+                    const NebulaFrameItem* other = nullptr;
+                    for (std::uint32_t j = 0; j < last.item_count; ++j) {
+                        const NebulaFrameItem& o = last.items[j];
+                        if (o.slot == item.slot && (other == nullptr || (o.part == item.part && other->part != item.part))) other = &o;
+                    }
+                    ++logged;
+                    std::fprintf(stderr,
+                                 "[interp-miss] frame %u category %u slot %u part %u/%u generation %u/%u%s%s%s%s%s%s%s block %u/%u "
+                                 "blocks(joints %u/%u model %u/%u calc %u/%u)\n",
+                                 list.game_frame, (item.flags & NEBULA_ITEM_CATEGORY_MASK) >> NEBULA_ITEM_CATEGORY_SHIFT,
+                                 item.slot, item.part, other->part, item.generation, other->generation,
+                                 item.pipeline != other->pipeline ? " pipeline" : "", item.mesh != other->mesh ? " mesh" : "",
+                                 item.textures != other->textures ? " textures" : "", item.matrix != other->matrix ? " matrix" : "",
+                                 item.flags != other->flags ? " flags" : "", item.source_hash != other->source_hash ? " source" : "",
+                                 (item.flags & NEBULA_ITEM_RING) != 0u ? " ring" : "", item.block, other->block,
+                                 item.block < list.block_count ? list.blocks[item.block].joint_count : 0u,
+                                 other->block < last.block_count ? last.blocks[other->block].joint_count : 0u,
+                                 item.block < list.block_count ? list.blocks[item.block].model : 0u,
+                                 other->block < last.block_count ? last.blocks[other->block].model : 0u,
+                                 item.block < list.block_count ? list.blocks[item.block].calc_mode : 0u,
+                                 other->block < last.block_count ? last.blocks[other->block].calc_mode : 0u);
+                }
+            }
+        } else if (ring && (pair == NEBULA_NONE32 || !core::ring_shape_matches(item, before.list->items[pair]))) {
+            ++count.ring_at_b;
+        }
+    }
+}
+
 void RenderCore::prepare_walk(ListData& now, ListData* before, const WalkTime& time) {
     const NebulaFrameList& list = *now.list;
     if (!now.scanned) {
@@ -129,10 +185,17 @@ void RenderCore::prepare_walk(ListData& now, ListData* before, const WalkTime& t
     walk_.before = before;
     walk_.time = time;
     walk_.serial = ++walk_serial_;
-    walk_.mip_lines = static_cast<float>(std::log2(std::max(1.0, static_cast<double>(renderer_.frame_map().height) / kAuthoredLines)));
+    // The lines the scene is drawn at (dynamic resolution's last rectangle; the render size without it) over the authored
+    // lines: levels drawn by hand are chosen as the game chose them, finer or coarser (make_sampler_key).
+    walk_.mip_lines = static_cast<float>(
+        std::log2(std::max(1.0, static_cast<double>(renderer_.scene_rectangle().height)) / kAuthoredLines));
     const bool between = time.t < 1.0f && before != nullptr;
     if (between) {
         pairing_.prepare_motion(now, *before);
+        if (!now.coverage_counted && !now.cut && ::galaxy::diagnosing(::galaxy::kDiagnosePresentStats)) {
+            now.coverage_counted = true;
+            count_coverage(now, *before);
+        }
     }
     walk_.between = between;
 
@@ -179,6 +242,17 @@ void RenderCore::prepare_walk(ListData& now, ListData* before, const WalkTime& t
         in.scale_flags = block.scale_flags;
         in.model = block.model != 0u ? &registries_.model(block.model).tables : nullptr;
         in.joint_count = block.joint_count;
+        if (in.model != nullptr && in.model->has_weighted) {
+            // Each joint's product made once for the block's eye and world rows (the envelopes' joints are the model's).
+            const std::size_t joints = in.model->joint_count;
+            if (walk_skin_made_.size() < joints) {
+                walk_skin_.resize(joints * 12u);
+                walk_skin_made_.resize(joints);
+            }
+            std::memset(walk_skin_made_.data(), 0, joints);
+            in.skin = reinterpret_cast<float (*)[4]>(walk_skin_.data());
+            in.skin_made = walk_skin_made_.data();
+        }
         in.normal_scale = block.normal_scale;
         const std::uint32_t camera = now.block_camera[b];
         const bool eye_block = block.camera == NEBULA_NONE32;
@@ -283,8 +357,8 @@ void RenderCore::prepare_walk(ListData& now, ListData* before, const WalkTime& t
     now.rows_walk = walk_.serial;
 
     // The instance table: one entry per item, in draw order. An instanced draw's light base is its first instance's
-    // row.
-    const UploadRing::Allocation instances = matrix_ring.allocate(std::size_t{list.item_count} * 16u + 16u, 16u);
+    // row. Vulkan binds it at its offset, which must be a multiple of minStorageBufferOffsetAlignment (at most 256).
+    const UploadRing::Allocation instances = matrix_ring.allocate(std::size_t{list.item_count} * 16u + 16u, 256u);
     walk_.instances = instances.gpu;
     {
         auto* out = reinterpret_cast<std::uint32_t*>(instances.cpu);
@@ -388,6 +462,23 @@ void RenderCore::prepare_walk(ListData& now, ListData* before, const WalkTime& t
         }
     }
     now.view_terms = walk_view_terms_;
+    // Each view's four side planes in eye space, from x and y against w = -z, with the jitter's room: normal and length.
+    walk_view_planes_.resize(list.view_count);
+    for (std::uint32_t v = 0; v < list.view_count; ++v) {
+        const std::array<float, 6>& terms = walk_view_terms_[v];
+        const float x_slack = std::fabs(terms[0]) * 0.01f + 0.01f, y_slack = std::fabs(terms[2]) * 0.01f + 0.01f;
+        const float a = terms[0], b = terms[1], c = terms[2], d = terms[3];
+        const float sides[4][3] = {{a, 0.0f, b - 1.0f - x_slack}, {-a, 0.0f, -b - 1.0f - x_slack},
+                                   {0.0f, c, d - 1.0f - y_slack}, {0.0f, -c, -d - 1.0f - y_slack}};
+        std::array<float, 16>& planes = walk_view_planes_[v];
+        for (unsigned k = 0; k < 4u; ++k) {
+            const float nx = sides[k][0], ny = sides[k][1], nz = sides[k][2];
+            planes[k * 4u] = nx;
+            planes[k * 4u + 1u] = ny;
+            planes[k * 4u + 2u] = nz;
+            planes[k * 4u + 3u] = std::sqrt(nx * nx + ny * ny + nz * nz);
+        }
+    }
     walk_views_.assign(list.view_count, WalkView{});
     walk_constants_.assign(list.constants_count, core::StaticSlot{});
     walk_constants_known_.assign(list.constants_count, 0u);
@@ -469,18 +560,71 @@ const RenderCore::WalkView& RenderCore::walk_view(std::uint32_t index, const Neb
     rows.traced[2] = (view_flags_ & 8u) != 0u ? static_cast<float>(rt_mirror_slot_) : 0.0f;
     if ((view_flags_ & 8u) != 0u && rt_volume_drawn_ && index == rt_scene_view_) {
         // The light volume over the scene camera's view (program.hlsli traced_air): the depth's eye terms and the
-        // viewport the volume spans (rt_light_frame_'s), its picture and sampler, 1 it is there.
+        // viewport the volume spans (rt_light_frame_'s), its picture's place + 1 and its sampler.
         std::memcpy(rows.volume[0], rt_light_frame_.depth, sizeof(rows.volume[0]));
         std::memcpy(rows.volume[1], rt_light_frame_.viewport, sizeof(rows.volume[1]));
-        rows.volume[2][0] = static_cast<float>(rt_volume_slot_);
+        rows.volume[2][0] = static_cast<float>(rt_volume_slot_) + 1.0f;
         rows.volume[2][1] = static_cast<float>(rt_volume_sampler_);
-        rows.volume[2][2] = 1.0f;
         rows.volume[2][3] = rt_scatter_drawn_ ? static_cast<float>(rt_scatter_slot_) + 1.0f : 0.0f;
     }
+    // The indirect ratio's place + 1 (program.hlsli traced_o): the scene view's, where the pass ran.
+    rows.volume[2][2] = (view_flags_ & 8u) != 0u && rt_indirect_shown_ && index == rt_scene_view_
+                            ? static_cast<float>(rt_indirect_slot_) + 1.0f : 0.0f;
     rows.traced[3] = (view_flags_ & 8u) != 0u ? static_cast<float>(rt_facing_slot_) : 0.0f;
+    if ((view_flags_ & 8u) != 0u && rt_transmit_drawn_ && index == rt_scene_view_) {
+        rows.transmit[0] = static_cast<float>(rt_transmit_slot_);  // program.hlsli traced_mirror: glass and water, High
+        rows.transmit[1] = 1.0f;
+    }
+    if ((view_flags_ & 8u) != 0u && rt_blend_guide_mode_ != 0u && index == rt_scene_view_) {
+        // The guide blended draws compare with (program.hlsli traced_by_air, traced_mirror_own): the second
+        // layer's, else the opaque layer's; and the depth's eye terms for the compare (with the volume or without).
+        rows.blend_guide[0] = static_cast<float>(rt_blend_guide_mode_ == 1u ? rt_blend_guide_slot_ : rt_opaque_guide_slot_);
+        rows.blend_guide[1] = static_cast<float>(rt_blend_guide_mode_);
+        std::memcpy(rows.volume[0], rt_light_frame_.depth, sizeof(rows.volume[0]));
+    }
     if ((view_flags_ & 8u) != 0u) {
         std::memcpy(rows.stage_a, rt_stage_a_, sizeof(rows.stage_a));
         std::memcpy(rows.stage_k, rt_stage_k_, sizeof(rows.stage_k));
+        std::memcpy(rows.look, rt_look_, sizeof(rows.look));
+        for (unsigned i = 0; i < kRtDevProgramSlots; ++i) {  // rt_dev.h: program.hlsli view_dev
+            const unsigned which = kRtDevProgramFirst + i;
+            const bool given = (rt_dev_set_ >> which & 1u) != 0u;
+            rows.dev[0][i] = given ? rt_dev_[which] : 0.0f;
+            rows.dev[1][i] = given ? 1.0f : 0.0f;
+        }
+        // The relight's view constants (program.hlsli traced_painted, view_relight): the program's formulas
+        // on the rows above, once a view, not a pixel. sRGB decoded as traced_lin; dev y, z, w as the program reads them.
+        const auto lin = [](float v) {
+            v = std::max(v, 0.0f);
+            return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f);
+        };
+        const auto luma = [](const float* v) { return 0.2126f * v[0] + 0.7152f * v[1] + 0.0722f * v[2]; };
+        const float sun_strength = rows.dev[1][1] > 0.5f ? rows.dev[0][1] : 1.25f;  // October's kSun
+        const float sky_chroma = rows.dev[1][2] > 0.5f ? rows.dev[0][2] : 0.4f;
+        const float stage_light = rows.dev[1][3] > 0.5f ? rows.dev[0][3] : 0.0f;
+        float sky[3], full[3], key[3], held[3];
+        for (unsigned ch = 0; ch < 3u; ++ch) {
+            sky[ch] = lin(rows.stage_a[ch]);
+            full[ch] = lin(std::clamp(rows.stage_a[ch] + rows.stage_k[ch], 0.0f, 1.0f));
+            key[ch] = std::max(full[ch] - sky[ch], 0.0f);
+            held[ch] = full[ch] + (1.0f - full[ch]) * stage_light;
+        }
+        const float exposure = luma(full) / std::max(luma(sky) + luma(key) * rows.look[1], 1e-4f);
+        const float sky_l = luma(sky), held_l = luma(held);
+        for (unsigned ch = 0; ch < 3u; ++ch) {
+            rows.relight[0][ch] = sky[ch];
+            rows.relight[1][ch] = rows.look[3] * (sky_l + (sky[ch] - sky_l) * sky_chroma) * exposure;
+            rows.relight[2][ch] = key[ch] * sun_strength * exposure;
+            rows.relight[3][ch] = held_l > 1e-4f ? held[ch] / held_l : 1.0f;
+        }
+        rows.relight[0][3] = held_l;
+        // The sun's direction in the eye's space for a lit program's key highlight: the scene's view under the
+        // relight with a traced sun this walk (its Facing picture is the scene's; without one its r is 1), else none:
+        // the programs read the Facing picture only where it is given.
+        const bool sun_known = rows.look[0] > 0.0f && rt_sun_now_ && index == rt_scene_view_;
+        for (unsigned ch = 0; ch < 3u; ++ch) {
+            rows.relight[ch + 1u][3] = sun_known ? rt_sun_eye_[ch] : 0.0f;
+        }
     }
     rows.scale[1] = walk_.time.t;
     rows.scale[2] = walk_.time.t_prev;
@@ -650,12 +794,13 @@ std::uint32_t RenderCore::merge_ring_run(std::uint32_t first, std::uint32_t end,
 
 void RenderCore::walk_tables(std::uint32_t id, gpu::Address& lists, std::uint32_t& first) {
     core::TextureTable& table = registries_.table(id);
-    table.last_frame = frame_index_;
+    table.last_frame = walk_.now->serial;
     table.retired = false;
     // A list written earlier in this walk stands unless the generation moved since (the sampler array started again, or
     // the Vulkan image array grew and its null slot moved): then it is written again.
     const auto generation = renderer_.sampler_generation();
-    if (table.walk_stamp == walk_.serial && table.samplers_generation == generation) {
+    if (table.walk_stamp == walk_.serial && table.samplers_generation == generation &&
+        (!table.has_target || table.pictures_moved == pictures_moved_)) {
         lists = table.lists;
         first = table.list_first;
         return;
@@ -701,13 +846,14 @@ void RenderCore::walk_tables(std::uint32_t id, gpu::Address& lists, std::uint32_
             mode.min_lod = t.min_lod;
             mode.max_lod = t.max_lod;
             const TextureHandle& handle = walk_handles_[i];
-            const bool generated = TextureStore::samples_generated(mode, handle);
-            if (handle.generated_mips && !generated) {
+            // The cook's generated levels are ray tracing's alone: a draw keeps to the game's first level.
+            if (handle.generated_mips) {
                 mode.min_lod = 0.0f;
                 mode.max_lod = 0.0f;
             }
-            table.sampler_slots[i] = renderer_.sampler_slot(make_sampler_key(mode, generated, handle.mip_levels, handle.lod_shift,
-                                                                             handle.lod_arbitrary, mip_lines, scene_mip_bias_));
+            table.sampler_slots[i] = renderer_.sampler_slot(make_sampler_key(mode, handle.mip_levels, handle.lod_shift,
+                                                                             handle.lod_arbitrary, mip_lines, scene_mip_bias_,
+                                                                             handle.authored_levels));
         }
         table.textures_revision = texture_store_.revision();
         table.samplers_generation = generation;
@@ -720,6 +866,8 @@ void RenderCore::walk_tables(std::uint32_t id, gpu::Address& lists, std::uint32_
         walk_pairs_[2u * i + 1u] = table.sampler_slots[i];
     }
     renderer_.write_texture_list(walk_pairs_.data(), count, table.lists, table.list_first);
+    table.has_target = has_target;
+    table.pictures_moved = pictures_moved_;
     if (count > table.count && !table.clamp_logged) {
         table.clamp_logged = true;
         std::fprintf(stderr, "[textures] test: a list of %u maps walked as a run of %u (first entry %u)\n", table.count, count,
@@ -730,12 +878,12 @@ void RenderCore::walk_tables(std::uint32_t id, gpu::Address& lists, std::uint32_
     first = table.list_first;
 }
 
-#if defined(NEBULA_GPU_VULKAN) || defined(NEBULA_GPU_METAL)
+#if defined(NEBULA_GPU_VULKAN) || defined(NEBULA_GPU_METAL) || defined(NEBULA_GPU_D3D11)
 // A device without descriptor indexing: each draw binds its table, as many maps as a bound table holds on this device
 // (renderer_.table_slots(); program.hlsli NEBULA_BOUND_TABLES). A longer list draws with its first maps.
 void RenderCore::walk_bound_tables(std::uint32_t id, gpu::Table& textures, gpu::Table& samplers) {
     core::TextureTable& table = registries_.table(id);
-    table.last_frame = frame_index_;
+    table.last_frame = walk_.now->serial;
     table.retired = false;
     // The list cut to the bound table's compile-time size; told once per list.
     const std::uint32_t listed = table.count;
@@ -750,7 +898,7 @@ void RenderCore::walk_bound_tables(std::uint32_t id, gpu::Table& textures, gpu::
         return table.count == 0u ? none : table.list[std::min(i, table.count - 1u)];
     };
     const bool stale = table.textures.ptr == 0u || table.textures_revision != texture_store_.revision();
-    const bool per_walk = table.has_target && table.walk_stamp != walk_.serial;
+    const bool per_walk = table.has_target && (table.walk_stamp != walk_.serial || table.pictures_moved != pictures_moved_);
     const float mip_lines = walk_.mip_lines;  // taken once in prepare_walk
     const auto generation = renderer_.sampler_generation();
     const bool samplers_stale = table.samplers.ptr == 0u || table.samplers_generation != generation ||
@@ -778,6 +926,7 @@ void RenderCore::walk_bound_tables(std::uint32_t id, gpu::Table& textures, gpu::
                 // A target's picture changes from frame to frame: the table lives for this frame.
                 table.textures = renderer_.texture_table_for(handles.data(), count, texture_store_);
                 table.walk_stamp = walk_.serial;
+                table.pictures_moved = pictures_moved_;
             } else {
                 table.textures = renderer_.persistent_texture_table(handles.data(), count, texture_store_, table.textures);
             }
@@ -799,13 +948,13 @@ void RenderCore::walk_bound_tables(std::uint32_t id, gpu::Table& textures, gpu::
                 mode.min_lod = t.min_lod;
                 mode.max_lod = t.max_lod;
                 const TextureHandle& handle = handles[i];
-                const bool generated = TextureStore::samples_generated(mode, handle);
-                if (handle.generated_mips && !generated) {
+                // The cook's generated levels are ray tracing's alone: a draw keeps to the game's first level.
+                if (handle.generated_mips) {
                     mode.min_lod = 0.0f;
                     mode.max_lod = 0.0f;
                 }
-                keys[i] = make_sampler_key(mode, generated, handle.mip_levels, handle.lod_shift, handle.lod_arbitrary,
-                                           mip_lines, scene_mip_bias_);
+                keys[i] = make_sampler_key(mode, handle.mip_levels, handle.lod_shift, handle.lod_arbitrary, mip_lines,
+                                           scene_mip_bias_, handle.authored_levels);
             }
             table.samplers = renderer_.sampler_table_for(keys.data(), count);
             table.samplers_generation = generation;
@@ -854,16 +1003,12 @@ bool RenderCore::item_culled(const NebulaFrameItem& item, const NebulaFramePass&
     if (!std::isfinite(radius) || !std::isfinite(centre[0] + centre[1] + centre[2])) {
         return false;
     }
-    // The four side planes in eye space, from x and y against w = -z, with the jitter's room.
-    const std::array<float, 6>& terms = walk_view_terms_[item.view];
-    const float x_slack = std::fabs(terms[0]) * 0.01f + 0.01f, y_slack = std::fabs(terms[2]) * 0.01f + 0.01f;
-    const auto outside = [&](float nx, float ny, float nz) {
-        const float length = std::sqrt(nx * nx + ny * ny + nz * nz);
-        return nx * centre[0] + ny * centre[1] + nz * centre[2] < -radius * length;
+    // The view's side planes (prepare_walk).
+    const float* planes = walk_view_planes_[item.view].data();
+    const auto outside = [&](const float* plane) {
+        return plane[0] * centre[0] + plane[1] * centre[1] + plane[2] * centre[2] < -radius * plane[3];
     };
-    const float a = terms[0], b = terms[1], c = terms[2], d = terms[3];
-    return outside(a, 0.0f, b - 1.0f - x_slack) || outside(-a, 0.0f, -b - 1.0f - x_slack) ||
-           outside(0.0f, c, d - 1.0f - y_slack) || outside(0.0f, -c, -d - 1.0f - y_slack);
+    return outside(planes) || outside(planes + 4) || outside(planes + 8) || outside(planes + 12);
 }
 
 namespace {
@@ -871,13 +1016,12 @@ namespace {
 // The walker's draws as the renderer takes them at once: the encoder, and the renderer's own draw targets and texture arrays.
 class DirectDraws {
 public:
-    static constexpr bool kDirect = true;
     DirectDraws(gpu::Encoder& encoder, Renderer& renderer) noexcept : encoder_(encoder), renderer_(renderer) {}
     [[nodiscard]] gpu::Encoder& raw() noexcept { return encoder_; }
     void set_rows(gpu::Address rows, gpu::Address instances) noexcept { encoder_.set_rows(rows, instances); }
     void set_draw_aux(unsigned aux) { renderer_.set_draw_aux(aux); }
     void bind_textures(gpu::Address lists) { renderer_.bind_draw_textures(lists); }
-#if defined(NEBULA_GPU_VULKAN) || defined(NEBULA_GPU_METAL)
+#if defined(NEBULA_GPU_VULKAN) || defined(NEBULA_GPU_METAL) || defined(NEBULA_GPU_D3D11)
     void set_tables(gpu::Table textures, gpu::Table samplers) noexcept {
         renderer_.bind_draw_tables(textures, samplers);
         encoder_.set_tables(textures, samplers);
@@ -906,12 +1050,11 @@ private:
 // The same calls recorded (draw_record.h) for a pass replayed in chunks. What the renderer's own state answers is asked now.
 class RecordedDraws {
 public:
-    static constexpr bool kDirect = false;
     RecordedDraws(gpu::DrawRecorder& recorder, Renderer& renderer) noexcept : recorder_(recorder), renderer_(renderer) {}
     void set_rows(gpu::Address rows, gpu::Address instances) noexcept { recorder_.set_rows(rows, instances); }
     void set_draw_aux(unsigned aux) { recorder_.set_draw_aux(aux); }
     void bind_textures(gpu::Address lists) { recorder_.set_texture_arrays(renderer_.draw_texture_arrays(lists)); }
-#if defined(NEBULA_GPU_VULKAN) || defined(NEBULA_GPU_METAL)
+#if defined(NEBULA_GPU_VULKAN) || defined(NEBULA_GPU_METAL) || defined(NEBULA_GPU_D3D11)
     void set_tables(gpu::Table textures, gpu::Table samplers) { recorder_.set_tables(textures, samplers); }
 #endif
     void set_pipeline(gpu::Pipeline* pipeline) { recorder_.set_pipeline(pipeline); }
@@ -1033,9 +1176,30 @@ void RenderCore::walk_draw_items(const NebulaFramePass& pass, Draws& encoder) {
         // The prepass leaves them out too (they are no surfaces).
         if ((rt_light_on_ || rt_prepass_walk_) && scene_layer &&
             (((item.flags & NEBULA_ITEM_CATEGORY_MASK) >> NEBULA_ITEM_CATEGORY_SHIFT) == NEBULA_CATEGORY_GAME_SHADOW ||
-             (mesh != nullptr && (mesh->hit_flags & NEBULA_HIT_DRAWN_SHADOW) != 0u))) {
+             (mesh != nullptr && (mesh->hit_flags & (NEBULA_HIT_DRAWN_SHADOW | NEBULA_HIT_DRAWN_SHEEN)) != 0u))) {
             ++i;
             continue;
+        }
+        // The game's fake refraction is not drawn under the traced transmission: a draw
+        // of its indirect categories whose maps hold a picture of the scene redraws what is on screen, warped (a second
+        // image of Mario on Freezeflame's ice); the tracer's transmit and mirror show what lies under and before it. It
+        // stays in the traced scene; the prepass leaves it out too (the guide is what is drawn). rt_dev indirect_drawn 1:
+        // drawn as before.
+        if ((rt_light_on_ || rt_prepass_walk_) && scene_layer && rt_pass_transmit_on()) {
+            const std::uint32_t category = (item.flags & NEBULA_ITEM_CATEGORY_MASK) >> NEBULA_ITEM_CATEGORY_SHIFT;
+            if (category >= NEBULA_CATEGORY_INDIRECT_MAP_OBJ && category <= NEBULA_CATEGORY_INDIRECT_PLANET &&
+                rt_dev(RtDev::IndirectDrawn, 0.0f) < 0.5f) {
+                const core::TextureTable& maps = registries_.table(item.textures);
+                const std::size_t listed = std::min<std::size_t>(maps.count, maps.list.size());
+                bool reads_scene = false;
+                for (std::size_t k = 0; k < listed && !reads_scene; ++k) {
+                    reads_scene = maps.list[k].texture != 0u && TextureStore::is_target(maps.list[k].texture);
+                }
+                if (reads_scene) {
+                    ++i;
+                    continue;
+                }
+            }
         }
         // A drop shadow's stencil volume whose shadow the tracer draws (rt_drops_collect) is left out.
         if (!rt_drop_volumes_.empty() && scene_layer && !state_color_write(state) && state_stencil(state) &&
@@ -1050,7 +1214,7 @@ void RenderCore::walk_draw_items(const NebulaFramePass& pass, Draws& encoder) {
             continue;
         }
         // With one pass for the scene, a draw that writes no motion stays in the motion draws' pass (aux 4).
-        std::uint8_t aux = scene_layer && motion_scene_ ? scene_aux(state, layer_window) : 0u;
+        std::uint8_t aux = scene_layer && motion_scene_ ? core::scene_aux(state, layer_window) : 0u;
         if (scene_layer && motion_scene_ && one_pass && aux != 1u) {
             aux = 4u;
         }
@@ -1060,6 +1224,15 @@ void RenderCore::walk_draw_items(const NebulaFramePass& pass, Draws& encoder) {
         } else if (rt_light_on_ && scene_layer && rt_prepassed_[i] != 0u && aux <= 4u &&
                    program_traced(entry.desc.pixel)) {
             aux = static_cast<std::uint8_t>(aux | kAuxTraced);  // a surface the light pass saw: its colour and lights by their shares
+        }
+        // An added clear shell the second layer took (rt_prepass_draws): its traced form is an
+        // exchange (premultiplied: F R over what is behind by 1 - F), not a glow.
+        const bool exchange = aux >= kAuxTraced && rt_prepassed_[i] == 2u && core::added_prepass_draws(state);
+        if (exchange) {
+            aux = static_cast<std::uint8_t>(aux | kAuxExchange);
+        }
+        if (::galaxy::diagnosing(::galaxy::kDiagnoseProgramsDrawn)) [[unlikely]] {
+            note_program_drawn(entry.desc.vertex, entry.desc.pixel);
         }
         gpu::Pipeline* pipeline = pipelines_.get(item.pipeline, entry, target_variant, aux);
         if (pipeline == nullptr) {  // the driver refused it: the player misses this draw
@@ -1111,7 +1284,7 @@ void RenderCore::walk_draw_items(const NebulaFramePass& pass, Draws& encoder) {
         const core::StaticSlot& material = walk_material(item.constants);
         encoder.set_material(material.vertex_rows, material.pixel_rows);
         gpu::DrawRoot root;
-#if defined(NEBULA_GPU_VULKAN) || defined(NEBULA_GPU_METAL)
+#if defined(NEBULA_GPU_VULKAN) || defined(NEBULA_GPU_METAL) || defined(NEBULA_GPU_D3D11)
         if (!renderer_.bindless()) {
             gpu::Table textures{}, samplers{};
             walk_bound_tables(item.textures, textures, samplers);
@@ -1123,13 +1296,65 @@ void RenderCore::walk_draw_items(const NebulaFramePass& pass, Draws& encoder) {
             walk_tables(item.textures, lists, root.table);
             encoder.bind_textures(lists);
         }
+        // A metal (draw flag 128): no body, all its light its mirror's: share 1, no added light.
+        const bool metal = rt_light_on_ && scene_layer && (item.flags & (NEBULA_ITEM_RING | NEBULA_ITEM_INSTANCES)) == 0u &&
+                           registries_.mesh(item.mesh).hit_class == NEBULA_HIT_METAL;
         root.first_instance = i;
+        // Shown as it is (program.hlsli draw flag 64): the sky and what is drawn with it, and a
+        // surface the cooker classed glowing: no share, no added light, no mirror. The sky takes no air in front (8).
+        const std::uint32_t category = (item.flags & NEBULA_ITEM_CATEGORY_MASK) >> NEBULA_ITEM_CATEGORY_SHIFT;
+        const bool sky_draw = category == NEBULA_CATEGORY_SKY || category == NEBULA_CATEGORY_AIR || category == NEBULA_CATEGORY_SUN ||
+                              category == NEBULA_CATEGORY_ASTRO_DOME_SKY;
+        const bool shown = rt_light_on_ && scene_layer &&
+                           (sky_draw || ((item.flags & (NEBULA_ITEM_RING | NEBULA_ITEM_INSTANCES)) == 0u &&
+                                         registries_.mesh(item.mesh).hit_class == NEBULA_HIT_EMISSIVE));
+        // The shade's bound by the light set's kind, the art's own split
+        // (program.hlsli traced_tint_bound): 2048 a set of the player, strong, weak or coin records (characters,
+        // enemies, objects), 4096 a planet set (the environment); neither for an unknown set or none.
+        const std::uint32_t set_kind = rt_light_on_ && scene_layer && item.light_set != NEBULA_NONE32 && item.light_set < list.light_set_count &&
+                                               list.light_set_owners != nullptr
+                                           ? list.light_set_owners[item.light_set].kind
+                                           : std::uint32_t{NEBULA_LIGHT_OWNER_NONE};
+        const bool character = set_kind == NEBULA_LIGHT_OWNER_PLAYER || set_kind == NEBULA_LIGHT_OWNER_STRONG ||
+                               set_kind == NEBULA_LIGHT_OWNER_WEAK || set_kind == NEBULA_LIGHT_OWNER_COIN;
+        const bool environment = set_kind == NEBULA_LIGHT_OWNER_PLANET;
         root.flags = ((item.flags & NEBULA_ITEM_SPREAD_LINES) != 0u ? 1u : 0u) |
+                     (shown ? 64u : 0u) |
+                     (character ? 2048u : 0u) | (environment ? 4096u : 0u) |
+                     (metal ? 128u : 0u) |
+                     // A glowing mesh that is a light this frame: 16384, a being's 32768 too
+                     // (program.hlsli traced_colour). Not 256: that is the added shells' exchange, and
+                     // 256 drew every glowing body flat.
+                     (rt_light_on_ && scene_layer && i < rt_glow_bodies_.size() && rt_glow_bodies_[i] != 0u ? 16384u : 0u) |
+                     (rt_light_on_ && scene_layer && i < rt_glow_bodies_.size() && rt_glow_bodies_[i] == 3u ? 32768u : 0u) |
+                     // A hot body (lava, a sun) burns brighter than a lit surface (program.hlsli traced_colour).
+                     (rt_light_on_ && scene_layer && i < rt_glow_bodies_.size() && rt_glow_bodies_[i] == 2u ? 8192u : 0u) |
                      ((item.flags & NEBULA_ITEM_SPREAD_POINTS) != 0u ? 2u : 0u) |
                      (rt_light_on_ && rt_volume_drawn_ && scene_layer && rt_volume_reads(item, state) ? 4u : 0u) |
+                     // A blended surface off the one the light pass saw (program.hlsli traced_by_air).
+                     (rt_light_on_ && rt_volume_drawn_ && rt_blend_guide_mode_ != 0u && scene_layer && state_color_write(state) &&
+                              (item.flags & (NEBULA_ITEM_INSTANCES | NEBULA_ITEM_PARTICLE)) == 0u &&
+                              (state & 3u) == NEBULA_BLEND_ADD && ((state >> 2u) & 15u) == NEBULA_FACTOR_SRC_ALPHA &&
+                              ((state >> 6u) & 15u) == NEBULA_FACTOR_INV_SRC_ALPHA
+                          ? 16u
+                          : 0u) |
+                     // A glow (its blend adds): no reflection of its own (program.hlsli traced_mirror_own). An
+                     // added clear shell is no glow: an exchange (256), and 512 where the game's add scales by its alpha.
+                     (rt_light_on_ && scene_layer && !exchange && (state & 3u) == NEBULA_BLEND_ADD &&
+                              ((state >> 6u) & 15u) == NEBULA_FACTOR_ONE
+                          ? 32u
+                          : 0u) |
+                     (exchange ? 256u : 0u) |
+                     // White water: a material that keeps none of its art's tint (a fall, a splash; not
+                     // glass or water): its drawn colour by its luminance (program.hlsli traced_untinted).
+                     (rt_light_on_ && scene_layer && mesh != nullptr && mesh->hit_tint_keep == 0.0f &&
+                              mesh->hit_class != NEBULA_HIT_GLASS && mesh->hit_class != NEBULA_HIT_WATER
+                          ? 1024u
+                          : 0u) |
+                     (exchange && ((state >> 2u) & 15u) == NEBULA_FACTOR_SRC_ALPHA ? 512u : 0u) |
                      // The air in front (traced_scatter): a draw that covers what is behind it or blends over it by
                      // its alpha (an added one would add the air twice).
-                     (rt_light_on_ && rt_scatter_drawn_ && scene_layer && state_color_write(state) &&
+                     (rt_light_on_ && rt_scatter_drawn_ && scene_layer && !sky_draw && state_color_write(state) &&
                               ((state & 3u) == NEBULA_BLEND_REPLACE ||
                                ((state & 3u) == NEBULA_BLEND_ADD && ((state >> 2u) & 15u) == NEBULA_FACTOR_SRC_ALPHA &&
                                 ((state >> 6u) & 15u) == NEBULA_FACTOR_INV_SRC_ALPHA))
@@ -1230,7 +1455,7 @@ gpu::Address RenderCore::ring_item_before(std::uint32_t index, gpu::Address own)
 // The sky's up and the flags a scene's views carry (walk_view), from its SCENE_BEGIN.
 void RenderCore::set_scene_sky(const NebulaFramePass& scene_begin) {
     const NebulaFrameList& list = *walk_.now->list;
-    const bool wide = enhanced_lighting_ && get_render_config().wide_scene;
+    const bool wide = wide_scene_;
     std::memcpy(sky_up_, list.sky_up, sizeof(sky_up_));
     view_flags_ = (list.sky_up_known != 0u ? 1u : 0u) | (enhanced_lighting_ ? 2u : 0u) | (wide ? 4u : 0u);
     if (scene_begin.scene_camera != NEBULA_NONE32 && walk_.between && list.sky_up_known != 0u) {
@@ -1241,8 +1466,9 @@ void RenderCore::set_scene_sky(const NebulaFramePass& scene_begin) {
 
 void RenderCore::walk_scene_begin(const NebulaFramePass& pass) {
     const NebulaFrameList& list = *walk_.now->list;
-    const RenderConfig cfg = get_render_config();
-    const bool wide = enhanced_lighting_ && cfg.wide_scene;
+    const bool wide = wide_scene_;
+    // The scene is drawn in dynamic resolution's rectangle from here (its clear may have opened it already).
+    renderer_.begin_scene_rectangle();
     set_scene_sky(pass);
     scene_phase_ = true;
     std::array<float, 12> view_at{};
@@ -1280,6 +1506,7 @@ void RenderCore::walk_scene_begin(const NebulaFramePass& pass) {
     bool switched = false;
     if (renderer_.output_scene_active()) {
         renderer_.end_output_scene();
+        renderer_.begin_scene_rectangle();
         switched = true;
     }
     renderer_.begin_wide_scene(wide);
@@ -1288,12 +1515,50 @@ void RenderCore::walk_scene_begin(const NebulaFramePass& pass) {
     }
     ++walk_view_stamp_;
     if (rt_backend_.started()) {
-        rt_scene(pass);
-        rt_prepass(pass);
+        if (static_cast<std::uint32_t>(&pass - list.passes) == rt_traced_begin_) {
+            rt_scene(pass);
+            rt_prepass(pass);
+        } else {
+            rt_untraced();  // another scene this walk is the traced one
+        }
+    }
+    // The scene's camera for the passes after its end (draw.post's depth, draw.native's matrices).
+    post_scene_known_ = false;
+    if (pass.scene_view != NEBULA_NONE32 && pass.scene_camera != NEBULA_NONE32) {
+        const NebulaFrameView& view = list.views[pass.scene_view];
+        const ScaledViewport viewport = viewport_pixels(view.viewport, renderer_.frame_map());
+        if (viewport.valid()) {
+            post_scene_view_ = scene_depth_view(walk_view_terms_[pass.scene_view].data(), viewport);
+            std::memcpy(post_scene_camera_.data(), walk_cameras_[pass.scene_camera].data(), sizeof(post_scene_camera_));
+            post_scene_ortho_ = view.orthographic != 0u;
+            post_scene_target_[0] = static_cast<float>(renderer_.frame_map().width);
+            post_scene_target_[1] = static_cast<float>(renderer_.frame_map().height);
+            post_scene_known_ = true;
+        }
     }
 }
 
 void RenderCore::walk_opaque_end(const NebulaFramePass& pass) {
+    // The scene's camera as its opaque end gives it (MR::sceneOpaqueEnd, with the scene's projection loaded): the scene
+    // begins before the game loads its projection (GameScene::draw3D), so its begin pass may carry the 2-D one. The
+    // passes after the scene (draw.post's depth, draw.native's matrices) and the upscaler read this one.
+    if (scene_phase_ && pass.scene_view != NEBULA_NONE32 && pass.scene_camera != NEBULA_NONE32) {
+        const NebulaFrameList& list = *walk_.now->list;
+        const NebulaFrameView& view = list.views[pass.scene_view];
+        const ScaledViewport viewport = viewport_pixels(view.viewport, renderer_.frame_map());
+        if (viewport.valid()) {
+            post_scene_view_ = scene_depth_view(walk_view_terms_[pass.scene_view].data(), viewport);
+            std::memcpy(post_scene_camera_.data(), walk_cameras_[pass.scene_camera].data(), sizeof(post_scene_camera_));
+            post_scene_ortho_ = view.orthographic != 0u;
+            post_scene_target_[0] = static_cast<float>(renderer_.frame_map().width);
+            post_scene_target_[1] = static_cast<float>(renderer_.frame_map().height);
+            post_scene_known_ = true;
+        }
+        if (view.orthographic == 0u) {
+            const std::array<float, 6>& terms = walk_view_terms_[pass.scene_view];
+            renderer_.set_scene_camera(terms[5] / (terms[4] - 1.0f), terms[5] / terms[4], 2.0f * std::atan(1.0f / std::fabs(terms[2])));
+        }
+    }
     if (rt_backend_.started() && scene_phase_) {
         rt_blended(pass);
     }
@@ -1317,14 +1582,20 @@ void RenderCore::walk_opaque_end(const NebulaFramePass& pass) {
 }
 
 void RenderCore::walk_scene_end() {
+    rt_program_signal();  // signals S and A: the scene as the programs drew it, before anything after the scene
+    pipelines_.scene_drawn();
     rt_reactive();
+    // The camera's finish (scene_camera.hlsl g_finish): 1 traced with the relight in the sun (form above 0,
+    // rt_look_[0]; 0 is Painted), 2 traced with the relight and no sun (the eye may open), 0 none.
+    const unsigned traced_finish =
+        !(rt_light_on_ && rt_physical_) ? 0u : rt_look_[0] > 0.0f ? 1u : rt_sunless_ ? 2u : 0u;
     rt_light_end();
     scene_phase_ = false;
     temporal_scene_ = false;
     motion_scene_ = false;
     scene_mip_bias_ = 0.0f;
     collect_ao_objects_ = false;
-    renderer_.end_wide_scene();
+    renderer_.end_wide_scene(traced_finish);
     // Once 3D is complete, post-AA and the 2D layer need one value per pixel. Keep all the selected
     // geometry samples through the resolve, without writing their identical post-AA result back N times.
     if (renderer_.begin_output_scene(true)) {
@@ -1334,6 +1605,8 @@ void RenderCore::walk_scene_end() {
     if (renderer_.begin_output_scene()) {
         display_pictures_.set_frame_map(renderer_.frame_map());
     }
+    // HDR output: the HUD and menus from here in the scene's 10-bit format, ending at the paper white.
+    renderer_.begin_layer_2d();
     note_layer_2d_lines(renderer_.frame_map().height);
     ++walk_view_stamp_;
 }
@@ -1492,6 +1765,7 @@ void RenderCore::plan_early_probes(ListData& now) {
     const auto keeps_depth = [&](const NebulaFramePass& pass) {
         switch (pass.kind) {
         case NEBULA_PASS_PROBE:
+        case NEBULA_PASS_TRACED_DRAW:  // draws nothing
             return true;
         case NEBULA_PASS_CLEAR:
             return pass.layer == NEBULA_LAYER_TARGET || (pass.clear_channels & 4u) == 0u;
@@ -1515,15 +1789,28 @@ void RenderCore::plan_early_probes(ListData& now) {
         if (list.passes[p].kind != NEBULA_PASS_PROBE) {
             continue;
         }
+        // Back to the scene's end if nothing between changes its depth (frame copies do not): asked there, the scene's
+        // own depth is still the bound one (before an upscaler or the resolve trades the targets). Else after the
+        // nearest frame copy, where the scene pass is closed anyway.
+        std::uint32_t copy = NEBULA_NONE32;
         for (std::uint32_t q = p; q-- > 0u;) {
             const NebulaFramePass& pass = list.passes[q];
-            if (pass.kind == NEBULA_PASS_COPY_FRAME || pass.kind == NEBULA_PASS_TAKE_FRAME) {
-                now.early_probes.push_back(core::ListData::EarlyProbe{q, p});
+            if (pass.kind == NEBULA_PASS_SCENE_END) {
+                copy = q;
                 break;
+            }
+            if (pass.kind == NEBULA_PASS_COPY_FRAME || pass.kind == NEBULA_PASS_TAKE_FRAME) {
+                if (copy == NEBULA_NONE32) {
+                    copy = q;
+                }
+                continue;
             }
             if (!keeps_depth(pass)) {
                 break;
             }
+        }
+        if (copy != NEBULA_NONE32) {
+            now.early_probes.push_back(core::ListData::EarlyProbe{copy, p});
         }
     }
 }
@@ -1560,7 +1847,7 @@ void RenderCore::plan_late_depth_clears(ListData& now) {
                 break;  // the whole depth again
             } else if (pass.kind == NEBULA_PASS_DRAW) {
                 late = leaves_depth(pass);
-            } else if (pass.kind != NEBULA_PASS_CLEAR && pass.kind != NEBULA_PASS_SHOW) {
+            } else if (pass.kind != NEBULA_PASS_CLEAR && pass.kind != NEBULA_PASS_SHOW && pass.kind != NEBULA_PASS_TRACED_DRAW) {
                 late = false;
             }
         }
@@ -1573,7 +1860,16 @@ void RenderCore::plan_late_depth_clears(ListData& now) {
 void RenderCore::walk_list(ListData& now, ListData* before, const WalkTime& time) {
     prepare_walk(now, before, time);
     const NebulaFrameList& list = *now.list;
+    rt_traced_begin_ = rt_backend_.started() ? rt_pick_scene() : NEBULA_NONE32;
     target_open_ = false;
+    post_scene_known_ = false;
+    if (walk_picture_list_ == &list && walk_picture_frame_ == list.game_frame) {
+        ++walk_picture_;
+    } else {
+        walk_picture_list_ = &list;
+        walk_picture_frame_ = list.game_frame;
+        walk_picture_ = 0u;
+    }
     std::uint32_t target_channels = 0u;
     if (!now.targets_planned) {
         plan_early_targets(now);
@@ -1602,7 +1898,7 @@ void RenderCore::walk_list(ListData& now, ListData* before, const WalkTime& time
         }
         walk_pass(now, p, target_channels);
         for (const core::ListData::EarlyProbe& early : now.early_probes) {
-            if (early.after == p && now.probes_due(walk_.between)) {
+            if (early.after == p && list.passes[p].kind != NEBULA_PASS_SCENE_END && now.probes_due(walk_.between)) {
                 const NebulaFramePass& probe = list.passes[early.probe];
                 record_screen_probes(probe.probe_channel, list.probes + probe.first_probe, probe.probe_count,
                                      probe.arg0 == NEBULA_PROBE_COMPARED);
@@ -1620,6 +1916,9 @@ void RenderCore::walk_pass(ListData& now, std::uint32_t p, std::uint32_t& target
     const NebulaFrameList& list = *now.list;
     {
         const NebulaFramePass& pass = list.passes[p];
+        if (pass.kind == NEBULA_PASS_TRACED_DRAW) {
+            return;  // the tracer's alone (rt_walk.cpp): nothing drawn, no target closed
+        }
         if (target_open_ && (pass.layer != NEBULA_LAYER_TARGET || (pass.kind == NEBULA_PASS_DRAW && pass.load != 0u))) {
             walk_target_end(target_channels);
         }
@@ -1637,8 +1936,11 @@ void RenderCore::walk_pass(ListData& now, std::uint32_t p, std::uint32_t& target
             // The whole frame cleared just before the scene begins: the scene's own pass can open with the clear.
             const bool starts_scene = !target_open_ && (pass.clear_channels & 5u) == 5u &&
                 p + 1u < list.pass_count && list.passes[p + 1u].kind == NEBULA_PASS_SCENE_BEGIN;
-            const bool starts_hdr = starts_scene && enhanced_lighting_ && get_render_config().wide_scene &&
-                !renderer_.temporal_mode();
+            const bool starts_hdr = starts_scene && wide_scene_ && !renderer_.temporal_mode();
+            if (starts_scene) {
+                // The scene's pass opens with this clear: in dynamic resolution's rectangle.
+                renderer_.begin_scene_rectangle();
+            }
             SceneClearValues clear = make_scene_clear_values(pass.clear_rgba, 0u);
             if (starts_hdr) {
                 // The skipped SDR attachment would have rounded the clear before widening it to FP16.
@@ -1673,7 +1975,17 @@ void RenderCore::walk_pass(ListData& now, std::uint32_t p, std::uint32_t& target
                 note_generated_written(pass.target);
             }
             request.channels = pass.channels < kCopyLayoutDisplay ? static_cast<std::uint8_t>(pass.channels) : 0u;
-            (void)renderer_.draw_frame_pass(request, texture_store_);
+            // A copy before the list writes the frame (the camera's cover asks one in the game's step, before its frame
+            // starts) takes the picture shown last, as the console's frame buffer still held it.
+            bool before_frame = true;
+            for (std::uint32_t q = 0; q < p && before_frame; ++q) {
+                before_frame = list.passes[q].kind == NEBULA_PASS_COPY_FRAME;
+            }
+            const DisplayTexture* shown = before_frame ? display_pictures_.latest() : nullptr;
+            if (shown != nullptr ? renderer_.draw_shown_frame_pass(request, *shown, texture_store_)
+                                 : renderer_.draw_frame_pass(request, texture_store_)) {
+                ++pictures_moved_;
+            }
             break;
         }
         case NEBULA_PASS_TAKE_FRAME: {
@@ -1687,12 +1999,16 @@ void RenderCore::walk_pass(ListData& now, std::uint32_t p, std::uint32_t& target
                 const auto width = static_cast<std::uint32_t>(map.width);
                 const auto height = static_cast<std::uint32_t>(map.height);
                 gpu::TextureRef released;
-                (void)renderer_.take_scene(key, display_pictures_.take_idle_texture(width, height), texture_store_, released);
+                if (renderer_.take_scene(key, display_pictures_.take_idle_texture(width, height), texture_store_, released)) {
+                    ++pictures_moved_;
+                }
                 display_pictures_.release_texture(std::move(released), width, height);
             } else {
                 FramePassRequest request{};
                 request.key = key;
-                (void)renderer_.draw_frame_pass(request, texture_store_);
+                if (renderer_.draw_frame_pass(request, texture_store_)) {
+                    ++pictures_moved_;
+                }
             }
             break;
         }
@@ -1703,6 +2019,16 @@ void RenderCore::walk_pass(ListData& now, std::uint32_t p, std::uint32_t& target
             walk_opaque_end(pass);
             break;
         case NEBULA_PASS_SCENE_END:
+            // The probes asked after the scene with its depth unchanged (plan_early_probes): while it is still bound.
+            if (now.probes_due(walk_.between)) {
+                for (const core::ListData::EarlyProbe& early : now.early_probes) {
+                    if (early.after == p) {
+                        const NebulaFramePass& probe = list.passes[early.probe];
+                        record_screen_probes(probe.probe_channel, list.probes + probe.first_probe, probe.probe_count,
+                                             probe.arg0 == NEBULA_PROBE_COMPARED);
+                    }
+                }
+            }
             walk_scene_end();
             break;
         case NEBULA_PASS_BLOOM_HOLD:
@@ -1721,10 +2047,128 @@ void RenderCore::walk_pass(ListData& now, std::uint32_t p, std::uint32_t& target
         case NEBULA_PASS_SHOW:
             walk_show();
             break;
+        case NEBULA_PASS_POST:
+            walk_post(list, pass);
+            break;
+        case NEBULA_PASS_NATIVE:
+            walk_native(list, pass);
+            break;
         default:
             break;
         }
     }
+}
+
+void RenderCore::walk_post(const NebulaFrameList& list, const NebulaFramePass& pass) {
+    // A program the game freed after the list was made, or rows outside the list: the frame stays as it is.
+    const std::shared_ptr<const ModPostProgram> program = mod_post_program(pass.arg0);
+    if (!program || list.instance_rows == nullptr || pass.first_item > list.instance_row_count ||
+        list.instance_row_count - pass.first_item < 4u) {
+        return;
+    }
+    ModPostConstants constants{};
+    // The game's time at this picture: between the frame before (t = 0) and this one (t = 1) in a generated picture,
+    // so the program's animation moves at the display's rate.
+    constants.time = static_cast<float>((static_cast<double>(list.game_frame) - 1.0 + static_cast<double>(walk_.time.t)) /
+                                        kGameStepRate);
+    constants.frame = list.game_frame;
+    std::memcpy(constants.params, list.instance_rows + pass.first_item, sizeof(constants.params));
+    // Distance along the view axis from the depth target's value D (scene_depth_view: the host's clip z is
+    // z z_scale + z_offset, w = -z; reversed, the far plane at 0). With distance = -z,
+    // ndc = (D - min) / (max - min) = z_offset / distance - z_scale, so
+    // distance = z_offset (max - min) / (D - min + z_scale (max - min)). GX's perspective has E = -n / (f - n) and
+    // F = -f n / (f - n), so z_scale = -E k and z_offset = -F k are both positive: the numerator is positive and so is
+    // the denominator for every depth the scene drew (D 0, the far plane, gives z_offset / z_scale = f).
+    bool depth = false;
+    constants.depth_terms[3] = 3.0e38f;
+    if (post_scene_known_ && !post_scene_ortho_ && (program->reads & kModPostReadsDepth) != 0u) {
+        const RtView& v = post_scene_view_;
+        const float range = v.max_depth - v.min_depth;
+        constants.depth_terms[0] = v.z_offset * range;
+        constants.depth_terms[1] = 1.0f;
+        constants.depth_terms[2] = v.z_scale * range - v.min_depth;
+        // The far plane: F / E (ndc 0); an infinite one (E 0) the largest number.
+        constants.depth_terms[3] = v.z_scale != 0.0f ? std::min(v.z_offset / v.z_scale, 3.0e38f) : 3.0e38f;
+        depth = constants.depth_terms[0] > 0.0f && constants.depth_terms[3] > 0.0f;
+    }
+    // The picture trades places with the scene target: its allocated size (frame_extent; the frame is drawn in a part of
+    // it under dynamic resolution).
+    const FrameMap& map = renderer_.frame_extent();
+    const auto width = static_cast<std::uint32_t>(map.width);
+    const auto height = static_cast<std::uint32_t>(map.height);
+    if (width == 0u || height == 0u) {
+        return;
+    }
+    // The frame so far becomes the program's input picture; a fresh target takes its place as the frame.
+    gpu::TextureRef picture = renderer_.take_frame_picture(display_pictures_.take_idle_texture(width, height));
+    if (!picture) {
+        return;
+    }
+    renderer_.record_mod_post(*program, constants, picture, depth);
+    display_pictures_.release_texture(std::move(picture), width, height);
+}
+
+void RenderCore::walk_native(const NebulaFrameList& list, const NebulaFramePass& pass) {
+    if (list.native_calls == nullptr || pass.first_item >= list.native_call_count) {
+        return;
+    }
+    const NebulaCall& call = list.native_calls[pass.first_item];
+    if (call.fn == nullptr) {
+        return;
+    }
+    NebulaFrame frame{};
+    frame.size = sizeof(frame);
+    frame.point = pass.arg0;
+    frame.game_frame = list.game_frame;
+    frame.picture = walk_picture_;
+    // Points 0 to 2 are in the scene. view: the game's 3x4 camera and 0 0 0 1. projection: the one the host draws the
+    // scene with, in Direct3D's clip space (x right, y up, z 0 to 1 reversed: near 1), with this picture's jitter,
+    // and the scene's viewport and depth range folded in: a vertex drawn with projection x view through a viewport
+    // over the whole target (depth 0 to 1) lands on the scene's own pixel and depth. The Vulkan renderer turns y for
+    // its positive-height viewport (record_native_call).
+    const bool scene_point = pass.arg0 <= 2u;
+    if (scene_point && post_scene_known_ && post_scene_target_[0] > 0.0f && post_scene_target_[1] > 0.0f) {
+        for (unsigned i = 0; i < 12u; ++i) {
+            frame.view[i] = post_scene_camera_[i];
+        }
+        frame.view[15] = 1.0f;
+        const RtView& v = post_scene_view_;
+        // The host's clip rows over the scene viewport (scene_depth_view's terms, its jitter in [1] and [3]).
+        float rows[4][4]{};
+        if (post_scene_ortho_) {
+            rows[0][0] = v.projection[0];
+            rows[0][3] = v.projection[1];
+            rows[1][1] = v.projection[2];
+            rows[1][3] = v.projection[3];
+            rows[2][2] = v.z_scale;
+            rows[2][3] = v.z_offset;
+            rows[3][3] = 1.0f;
+        } else {
+            rows[0][0] = v.projection[0];
+            rows[0][2] = v.projection[1];
+            rows[1][1] = v.projection[2];
+            rows[1][2] = v.projection[3];
+            rows[2][2] = v.z_scale;
+            rows[2][3] = v.z_offset;
+            rows[3][2] = -1.0f;
+        }
+        // The viewport (pixels, y down) and depth range into the whole target's: x' = x sx + w tx, y' = y sy + w ty,
+        // z' = z (max - min) + w min.
+        const float width = post_scene_target_[0];
+        const float height = post_scene_target_[1];
+        const float sx = v.viewport[2] / width;
+        const float tx = (2.0f * v.viewport[0] + v.viewport[2]) / width - 1.0f;
+        const float sy = v.viewport[3] / height;
+        const float ty = 1.0f - (2.0f * v.viewport[1] + v.viewport[3]) / height;
+        const float range = v.max_depth - v.min_depth;
+        for (unsigned c = 0; c < 4u; ++c) {
+            frame.projection[0u * 4u + c] = rows[0][c] * sx + rows[3][c] * tx;
+            frame.projection[1u * 4u + c] = rows[1][c] * sy + rows[3][c] * ty;
+            frame.projection[2u * 4u + c] = rows[2][c] * range + rows[3][c] * v.min_depth;
+            frame.projection[3u * 4u + c] = rows[3][c];
+        }
+    }
+    renderer_.record_native_call(call, frame, scene_point);
 }
 
 void RenderCore::walk_show() {
@@ -1739,7 +2183,7 @@ void RenderCore::walk_show() {
     if (picture == nullptr) {
         return;
     }
-    const FrameMap& map = renderer_.frame_map();
+    const FrameMap& map = renderer_.frame_extent();  // trades places with the scene target: its allocated size
     display_pictures_.adopt_picture(*picture, renderer_.take_frame_picture(display_pictures_.take_idle_texture(
                                                   static_cast<std::uint32_t>(map.width), static_cast<std::uint32_t>(map.height))));
     renderer_.copy_fg_hudless_display(*picture);

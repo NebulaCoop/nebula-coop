@@ -4,6 +4,7 @@
 
 #include "galaxy/render/mtl/post_process_mtl.h"
 
+#include "galaxy/render/idle_clock.h"
 #include "galaxy/render/mtl/utility_msl.h"
 
 #include "AreaTex.h"
@@ -117,6 +118,9 @@ void PostProcessor::initialize(const PostProcessSettings& settings, Format scene
             options.fastMathEnabled = NO;
             options.languageVersion = MTLLanguageVersion2_4;
             for (unsigned program = 0; program < kProgramCount; ++program) {
+                if (program == kEasuHalfPs) {
+                    continue;  // Vulkan's: Metal runs EASU from kEasuPs
+                }
                 for (unsigned quality = 0; quality < 4u; ++quality) {
                     if (quality != 0u && !kFollowsQuality[program]) {
                         made.at[program][quality] = retain(made.at[program][0]);
@@ -310,7 +314,7 @@ void PostProcessor::apply_settings(const PostProcessSettings& settings) {
 }
 
 bool PostProcessor::ensure_target(Target& target, unsigned width, unsigned height, Format format) {
-    target.used = clock_;
+    target.used = idle_clock();
     if (target.texture && target.width == width && target.height == height) {
         return true;
     }
@@ -323,12 +327,12 @@ bool PostProcessor::ensure_target(Target& target, unsigned width, unsigned heigh
     }
     target.width = width;
     target.height = height;
-    target.used = clock_;
+    target.used = idle_clock();
     return true;
 }
 
 bool PostProcessor::ensure_smaa_targets(unsigned width, unsigned height) {
-    smaa_used_ = clock_;
+    smaa_used_ = idle_clock();
     if (stencil_.texture && stencil_.width == width && stencil_.height == height && edges_.texture && weights_.texture) {
         return true;
     }
@@ -340,17 +344,19 @@ bool PostProcessor::ensure_smaa_targets(unsigned width, unsigned height) {
 // Hands back the targets no pass has asked for in 600 scene AA calls (SMAA's after a switch to FXAA or off, the
 // scaling intermediate after a window size that needs none); the next pass that wants one makes it again.
 void PostProcessor::trim_idle_targets() {
-    constexpr std::uint64_t kTargetIdleFrames = 600u;
-    if (stencil_.texture && clock_ > smaa_used_ + kTargetIdleFrames) {
+    if (stencil_.texture && idle_since(smaa_used_)) {
         edges_ = weights_ = stencil_ = {};
     }
     for (Target* target : {&antialiased_, &scaled_, &spatial_output_}) {
-        if (target->texture && clock_ > target->used + kTargetIdleFrames) {
+        if (target->texture && idle_since(target->used)) {
             *target = {};
         }
     }
     if (!spatial_output_.texture) {
         spatial_.reset();
+    }
+    if (traded_ && idle_since(traded_used_)) {
+        traded_.reset();
     }
 }
 
@@ -385,7 +391,8 @@ void PostProcessor::draw(Object encoder, Object pipeline_state, Stencil stencil,
 }
 
 // SMAA's edges and weights, or nothing for FXAA, from `source` (a copy of the picture).
-bool PostProcessor::record_aa(Object commands, AaRun pass, Object source, unsigned width, unsigned height) {
+bool PostProcessor::record_aa(Object commands, AaRun pass, Object source, unsigned width, unsigned height,
+                              unsigned part_width, unsigned part_height) {
     if (pass != AaRun::kSmaa) {
         return true;
     }
@@ -397,17 +404,20 @@ bool PostProcessor::record_aa(Object commands, AaRun pass, Object source, unsign
     if (edges_pipeline == nullptr || weights_pipeline == nullptr) {
         return false;
     }
-    const gpu::Rect full = gpu::rect(0, 0, static_cast<std::int32_t>(width), static_cast<std::int32_t>(height));
+    // The edges and weights are cleared whole (their passes' load) and drawn in the picture's part: past it they are
+    // zero, so the searches end at its edge (post_process.hlsl PicturePart).
+    const gpu::Rect part = gpu::rect(0, 0, static_cast<std::int32_t>(part_width), static_cast<std::int32_t>(part_height));
     PostConstants c{};
     set_post_input_size(c, width, height);
+    set_post_input_part(c, part_width, part_height);
     @autoreleasepool {
         id<MTLRenderCommandEncoder> const edges = begin_pass(commands, edges_.texture, stencil_.texture, true, true, @"SMAA edges");
-        draw((__bridge void*)edges, edges_pipeline, Stencil::Mark, &source, 1u, full, c);
+        draw((__bridge void*)edges, edges_pipeline, Stencil::Mark, &source, 1u, part, c);
         [edges endEncoding];
         id<MTLRenderCommandEncoder> const weights =
             begin_pass(commands, weights_.texture, stencil_.texture, true, false, @"SMAA weights");
         const Object inputs[3] = {edges_.texture->texture, area_texture_->texture, search_texture_->texture};
-        draw((__bridge void*)weights, weights_pipeline, Stencil::Test, inputs, 3u, full, c);
+        draw((__bridge void*)weights, weights_pipeline, Stencil::Test, inputs, 3u, part, c);
         [weights endEncoding];
     }
     return true;
@@ -415,20 +425,36 @@ bool PostProcessor::record_aa(Object commands, AaRun pass, Object source, unsign
 
 AaRun PostProcessor::prepare_scene_aa(Object commands, const Texture& color, unsigned width, unsigned height,
                                       unsigned picture_width, unsigned picture_height, unsigned display_width,
-                                      unsigned display_height) {
+                                      unsigned display_height, const SceneTrade& trade) {
+    scene_traded_ = false;
     if (!ready_ || width == 0u || height == 0u) {
         return AaRun::kNone;
     }
-    ++clock_;
     trim_idle_targets();
     const PostProcessPlan plan = plan_post_process(picture_width, picture_height, display_width, display_height, settings_,
                                                    status_.smaa_ok, status_.fxaa_ok);
     AaRun pass = plan.smaa ? AaRun::kSmaa : plan.fxaa ? AaRun::kFxaa : AaRun::kNone;
-    // The passes read a copy of the scene and write the scene target.
-    if (pass != AaRun::kNone && !ensure_target(antialiased_, width, height, scene_format_)) {
-        pass = AaRun::kNone;
+    // The part of the target the picture is drawn in (dynamic resolution's rectangle; the whole target without it).
+    part_width_ = std::min(picture_width != 0u ? picture_width : width, width);
+    part_height_ = std::min(picture_height != 0u ? picture_height : height, height);
+    // SMAA's targets and the whole-target last pass before the scene's image may change hands: once traded, a pass
+    // must run.
+    if (pass == AaRun::kSmaa && !ensure_smaa_targets(width, height)) {
+        pass = status_.fxaa_ok ? AaRun::kFxaa : AaRun::kNone;
     }
-    if (pass != AaRun::kNone) {
+    const bool whole_pass = pass == AaRun::kSmaa ? pipeline(kSmaaBlendVs, kSmaaBlendPs, scene_format_, depth_format_, kRgba) != nullptr
+                                                 : pipeline(kFullscreenVs, kFxaaPs, scene_format_, depth_format_, kRgba) != nullptr;
+    // The passes read the scene's own image, traded out, and write every pixel and channel of the image that took its
+    // place (of the picture's part: no pass reads past it); or they read a copy of the scene and write its colour back
+    // into the scene target.
+    if (pass != AaRun::kNone && trade && whole_pass) {
+        traded_ = trade(std::move(traded_));
+        traded_used_ = idle_clock();
+        scene_traded_ = true;
+        (void)record_aa(commands, pass, traded_->texture, width, height, part_width_, part_height_);
+    } else if (pass != AaRun::kNone && !ensure_target(antialiased_, width, height, scene_format_)) {
+        pass = AaRun::kNone;
+    } else if (pass != AaRun::kNone) {
         @autoreleasepool {
             id<MTLBlitCommandEncoder> const blit = [(__bridge id<MTLCommandBuffer>)commands blitCommandEncoder];
             blit.label = @"scene copy for AA";
@@ -436,14 +462,14 @@ AaRun PostProcessor::prepare_scene_aa(Object commands, const Texture& color, uns
                       sourceSlice:0
                       sourceLevel:0
                      sourceOrigin:MTLOriginMake(0, 0, 0)
-                       sourceSize:MTLSizeMake(width, height, 1)
+                       sourceSize:MTLSizeMake(part_width_, part_height_, 1)  // the picture's part (read no further)
                         toTexture:metal(antialiased_.texture)
                  destinationSlice:0
                  destinationLevel:0
                 destinationOrigin:MTLOriginMake(0, 0, 0)];
             [blit endEncoding];
         }
-        if (!record_aa(commands, pass, antialiased_.texture->texture, width, height)) {
+        if (!record_aa(commands, pass, antialiased_.texture->texture, width, height, part_width_, part_height_)) {
             pass = status_.fxaa_ok ? AaRun::kFxaa : AaRun::kNone;
         }
     }
@@ -468,18 +494,25 @@ void PostProcessor::finish_scene_aa(Object encoder, AaRun pass, unsigned width, 
     if (pass == AaRun::kNone) {
         return;
     }
-    const gpu::Rect full = gpu::rect(0, 0, static_cast<std::int32_t>(width), static_cast<std::int32_t>(height));
+    // The picture's part prepare_scene_aa worked in.
+    const unsigned part_w = std::min(part_width_, width);
+    const unsigned part_h = std::min(part_height_, height);
+    const gpu::Rect full = gpu::rect(0, 0, static_cast<std::int32_t>(part_w), static_cast<std::int32_t>(part_h));
     PostConstants c{};
     set_post_input_size(c, width, height);
+    set_post_input_part(c, part_w, part_h);
+    const Object source = scene_traded_ ? traded_->texture : antialiased_.texture->texture;
+    const std::uint8_t mask = scene_traded_ ? kRgba : kRgb;
     if (pass == AaRun::kFxaa) {
-        const Object state = pipeline(kFullscreenVs, kFxaaPs, scene_format_, depth_format_, kRgb, samples);
-        const Object inputs[1] = {antialiased_.texture->texture};
+        const Object state = pipeline(kFullscreenVs, kFxaaPs, scene_format_, depth_format_, mask, samples);
+        const Object inputs[1] = {source};
         if (state != nullptr) {
             draw(encoder, state, Stencil::None, inputs, 1u, full, c);
         }
     } else {
-        const Object state = pipeline(kSmaaBlendVs, kSmaaBlendKeepPs, scene_format_, depth_format_, kRgb, samples);
-        const Object inputs[2] = {antialiased_.texture->texture, weights_.texture->texture};
+        const Object state = pipeline(kSmaaBlendVs, scene_traded_ ? kSmaaBlendPs : kSmaaBlendKeepPs, scene_format_, depth_format_,
+                                      mask, samples);
+        const Object inputs[2] = {source, weights_.texture->texture};
         if (state != nullptr) {
             draw(encoder, state, Stencil::None, inputs, 2u, full, c);
         }
@@ -562,7 +595,7 @@ PostProcessor::PresentStep PostProcessor::prepare_present(Object commands, const
         step.constants.params[2] = static_cast<float>(target_width);
         step.constants.params[3] = static_cast<float>(target_height);
         if (plan.resample_to_target) {
-            step.pipeline = pipeline(kFullscreenVs, kResamplePs, target_format, Format::None, kRgba);
+            step.pipeline = pipeline(kFullscreenVs, plan.copy ? kCopyPs : kResamplePs, target_format, Format::None, kRgba);
             return step;
         }
         @autoreleasepool {
@@ -605,7 +638,7 @@ bool PostProcessor::record_spatial(Object commands, const Texture& source, unsig
         std::fprintf(stderr, "[post-process] MetalFX spatial %ux%u -> %ux%u\n", source_width, source_height, target_width,
                      target_height);
     }
-    spatial_output_.used = clock_;
+    spatial_output_.used = idle_clock();
     if (!spatial_output_.texture || spatial_output_.width != target_width || spatial_output_.height != target_height) {
         spatial_output_ = {};
         spatial_output_.texture = Context::get().create_texture(target_width, target_height, 1u, scene_format_,
@@ -616,7 +649,7 @@ bool PostProcessor::record_spatial(Object commands, const Texture& source, unsig
         }
         spatial_output_.width = target_width;
         spatial_output_.height = target_height;
-        spatial_output_.used = clock_;
+        spatial_output_.used = idle_clock();
     }
     spatial_->encode(commands, source, *spatial_output_.texture);
     return true;
@@ -626,7 +659,8 @@ void PostProcessor::finish_present(Object encoder, const PresentStep& step, cons
     PostConstants constants = step.constants;
     constants.origin[0] = viewport.left;
     constants.origin[1] = viewport.top;
-    set_post_output(constants, output);
+    set_post_output(constants, output, static_cast<unsigned>(std::max(viewport.right - viewport.left, 0)),
+                    static_cast<unsigned>(std::max(viewport.bottom - viewport.top, 0)));
     if (step.ten_bit && !output.hdr) {
         // A target with the scene's ten bits takes the picture as it is: nothing to round, so nothing to dither.
         constants.origin[2] = 0;
@@ -722,7 +756,7 @@ void PostProcessor::self_test() {
         for (unsigned i = 0; i < 2u; ++i) {
             const bool ok = passes[i] == AaRun::kSmaa ? status_.smaa_ok : status_.fxaa_ok;
             if (!ok) continue;
-            if (!ensure_target(antialiased_, kSize, kSize, scene_format_) || !record_aa(list, passes[i], source->texture, kSize, kSize)) {
+            if (!ensure_target(antialiased_, kSize, kSize, scene_format_) || !record_aa(list, passes[i], source->texture, kSize, kSize, kSize, kSize)) {
                 fail(passes[i], "NO MEMORY");
                 continue;
             }

@@ -179,6 +179,12 @@ namespace NebulaHost {
         }
     }
 
+    // A mod's chat command on the chat (options: its words split by spaces): true when added.
+    inline bool coopCommandAdd(const char* pName, const char* pDescription, const char* pOptions) {
+        const NebulaHostServices* pHost = nebula_host();
+        return pHost->coop_command_add != nullptr && pHost->coop_command_add(pHost->user, pName, pDescription, pOptions) != 0;
+    }
+
     // A mod's chat command this player typed: 1 with its name and its word's place, 0 when none waits.
     inline s32 coopCommandTake(char* pCommand, u32 capacity, s32* pWord) {
         if (capacity > 0) {

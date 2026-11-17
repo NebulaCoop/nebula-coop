@@ -4,7 +4,7 @@
 //
 // The room's own (add_room_commands) are sm64coopdx's: /players, and for the host /kick, /ban, /permban and
 // /moderator, each asking first (/confirm does it, any other line drops it); a moderator may /kick and /ban. Any
-// other feature adds its own with add(), and a co-op mod's luma.json "commands" with add_mod_command, as a sm64coopdx
+// other feature adds its own with add(), and a co-op mod its own with add_mod_command (the coop service), as a sm64coopdx
 // mod does with hook_chat_command (the built-in Personal Star Counter's /psc).
 //
 // What a command says shows in the chat for this player alone (Chat::say). A built-in text is a NebulaText id
@@ -93,7 +93,7 @@ private:
 // with the chat attached.
 void add_room_commands(Chat& chat, Session& session);
 
-// A mod's command (luma.json "commands", sm64coopdx's hook_chat_command): /`name` goes to `send` with its word's place
+// A mod's command (the coop service's add_command, sm64coopdx's hook_chat_command): /`name` goes to `send` with its word's place
 // in `options` (1 the first, case aside; 0 for no word), for the mod's scripts' chat_command. Without `options`, a
 // "[On|Off]" in `description` gives them. A word that is none of them, or more than one word, is refused. False as
 // add's.

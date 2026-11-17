@@ -1,4 +1,4 @@
-/* The game module's interface to Nebula's host (docs/NATIVE_PORT.md, "Module layout"): plain C, so the game module
+/* The game module's interface to Nebula's host: plain C, so the game module
    (built against the game's own C++ library) and the host (the host's C++ library) share nothing else. The host fills
    NebulaHostServices and calls nebula_game_attach, then runs the game on its game thread with nebula_game_run. Game code
    runs on that thread only, but for nebula_game_sound_frame (the host's audio clock) and nebula_game_mii_valid (any
@@ -26,7 +26,8 @@ extern "C" {
 
 /* Upstream Nebula's number for this interface. Co-op changes leave it as it is (docs/COOP_PLAN.md "Versions"): the
    host checks the module against the header's fingerprint (nebula_game_api_fingerprint), which the build works out. */
-#define NEBULA_GAME_API_VERSION 153u
+#define NEBULA_GAME_API_VERSION 158u
+
 
 /* The game's fixed step: nebula_game_run's loop runs this many steps a second (frame_wait paces them), whatever the
    display's rate; the host presents each or interpolates between them. */
@@ -340,6 +341,25 @@ enum {
     NEBULA_HOME_MENU_VIEW,
     NEBULA_HOME_MENU_POINT,    /* value: the answer under the pointer, selected */
     NEBULA_HOME_MENU_CHOOSE,   /* value: the answer clicked */
+    /* Launcher mode's home screen (docs/using-nebula/command-line-arguments.md --home), opened at the boot's title hold: 1 when the host opened
+       it. While it is open and the HOME Menu is not, VIEW, POINT and CHOOSE are its own: the view has bit 16 set, bits
+       0-7 the selected answer and bits 8-15 the page (0 the rows Play, Settings, Quit; 1 an update's notice, whose
+       answer is Back). */
+    NEBULA_HOME_MENU_LAUNCHER_OPEN,
+    NEBULA_HOME_MENU_LAUNCHER_POLL, /* its choice: -1 none yet, 0 play (the boot goes on to the title), 1 quit, 2 the
+                                       benchmark (the game quits; the host starts again into it) */
+    NEBULA_HOME_MENU_LAUNCHER_TEXT, /* value: bits 16-31 which (0 the update's version, 1 its notes), bits 0-15 a
+                                       position: its UTF-16 unit there, 0 past the end */
+    /* The title's press: 1 when the host shows the update the start's check found, its notice alone over the title (the
+       launcher's view, page 1). LAUNCHER_POLL then answers 0 for Later (the game goes on) or 3 for Update. Once a
+       session. */
+    NEBULA_HOME_MENU_LAUNCHER_NOTICE,
+    /* Each frame no reset of the game's own runs, past the boot: 1 once when the host asks the game back to its title
+       through its reset (GameSystemRestartProcess), the saves read again and the file in play left blank (the benchmark
+       in the running game, at its start and at its end); else 0. */
+    NEBULA_HOME_MENU_RESET,
+    /* That reset's saves are read: the title comes next. */
+    NEBULA_HOME_MENU_RESET_DONE,
 };
 
 /* What the settings' galaxy select asks of the scene (galaxy_travel). */
@@ -351,9 +371,14 @@ enum {
 
 /* The picture's shape as the game draws it (NebulaFrameClock::display), from the output's shape the host latches at
    each frame (display_extent): the camera, the 2D screen and the layouts widen with it. */
+/* The narrowest and widest shapes the game draws for (a phone held upright; three 32:9 panels side by side). An
+   output beyond them shows the nearest of the two, fitted by the presentation. */
+#define NEBULA_DISPLAY_NARROWEST_ASPECT (9.0 / 21.0)
+#define NEBULA_DISPLAY_WIDEST_ASPECT (96.0 / 9.0)
+
 typedef struct NebulaDisplay {
     int32_t wide;          /* 0: 16:9, nothing changes */
-    float content_aspect;  /* width / height, 4:3 to 32:9 */
+    float content_aspect;  /* width / height, NEBULA_DISPLAY_NARROWEST_ASPECT to NEBULA_DISPLAY_WIDEST_ASPECT */
     int32_t screen_width;  /* MR::getScreenWidth in the 16:9 mode (832 at 16:9) */
     float layout_width;    /* the layout canvas (608 at 16:9 and narrower) */
     float vertical_fit;    /* the layouts' height scale under 16:9 (1 at 16:9 and wider) */
@@ -408,7 +433,6 @@ typedef struct NebulaCoopPlayer {
     uint8_t has_palette;        /* 0: not told yet (a copy shows its character's own colours) */
     uint8_t reserved_palette[3];
 } NebulaCoopPlayer;
-
 
 enum {
     NEBULA_COOP_PLAYER_LUIGI = 1u << 0, /* the file plays Luigi */
@@ -600,7 +624,17 @@ enum {
     NEBULA_OPTION_DIAGNOSE_SCENE_LOADS, /* --diagnostics scene-loads: 1 logs what each scene change loads */
     NEBULA_OPTION_TOUCH_POINTER,       /* 0 no touch screen, 1 one, 2 the finger has the pointer, 3 and the game is on a
                                           menu: no pointer shows under a finger there */
+    NEBULA_OPTION_GRAPHICS_BACKEND,    /* the renderer's backend, the same all session: 1 D3D12, 2 Vulkan, 3 D3D11 (draw.native) */
     NEBULA_OPTION_RAY_TRACING,         /* what ray tracing asks of the game now (NEBULA_RAY_TRACING_*); 0: nothing */
+    NEBULA_OPTION_SCENE_TEXTURES,      /* 1 while texture packs' replacements of the textures a loaded scene made are still
+                                          loading: the scene starts once this is 0 */
+};
+
+/* post_register's result (draw.post, docs/modding/reference/services/draw.md). */
+enum {
+    NEBULA_POST_OK = 0,        /* *program is the compiled program (never 0) */
+    NEBULA_POST_COMPILE = 1,   /* the device's compiler refused the text: its first error in `error` */
+    NEBULA_POST_NO_MOTION = 2, /* it reads motion and the frame has no motion vectors (temporal upscaling off) */
 };
 
 /* NEBULA_OPTION_RAY_TRACING's bits. */
@@ -609,6 +643,9 @@ enum {
     NEBULA_RAY_TRACING_SHADOW_SETS = 1u << 1, /* a zone's shadow light set (the artists' darker lights for actors in a
                                                  shade) gives way to the lit set it darkens: the traced shadow darkens
                                                  them, once */
+    NEBULA_RAY_TRACING_MIRROR = 1u << 2,      /* reflections are traced at High: the game draws no mirror pass (a
+                                                 mirror's own view, captured for its surface); the surface's fetch of
+                                                 the capture takes the traced reflection in its place (12.5) */
 };
 
 /* The movie player's sound (movie_audio_control). */
@@ -642,7 +679,8 @@ enum {
 };
 typedef struct NebulaSaveRequest {
     uint32_t op;
-    const char* name;
+    const char* name;          /* a plain file name in the save folder, or "luma/<plain name>": a mod's global file
+                                  (services-save 7) in its luma folder, made at the first write, kept without backups */
     void* buffer;
     uint32_t size;
     uint32_t* length;          /* read: the file's length (may be NULL) */
@@ -822,7 +860,72 @@ enum {
                                                 next: APPLY, before: REVERT, back: CLOSE */
     NEBULA_SETTINGS_STATUS_MOD_REMOVE_ASK,   /* remove the mod whose page is open? `status_number` 1: it goes to the
                                                 recycle bin, 0: it is deleted. yes: APPLY, no: CLOSE */
+    NEBULA_SETTINGS_STATUS_MOD_FORGET_ASK,   /* forget what a removed mod kept (its numbers and saved data)?
+                                                `status_text` its id. yes: APPLY, no: CLOSE */
+    NEBULA_SETTINGS_STATUS_BENCHMARK_ASK,    /* restart and run the benchmark? yes: APPLY, no: CLOSE */
+    NEBULA_SETTINGS_STATUS_BENCHMARK_RESULTS, /* the benchmark's results, a page at a time: `status_text` the page's
+                                                title, `long_text` its table (below), `status_number` the page from 0
+                                                << 8 | the page count, | NEBULA_BENCHMARK_RESULTS_SENDABLE while the
+                                                shown run may be sent; on the summary `picture` is the frame-time graph
+                                                (`graph_*`). next: APPLY, before: REVERT, send to the developer: PRESS
+                                                (BENCHMARK_SEND_ASK asks first), back: CLOSE */
+    NEBULA_SETTINGS_STATUS_BENCHMARK_SEND_ASK, /* send the last result to the developer? yes: APPLY, see what is sent:
+                                                REVERT when `status_number`'s low bits are 1 (the report opens in the
+                                                system's text viewer), no: CLOSE; | NEBULA_BENCHMARK_FROM_RESULTS */
+    NEBULA_SETTINGS_STATUS_RENDERER_RESTART, /* the new renderer applies at the next start */
+    NEBULA_SETTINGS_STATUS_BENCHMARK_SENDING, /* the report is being sent; no answer until it ends.
+                                                `status_number`: NEBULA_BENCHMARK_FROM_RESULTS */
+    NEBULA_SETTINGS_STATUS_BENCHMARK_SENT,   /* the report reached the developer. OK: APPLY or CLOSE.
+                                                `status_number`: NEBULA_BENCHMARK_FROM_RESULTS */
+    NEBULA_SETTINGS_STATUS_BENCHMARK_SEND_FAILED, /* the report was not sent: `status_number`'s low byte why
+                                                (NEBULA_BENCHMARK_SEND_*), | NEBULA_BENCHMARK_FROM_RESULTS;
+                                                `status_text` the error as the sending reported it. OK: APPLY or CLOSE */
+    NEBULA_SETTINGS_STATUS_HDR_CALIBRATION,  /* the HDR calibration, a step at a time over the game: `status_number` the
+                                                step and its slider (NEBULA_HDR_*), `status_text` the level ("1000 NITS").
+                                                Next (Save at the last step): APPLY, back: REVERT, cancel: CLOSE; the
+                                                slider: CHANGE by steps, SET_VALUE to a place. The page under it is
+                                                hidden. At the peak and black steps the last write draws a test box over
+                                                the picture (NEBULA_HDR_BOX_*) on black, the window under it; at the
+                                                paper white step the game shows as it is over the window. */
 };
+/* The benchmark's results table (NEBULA_SETTINGS_STATUS_BENCHMARK_RESULTS' `long_text`): lines split by '\n', cells by
+   '\t'. A cell starts with any of these, in this order: '*' the shown run's line (the menu's blue), '#' a heading (the
+   help's grey), '<' left aligned (column 0 always is), then '@' a stage, named in the game's own words, or '"' a name
+   shown as it is. Any other cell is the host's capitals, translated as the rows are (numbers kept). A cell followed by
+   an empty cell, or by the line's end before its group's last column, spans on over them, left aligned; it widens the
+   last column it covers only when it is wider than all it covers. A line of four cells whose third is left aligned is
+   two groups side by side (columns 0-1 and 2-3); a narrow window shows the second group's lines under the first's. */
+/* NEBULA_SETTINGS_STATUS_BENCHMARK_RESULTS' `status_number`: the shown run may be sent to the developer
+   (SENDABLE: Send to developer offered; SENT: shown greyed, it was sent or is being sent). */
+enum { NEBULA_BENCHMARK_RESULTS_SENDABLE = 1 << 16, NEBULA_BENCHMARK_RESULTS_SENT = 1 << 17 };
+/* The send's question and screens' `status_number`: they were opened from the results window, which they replace in
+   place (its size) and which shows again after them. */
+enum { NEBULA_BENCHMARK_FROM_RESULTS = 1 << 18 };
+/* Why a report was not sent (NEBULA_SETTINGS_STATUS_BENCHMARK_SEND_FAILED). */
+enum {
+    NEBULA_BENCHMARK_SEND_NO_CONNECTION = 1, /* the server did not answer */
+    NEBULA_BENCHMARK_SEND_TOO_MANY = 2,      /* the server's daily limit for one network (HTTP 429) */
+    NEBULA_BENCHMARK_SEND_SERVER_BUSY = 3,   /* the server takes no reports now (HTTP 503) */
+    NEBULA_BENCHMARK_SEND_REFUSED = 4,       /* the server answered with another error */
+    NEBULA_BENCHMARK_SEND_NOT_MADE = 5,      /* no report could be made from the result */
+};
+/* NEBULA_SETTINGS_STATUS_HDR_CALIBRATION's `status_number`: the step in the low bits, the slider's place and its last
+   place (0 to last) above them, and NEBULA_HDR_SCENE_WAIT while the paper white's reference stage is not yet ready (the
+   screen stays black as at the test box's steps). */
+enum {
+    NEBULA_HDR_STEP_PEAK = 1,        /* raise until the squares vanish into the box around them */
+    NEBULA_HDR_STEP_BLACK = 2,       /* raise until just before the squares show on the black */
+    NEBULA_HDR_STEP_PAPER_WHITE = 3, /* the game's white, set to taste */
+    NEBULA_HDR_STEP_MASK = 0xF,
+    NEBULA_HDR_PLACE_SHIFT = 4,
+    NEBULA_HDR_LAST_SHIFT = 16,
+    NEBULA_HDR_FIELD_MASK = 0xFFF,
+    NEBULA_HDR_SCENE_WAIT = 0x10000000,
+};
+/* The test box: a square of this share of the picture's shorter side, centred across the picture, its middle this share
+   of the picture's height from its top. The window goes below it. */
+#define NEBULA_HDR_BOX_SIDE 0.34f
+#define NEBULA_HDR_BOX_CENTRE_Y 0.30f
 /* The Pair Joy-Con screen's halves (NEBULA_SETTINGS_STATUS_JOYCON). */
 enum {
     NEBULA_JOYCON_LEFT = 1,       /* a left half is connected */
@@ -881,7 +984,48 @@ typedef struct NebulaSettingsView {
     const uint8_t* picture;
     uint32_t picture_width;
     uint32_t picture_height;
+    uint32_t help_as_is; /* 1: `help` is already in the played language (a mod's refusal, as the validator words it):
+                            shown as is, not translated */
+    /* The benchmark's frame rate graph in `picture` (NEBULA_SETTINGS_STATUS_BENCHMARK_RESULTS' summary); 0 otherwise.
+       The plot inside the picture, in texels: 0 FPS at `graph_bottom`, `graph_top_fps` at `graph_top`. The scale's
+       lines are every `graph_step_fps`; the game writes their values, names the 60 and 30 FPS lines and numbers
+       the stages, each from its column in `graph_stage_starts` (`graph_stage_count` of them, the first at
+       `graph_left`). */
+    uint32_t graph_left;
+    uint32_t graph_top;
+    uint32_t graph_right;
+    uint32_t graph_bottom;
+    float graph_top_fps;
+    float graph_step_fps;
+    uint32_t graph_stage_count;
+    const uint32_t* graph_stage_starts;
+    /* 1: the scene plays under the menu (the HDR calibration's reference stage, visited from the title: the game resets,
+       travels and settles there, given no controls), so the menu does not hold it; it holds it again at 0. */
+    uint32_t scene_live;
 } NebulaSettingsView;
+
+/* What a benchmark step measures (NebulaBenchmarkState). */
+enum {
+    NEBULA_BENCHMARK_PART_YOURS = 0, /* the player's settings */
+    NEBULA_BENCHMARK_PART_STANDARD,  /* the standard settings (1920x1080, High), the same on every device */
+    NEBULA_BENCHMARK_PART_PROBE,     /* one optional pass, alone, to price it */
+    NEBULA_BENCHMARK_PART_AGAIN,     /* the first stage again, the device warmed up */
+};
+
+/* A benchmark run as the game's run panel shows it (benchmark_state). */
+typedef struct NebulaBenchmarkState {
+    uint32_t step;       /* the step running, from 1 */
+    uint32_t steps;      /* the run's steps */
+    uint32_t part;       /* NEBULA_BENCHMARK_PART_* */
+    uint32_t showing;    /* 1 while the step's stage is on screen (its opening, warming up or measured); 0 while it
+                            loads */
+    uint32_t fps_tenths; /* pictures shown a second (every present) over the last second, in tenths; 0 not known */
+    uint32_t progress;   /* the whole run, 0 to 10000, never going back */
+    uint32_t stopping;   /* 1 once the player stopped it: the game starts again in a moment */
+    uint32_t input;      /* what the player last used, for the stop hint: NEBULA_SETTINGS_INPUT_* */
+    uint32_t cover;      /* black over the game, under the panel, 0 to 255: a step's settings change under full black */
+    char stage[64];      /* the step's stage, the game's name for it (CosmosGardenGalaxy), NUL-ended */
+} NebulaBenchmarkState;
 
 /* The player's input to the settings menu (settings_input); the keyboard and controllers reach it through the host. */
 enum {
@@ -1197,7 +1341,8 @@ typedef struct NebulaHostServices {
     int (*galaxy_select_names_wanted)(void* user);
     /* A name for the galaxy select in the game's own words in the played language (UTF-16, NUL-terminated): galaxy
        `index`'s (`star` 0) or its star's. */
-    void (*galaxy_select_name)(void* user, uint32_t index, uint32_t star, const uint16_t* name);    /* `hd`: a texture record, the image handed over at `image` as the game painted it larger; the renderer draws it in
+    void (*galaxy_select_name)(void* user, uint32_t index, uint32_t star, const uint16_t* name);
+    /* `hd`: a texture record, the image handed over at `image` as the game painted it larger; the renderer draws it in
        that image's place while the image's texels are what they are now (a texture pack's name for them wins). NULL:
        what was handed over for `texture` goes. The renderer takes a copy. */
     void (*texture_hd)(void* user, uint32_t texture, const void* hd);
@@ -1290,7 +1435,23 @@ typedef struct NebulaHostServices {
        bytes into `id`; its base is NEBULA_COOP_MENU_CHARACTER's. The game plays a mod's only while it runs that mod's
        character (NebulaCharacters), else the base. Called on the simulation thread. */
     void (*coop_character_wanted)(void* user, char* id, uint32_t capacity);
-    /* Online co-op: a mod's chat command this player typed (luma.json "commands"), oldest first: 1 with the command's
+    /* draw.post (services/draw.md): a mod's post program compiled for this device. `text` is the cooked program's text
+       (LumaLink's part: its params over post_params, the mod's `float4 post(PostIn i)`), `size` bytes, not NUL-ended;
+       the host adds its prelude (PostIn, scene, scene_texel, depth, motion, post_params, the bindings) and its entry.
+       `reads`: LUMA_DRAW_POST_READS_*. NEBULA_POST_* and *program; `error` holds the compiler's first error, NUL-ended
+       within `error_capacity`. Game thread. */
+    int32_t (*post_register)(void* user, const void* text, uint32_t size, uint32_t reads, uint32_t* program, char* error,
+                             uint32_t error_capacity);
+    /* The program freed, after the lists that name it are released. Game thread. */
+    void (*post_free)(void* user, uint32_t program);
+    /* While a benchmark runs (Nebula --benchmark 1): `state` filled, 1; else 0 and nothing written. The game shows its
+       run panel from it; the host takes the stop (Escape, a controller's B, Android's back). Game thread. */
+    int32_t (*benchmark_state)(void* user, NebulaBenchmarkState* state);
+    /* Online co-op: a mod's chat command (the coop service's add_command, sm64coopdx's hook_chat_command), on the chat
+       for the rest of the run: /`name` with `description` as its /help line, `options` its words split by spaces (null
+       or "": a "[On|Off]" in the description gives them). 1: added; 0: the name is taken or not a name. Game thread. */
+    int (*coop_command_add)(void* user, const char* name, const char* description, const char* options);
+    /* Online co-op: a mod's chat command this player typed (coop_command_add), oldest first: 1 with the command's
        name (at most `capacity` bytes into `command`) and its word's place in its options (1 the first, 0 none) in
        `word`; 0 when none waits. Called on the simulation thread, each frame. */
     int (*coop_command_take)(void* user, char* command, uint32_t capacity, int32_t* word);
@@ -1325,6 +1486,12 @@ enum {
                                              24-31 the radius (255: the screen's height) */
     NEBULA_CONTEXT_SCREEN_COVERED,        /* each frame: 1 while a system or scene wipe is fully closed (MR::isScreenCoveredByWipe):
                                              the host holds the controls' context through what changes under it */
+    NEBULA_CONTEXT_CORNER_BUTTONS,        /* each frame, on a touch screen, while the game shows its own buttons in the screen's
+                                             top corners (the save select's Quit and Settings), for each: its bottom edge, 0..4095
+                                             down the screen. The on-screen controls keep their HOME under them */
+    NEBULA_CONTEXT_SCENE_PLAY,            /* each frame: 1 while the scene shows play (its opening tour and Mario's arrival
+                                             over, no movie), whatever is over it: the HDR calibration's reference stage is
+                                             ready */
 };
 
 #define NEBULA_MOVIE_AUDIO_QUEUE_FRAMES 20
@@ -1345,6 +1512,10 @@ NEBULA_GAME_API void nebula_game_sound_frame(void);
 NEBULA_GAME_API uint32_t nebula_game_mii_valid(const NebulaMii* mii);
 /* The host's Mii database changed (Miis imported while the game runs): the game reads its slots again. */
 NEBULA_GAME_API void nebula_game_mii_changed(void);
+/* The module's type rows as JSON (language/game-description.md; the host's --luma-describe), given to `write` in
+   pieces in order. Needs no attach; reads only the rows. */
+typedef void (*NebulaDescribeWrite)(void* user, const char* text, uint32_t length);
+NEBULA_GAME_API void nebula_game_luma_describe(NebulaDescribeWrite write, void* user);
 #ifdef __cplusplus
 }
 #endif

@@ -1,6 +1,5 @@
 #include "Game/Player/NebulaCharacters.hpp"
 #include "Game/Player/MarioConst.hpp"
-#include "Game/System/LumaRegistry.hpp"
 #include "Game/Util/FileUtil.hpp"
 #include "Game/Util/StringUtil.hpp"
 #include <nebula_format.h>
@@ -165,9 +164,7 @@ namespace NebulaCharacters {
         rCharacter.mMod = pMod;
         rCharacter.mPalette = pPalette != nullptr ? *pPalette : sCharacters[luigi ? cLuigi : cMario].mPalette;
         const s32 index = sCount++;
-        lumacore::registryAdd(lumacore::RegistryKind_Character, rCharacter.mId, nullptr, pMod, -1, index);
-        nebula_log("characters: %s (%s) added, like %s, model %s\n", rCharacter.mId, pMod != nullptr && pMod->id != nullptr ? pMod->id : "a plugin",
-                   luigi ? "luigi" : "mario", rCharacter.mArchive);
+        nebula_log("characters: %s added, like %s, model %s\n", rCharacter.mId, luigi ? "luigi" : "mario", rCharacter.mArchive);
         return index;
     }
 

@@ -1,9 +1,10 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-only
-# Builds Nebula for macOS and packs it as Nebula.app (docs/APPLE.md, "Build"): the Metal renderer and Apple's own
+# Builds Nebula for macOS and packs it as Nebula.app: the Metal renderer and Apple's own
 # host, the game module beside it. Nothing of another system's is in the app.
 #
 #   build_macos.sh -t <tools> -w <work folder> [-a "x86_64 arm64"] [-r] [-s <macOS SDK>] [-j <jobs>] [-x <Xcode>]
+#                  [-m <shipped mods>]
 #
 #   <tools>  holds toolchain/llvm (LLVM 19+), toolchain/libcxx (build_libcxx.sh's output) and deps (the dependency
 #            checkouts platform/apple/CMakeLists.txt names). cmake, ninja and cargo are taken from PATH.
@@ -12,18 +13,23 @@
 #            shaders, which the other one takes.
 #   -j       how many compiles run at once (default: the build tool's own choice).
 #   -x       an Xcode's Contents/Developer folder, for its Metal compiler, when it is not the machine's selected one:
-#            the programs are then compiled into the app's Metal libraries (docs/APPLE.md, "Shaders").
+#            the programs are then compiled into the app's Metal libraries.
+#   -m       a folder of the .luma files that come with the game (LumaKit, installer/lumakit): the app carries them in
+#            Contents/Resources/luma/mods, where the game installs them from at start.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
+# Plan 2.9: every platform's release items (permissions, usage texts, file and link associations) are in the tree.
+python3 "$root/tools/check_platform_items.py" "$root"
 tools=
 work=
 archs=$(uname -m)
 sdk=
 jobs=
 xcode=
-while getopts "t:w:a:rs:j:x:" option; do
+shipped=
+while getopts "t:w:a:rs:j:x:m:" option; do
     case "$option" in
     t) tools=$OPTARG ;;
     w) work=$OPTARG ;;
@@ -31,11 +37,16 @@ while getopts "t:w:a:rs:j:x:" option; do
     s) sdk=$OPTARG ;;
     j) jobs="--parallel $OPTARG" ;;
     x) xcode=$OPTARG ;;
-    *) sed -n '6,18p' "$0" >&2; exit 2 ;;
+    m) shipped=$OPTARG ;;
+    *) sed -n '6,19p' "$0" >&2; exit 2 ;;
     esac
 done
 if [ -z "$tools" ] || [ -z "$work" ]; then
-    sed -n '6,18p' "$0" >&2
+    sed -n '6,19p' "$0" >&2
+    exit 2
+fi
+if [ -n "$shipped" ] && ! ls "$shipped"/*.luma > /dev/null 2>&1; then
+    echo "the shipped mods folder has no .luma file: $shipped" >&2
     exit 2
 fi
 [ -n "$sdk" ] || sdk=$(xcrun --sdk macosx --show-sdk-path)
@@ -53,10 +64,12 @@ done
 host_tree=
 for arch in $ordered; do
     common="-G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=$here/toolchain.cmake -DNEBULA_APPLE_LLVM=$tools/toolchain/llvm -DNEBULA_APPLE_LIBCXX=$tools/toolchain/libcxx -DNEBULA_APPLE_PLATFORM=macos -DNEBULA_APPLE_ARCH=$arch -DNEBULA_APPLE_SDK=$sdk"
+    # The players' build: ThinLTO for the game module (native/CMakeLists.txt NEBULA_LTO; plain where the linker cannot).
     # shellcheck disable=SC2086
-    cmake -S "$root/native" -B "$work/macos-$arch/game" $common
+    cmake -S "$root/native" -B "$work/macos-$arch/game" $common -DNEBULA_LTO=ON
     # shellcheck disable=SC2086
-    cmake --build "$work/macos-$arch/game" --target smg_game $jobs
+    # Both game modules: the host loads libsmg_game_plain.dylib unless a mod's code needs the rows.
+    cmake --build "$work/macos-$arch/game" --target smg_game smg_game_plain $jobs
     tree="$work/macos-$arch/host"
     if [ "$arch" = "$host_arch" ]; then
         # shellcheck disable=SC2086
@@ -89,17 +102,22 @@ set -- $ordered
 if [ $# -gt 1 ]; then
     programs=
     modules=
+    plains=
     for arch in $ordered; do
         programs="$programs $work/macos-$arch/host/Nebula"
         modules="$modules $work/macos-$arch/game/libsmg_game.dylib"
+        plains="$plains $work/macos-$arch/game/libsmg_game_plain.dylib"
     done
     # shellcheck disable=SC2086
     lipo -create $programs -output "$app/Contents/MacOS/Nebula"
     # shellcheck disable=SC2086
     lipo -create $modules -output "$app/Contents/Frameworks/libsmg_game.dylib"
+    # shellcheck disable=SC2086
+    lipo -create $plains -output "$app/Contents/Frameworks/libsmg_game_plain.dylib"
 else
     cp "$work/macos-$1/host/Nebula" "$app/Contents/MacOS/Nebula"
     cp "$work/macos-$1/game/libsmg_game.dylib" "$app/Contents/Frameworks/libsmg_game.dylib"
+    cp "$work/macos-$1/game/libsmg_game_plain.dylib" "$app/Contents/Frameworks/libsmg_game_plain.dylib"
 fi
 
 # The programs' Metal libraries, when the build machine had Apple's compiler to make them (the same for every
@@ -110,22 +128,32 @@ for library in programs_2_4.metallib programs_3_0.metallib; do
     fi
 done
 
+# The mods that come with the game (the game installs them from here at start: galaxy/platform_paths.h
+# package_directory).
+if [ -n "$shipped" ]; then
+    mkdir -p "$app/Contents/Resources/luma/mods"
+    cp "$shipped"/*.luma "$app/Contents/Resources/luma/mods/"
+fi
+
 version=$(sed -n 's/^project(Nebula VERSION \([0-9.]*\).*/\1/p' "$root/CMakeLists.txt")
 sed "s/@NEBULA_VERSION@/$version/g" "$here/Info.macos.plist.in" > "$app/Contents/Info.plist"
+# The Info.plist's player texts in every language the game ships.
+python3 "$root/tools/package_text.py" apple "$app/Contents/Resources"
 
-# The icon, from the Windows one.
+# The icon: every size of the iconset from the 1024 px picture.
 iconset="$work/Nebula.iconset"
 rm -rf "$iconset"
 mkdir -p "$iconset"
-if sips -s format png "$root/installer/assets/nebula.ico" --out "$work/nebula-icon.png" >/dev/null 2>&1; then
+icon="$root/installer/assets/nebula-1024.png"
+if [ -f "$icon" ]; then
     for size in 16 32 128 256 512; do
-        sips -z $size $size "$work/nebula-icon.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
+        sips -z $size $size "$icon" --out "$iconset/icon_${size}x${size}.png" >/dev/null
         double=$((size * 2))
-        sips -z $double $double "$work/nebula-icon.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+        sips -z $double $double "$icon" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
     done
     iconutil -c icns "$iconset" -o "$app/Contents/Resources/Nebula.icns" || echo "no icon: iconutil could not write it" >&2
 else
-    echo "no icon: sips could not read installer/assets/nebula.ico" >&2
+    echo "no icon: installer/assets/nebula-1024.png is missing" >&2
 fi
 
 # Signed for this machine (an ad-hoc signature, which Apple silicon requires of every program it runs). An app given
@@ -135,6 +163,7 @@ fi
 # name there, without the player being asked (the microphone above all, which macOS otherwise asks for whenever the
 # sound goes to a device that also has inputs).
 codesign --force --options runtime --sign - "$app/Contents/Frameworks/libsmg_game.dylib"
+codesign --force --options runtime --sign - "$app/Contents/Frameworks/libsmg_game_plain.dylib"
 codesign --force --options runtime --entitlements "$here/Nebula.entitlements" --sign - "$app"
 # A signature that does not hold over every file is what makes macOS call a downloaded app "damaged".
 codesign --verify --deep --strict "$app"
@@ -145,8 +174,13 @@ package="$work/Nebula-macOS"
 rm -rf "$package" "$work/Nebula-macOS.zip"
 mkdir -p "$package"
 ditto --norsrc --noextattr "$app" "$package/Nebula.app"
-cat > "$package/How to open Nebula.txt" <<'TEXT'
-Nebula for Mac (Intel and Apple silicon, macOS 12 or later)
+case " $ordered " in
+    *" arm64 "*" x86_64 "* | *" x86_64 "*" arm64 "*) macs="Intel and Apple silicon" ;;
+    *" arm64 "*) macs="Apple silicon" ;;
+    *) macs="Intel" ;;
+esac
+echo "Nebula for Mac ($macs, macOS 12 or later)" > "$package/How to open Nebula.txt"
+cat >> "$package/How to open Nebula.txt" <<'TEXT'
 
 1. Move Nebula.app to your Applications folder.
 2. Open it. macOS says it cannot check the app for malicious software (it is not from the App Store or a registered

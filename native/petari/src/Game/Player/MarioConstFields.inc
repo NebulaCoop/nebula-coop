@@ -494,3 +494,5 @@
     {"mRushInBlendTimer", offsetof(MarioConstTable, mRushInBlendTimer), 'H', 1},
     {"mBrakeSlide", offsetof(MarioConstTable, mBrakeSlide), 'B', 1},
     {"mSwimSpinOxygen", offsetof(MarioConstTable, mSwimSpinOxygen), 'B', 1},
+    {"mBinderRadius", offsetof(MarioConstTable, mBinderRadius), 'f', 1},
+    {"mSensorRadius", offsetof(MarioConstTable, mSensorRadius), 'f', 1},

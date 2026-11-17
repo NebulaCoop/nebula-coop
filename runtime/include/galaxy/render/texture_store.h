@@ -4,6 +4,7 @@
 // and queues the work; the render thread applies the queue at the first walk of the list submitted after it.
 // Replacements (texture packs, the game's larger paintings, movies) take an id's place in `handle`.
 
+#include "galaxy/platform_time.h"
 #include "galaxy/windows_api.h"
 
 #include "galaxy/render/device_gate.h"
@@ -13,6 +14,7 @@
 #include "galaxy/render/texture_sampler.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <nebula_cooked_texture.h>
@@ -27,6 +29,8 @@ struct NebulaTextureImage;
 
 namespace galaxy::render {
 
+struct RenderConfig;
+
 struct RGBA8 {
     std::uint8_t r = 0;
     std::uint8_t g = 0;
@@ -38,6 +42,16 @@ namespace detail {
 // One level of a record (nebula_cooked_texture.h: its texels from `texels`, `width` x `height`) as RGBA8.
 void expand_record_level(std::uint8_t layout, const std::uint8_t* texels, std::uint32_t width, std::uint32_t height,
                          RGBA8* out);
+// Whether a record's levels (`texels`, the first level's first) were drawn by hand rather than made smaller from the
+// first. Each level (while it holds 4 texels or more a side) is compared with the first level made smaller by a box
+// filter the ways tools make levels: colour in sRGB values or in linear light, straight or premultiplied by alpha, and
+// one-bit alpha kept or cut at half again. A level whose mean colour (weighted by alpha) or mean alpha is more than
+// kAuthoredLevelsChange 255ths from every such copy's marks the record: Beach Bowl's sea bed (its far levels the water's
+// blue) measures 105, a fade into the distance its alpha's change. Of the game's 197 textures with levels, 72 are
+// marked; copies made in linear light or premultiplied (smoke, cloud maps) no longer read as drawn by hand.
+inline constexpr double kAuthoredLevelsChange = 8.0;
+[[nodiscard]] bool authored_levels(std::uint8_t layout, const std::uint8_t* texels, std::uint32_t width,
+                                   std::uint32_t height, std::uint32_t levels);
 }  // namespace detail
 
 // What a draw needs to bind one texture map.
@@ -47,20 +61,30 @@ struct TextureHandle {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint32_t mip_levels = 1;
-    // Levels below the first were made by the cook: only the enhanced-mipmaps option samples them.
+    // Levels below the first were made by the cook: only ray tracing's hits read them.
     bool generated_mips = false;
     // A replacement: width/height stay the game texture's, the resource is larger by 2^(lod_shift / 16) and
     // samplers shift their LOD range by that much.
     float lod_shift = 0.0f;
     bool lod_arbitrary = false;  // its levels pair with the game's by index (make_sampler_key)
+    // The game's own levels were drawn by hand (detail::authored_levels): a draw shows the level the game showed.
+    bool authored_levels = false;
 };
 
 class TextureStore {
 public:
     static constexpr std::uint32_t kTargetBit = 0x80000000u;
     [[nodiscard]] static constexpr bool is_target(std::uint32_t id) noexcept { return (id & kTargetBit) != 0u; }
-    // Whether a sampler reads the cook's generated levels of `handle`.
-    [[nodiscard]] static bool samples_generated(const TextureSampler& mode, const TextureHandle& handle);
+    // Whether anything can read the cook's generated levels with these settings: ray tracing's hits, which pick a level
+    // by their footprint. A draw's sampler always keeps to the first level (draw_walker); without ray tracing only that
+    // level is staged.
+    [[nodiscard]] static bool wants_generated_levels(const RenderConfig& render) noexcept;
+    // Whether every texture holds the levels wants_generated_levels(render) asks for: follow_settings has seen it and the
+    // remakes it asked for have landed (take_ops). The tracer starts only then (rt_follow_setting).
+    [[nodiscard]] bool generated_levels_landed(const RenderConfig& render) const noexcept;
+    // Render thread, each frame after begin_frame: on a change of wants_generated_levels, the textures with generated levels
+    // are made again with them or without them (the old texture draws until then).
+    void follow_settings(const RenderConfig& render);
 
     struct Ops;
 
@@ -126,6 +150,16 @@ public:
     // finished replacements and swaps them in; a new index or a changed dump mode looks every texture up again.
     void configure_texture_packs(const TexturePackSettings& settings);
     void apply_texture_packs();
+    // A loaded scene waits for the replacements of the textures it made (NEBULA_OPTION_SCENE_TEXTURES). Any thread: the
+    // texture operations queued so far (a count that only grows), those the render thread has applied, and the
+    // replacements of applied textures still loading or uploading.
+    [[nodiscard]] std::uint64_t queued_ops();
+    [[nodiscard]] std::uint64_t applied_ops() const noexcept { return applied_ops_.load(std::memory_order_acquire); }
+    [[nodiscard]] std::uint32_t replacements_coming() const noexcept {
+        return replacements_coming_.load(std::memory_order_acquire);
+    }
+    // While a scene waits for them behind its loading screen: more of each frame goes to their uploads.
+    void set_replacements_hurried(bool hurried) noexcept { replacements_hurried_.store(hurried, std::memory_order_relaxed); }
     [[nodiscard]] TexturePacks::Stats texture_pack_stats() const noexcept { return packs_.stats(); }
 
     // The movie: `frame`'s planes as textures NEBULA_TEXTURE_MOVIE_Y, _U and _V until the next call; null: none.
@@ -158,8 +192,13 @@ private:
         Staged staged;
         PackName name;
         bool generated = false;
+        bool authored = false;  // detail::authored_levels
+        // `trimmed`: a record's first level alone, its generated levels left out (nothing reads them: wants_generated_levels).
+        // `full_levels`: the levels the image has.
+        bool trimmed = false;
+        std::uint32_t full_levels = 1u;
         // A Create with `resize` makes an existing id's texture again with its `drop` top levels left out (0: whole). It is
-        // dropped if the id is gone or already has that many dropped.
+        // dropped if the id is gone or already has that many dropped and is trimmed as it is.
         bool resize = false;
         std::uint32_t drop = 0u;
     };
@@ -182,6 +221,7 @@ private:
         std::uint64_t demanded_at = ~std::uint64_t{0};  // the frame a walk last wanted it whole with no room for it
         std::uint32_t dropped = 0u;
         std::uint32_t full_levels = 0u;
+        bool trimmed = false;  // its generated levels left out (Op::trimmed)
     };
     struct ResizeRequest {
         std::uint32_t id = 0u;
@@ -217,6 +257,8 @@ private:
     void make_own(Entry& entry, const Op& op, bool once);
     void update_entry(Op& op);
     void resize_entry(Op& op);
+    // An entry whose generated levels are not as generated_levels_ says (staged while that changed): made again.
+    void follow_generated_levels(std::uint32_t id, Entry& entry);
     void free_entry(std::uint32_t id);
     void apply_built_in(Op& op);
     void dump_base_level(const Staged& staged, const PackName& name);
@@ -237,17 +279,20 @@ private:
     std::unordered_map<std::uint32_t, Source> sources_;
     std::unordered_map<std::uint32_t, const void*> built_ins_;
     std::vector<ResizeRequest> resize_requests_;  // the budget's: staged by the next take_ops
+    // wants_generated_levels as the render thread last saw it, for the calling threads' staging.
+    std::atomic<bool> generated_levels_wanted_{false};
     DeviceGate* gate_ = nullptr;
     ChunkRef arena_chunk_;
     std::uint64_t arena_used_ = 0u;
     std::vector<ChunkRef> free_chunks_;
     // A request for staging came since the last begin_frame, and the frames since one did (the spare chunks go when none for long).
     bool staging_requested_ = false;
-    unsigned staging_idle_frames_ = 0u;
+    std::uint64_t staging_quiet_since_ = 0u;  // idle_clock() at the last staging request
 
     // Render thread. Ids are never used again, so a table naming a freed image reads nothing, not another image.
     std::vector<std::unique_ptr<Entry>> entries_;
     std::uint64_t revision_ = 1u;
+    bool generated_levels_ = false;  // wants_generated_levels, as generated_levels_wanted_ was last set
     // Budget: frames begun, bytes of replaced textures still held by frames in flight, the bytes a walk may still ask to have
     // back this frame, the frame the next batch of reductions may start, and the counts since the start. (Render thread.)
     std::uint64_t frame_ = 0u;
@@ -265,11 +310,20 @@ private:
 
     TexturePacks packs_;
     bool stager_set_ = false;
+    // Whether textures are dumped (packs_.dumping()), for the calling threads' stage: set by configure_texture_packs.
+    std::atomic<bool> dumping_{false};
     std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> pack_waiters_;
     std::vector<std::pair<std::uint32_t, TexturePackPixels>> pack_uploads_;
     std::vector<std::vector<TextureBackend::UploadChunk>> pack_staging_;
     std::uint64_t pack_named_ = 0u, pack_bound_ = 0u, pack_swapped_ = 0u, pack_stats_frame_ = 0u;
+    galaxy::ClockInterval pack_stats_report_{10'000};  // [texture-pack] every ten seconds
     std::uint64_t pack_apply_ns_ = 0u, pack_apply_max_ns_ = 0u;
+    std::uint64_t taken_ops_ = 0u;  // under lock_: the operations take_ops has handed out
+    std::atomic<std::uint64_t> applied_ops_{0u};
+    std::atomic<std::uint32_t> replacements_coming_{0u};
+    std::atomic<bool> replacements_hurried_{false};
+    void publish_replacements_coming();
+    std::uint32_t pack_slow_reported_ = 0u;  // frames over the replacements budget written to the log
 
     struct MoviePlane {
         gpu::TextureRef texture;

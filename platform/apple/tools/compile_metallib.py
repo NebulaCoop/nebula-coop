@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-only
-"""The programs' file as Metal libraries (docs/APPLE.md, "Shaders").
+"""The programs' file as Metal libraries.
 
 The Metal renderer's programs are MSL text (programs_msl.bin, written by tools/programs_msl). Metal compiles a text in two
 steps: the text to its own bytecode (a tenth of a second a program on a 2017 MacBook Pro, which a first start would pay
@@ -33,23 +33,10 @@ import subprocess
 import sys
 
 MAGIC = b"NBPROG03"
-PROGRAM_TABLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "runtime", "include", "galaxy",
-                             "render", "program_table.h")
-
-
-def program_table_value(name):
-    """A ProgramVariant value from program_table.h, so the row layout follows core/program_table.cpp's."""
-    with open(PROGRAM_TABLE, encoding="utf-8") as file:
-        found = re.search(r"\b" + name + r"\s*=\s*(\d+)u?\b", file.read())
-    if found is None:
-        sys.exit(f"{PROGRAM_TABLE} names no {name}")
-    return int(found.group(1))
-
-
-STORED = program_table_value("kProgramStored")
-BOUND_OFFSET = program_table_value("kProgramBoundOffset")  # a pixel program's bound-table forms follow its variants
-PREPASS = program_table_value("kProgramPrepass")            # the ray tracer's forms (array forms) from here on
+STORED = 16        # program_table.h kProgramStored
 ROW_BYTES = 16 + 8 * STORED
+BOUND_OFFSET = 5   # program_table.h kProgramBoundOffset: a pixel program's bound-table forms, 5 to 9
+TRACED_OFFSET = 10 # program_table.h kProgramPrepass: the traced forms, 10 to 15, read arrays as the base forms do
 RECORD_MAGIC = b"NBMTLFN1"
 RECORD_BYTES = 40  # the magic, library u32 (0: 2.4, 1: 3.0), attributes u32 (a vertex program's inputs, a bit each), name[24]
 BATCH = 48
@@ -114,7 +101,8 @@ def main():
             if size == 0:
                 continue
             text = blob[offset:offset + size]
-            library = 1 if pixel and (stored < BOUND_OFFSET or stored >= PREPASS) else 0
+            bound = BOUND_OFFSET <= stored < TRACED_OFFSET
+            library = 1 if pixel and not bound else 0
             key = hashlib.sha1(text).digest()
             number = functions[library].get(key)
             if number is None:

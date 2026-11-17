@@ -94,9 +94,35 @@ public:
     [[nodiscard]] std::shared_ptr<mtl::Texture> create_texture(
         std::uint32_t width, std::uint32_t height, unsigned levels, std::uint64_t& allocation_bytes,
         TexelFormat format = TexelFormat::Rgba8, bool writable = false);
+    // create_texture in two steps as the other renderers have them, here both on the render thread: a new heap is named to
+    // the open pass. The texture packs' loaders make none (kMakesAnywhere).
+    // The staged levels make_texture may write (as record_upload takes them).
+    struct Levels {
+        const UploadChunk* staging = nullptr;
+        std::uint64_t offset = 0u;
+        const std::uint64_t* offsets = nullptr;
+        const std::uint32_t* pitches = nullptr;
+    };
+    struct MadeTexture {
+        std::shared_ptr<mtl::Texture> texture;
+        std::uint64_t allocation_bytes = 0u;
+        bool filled = false;  // never here: record_upload writes the levels
+    };
+    static constexpr bool kMakesAnywhere = false;
+    [[nodiscard]] MadeTexture make_texture(std::uint32_t width, std::uint32_t height, unsigned levels,
+                                           TexelFormat format = TexelFormat::Rgba8, bool writable = false,
+                                           const Levels* = nullptr) {
+        MadeTexture made;
+        made.texture = create_texture(width, height, levels, made.allocation_bytes, format, writable);
+        return made;
+    }
+    void adopt_texture(const MadeTexture&) noexcept {}
     [[nodiscard]] bool host_writes() const noexcept { return false; }
     [[nodiscard]] static bool direct_written(const mtl::Texture*) noexcept { return false; }
     [[nodiscard]] static bool supports_bc1();
+    [[nodiscard]] static bool supports_astc4x4();
+    // Every Metal GPU samples BC1 (a Mac's AMD or Intel) or ASTC (Apple's): never needed.
+    [[nodiscard]] static bool supports_rgb565() noexcept { return false; }
     // A texture made by create_texture that the pool may hand out again for the same extent.
     [[nodiscard]] static bool poolable(mtl::Texture* texture, std::uint32_t& width, std::uint32_t& height,
                                        std::uint32_t& levels);

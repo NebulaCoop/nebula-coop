@@ -33,13 +33,18 @@ public:
     void shutdown() noexcept;
     [[nodiscard]] bool ready() const noexcept { return ready_; }
     // With no encoder open on `commands` (an id<MTLCommandBuffer>), from the scene's single-sample depth: the colour
-    // multiplier of each scene target pixel. False: nothing to multiply.
-    bool prepare(Object commands, const Texture& depth, const RtView& view, bool ssao, std::span<const ao::ObjectOccluder> objects,
-                 UploadRing& ring, const StageMarker& mark = {});
+    // multiplier of each scene target pixel (at one occlusion pixel per scene target pixel the multiply makes it from the
+    // denoised occlusion itself). False: nothing to multiply.
+    // The scene is drawn in the top-left `part_width` x `part_height` of the depth (dynamic resolution's rectangle; 0:
+    // all of it), whose steps go down to `lowest_sixteenths` (16: none): the targets are made at the largest field of
+    // those steps and the passes work in this step's part, so a step change makes none again.
+    bool prepare(Object commands, const Texture& depth, unsigned part_width, unsigned part_height, unsigned lowest_sixteenths,
+                 const RtView& view, bool ssao, std::span<const ao::ObjectOccluder> objects, UploadRing& ring,
+                 const StageMarker& mark = {});
     // Inside a scene pass `encoder` (an id<MTLRenderCommandEncoder>) whose colour is `color_format` over `samples`
     // samples a pixel: the multiply.
     void finish(Object encoder, Format color_format, unsigned samples);
-    // Once a frame: hands back the occlusion targets after 600 frames in which prepare() did not run.
+    // Once a frame: hands back the occlusion targets after kIdleSteps game steps (idle_clock.h) in which prepare() did not run.
     void trim_idle();
 
 private:
@@ -52,21 +57,26 @@ private:
 
     bool ready_ = false;
     Format depth_format_ = Format::Depth32fStencil8;
-    std::array<Object, 7> functions_{};            // id<MTLFunction>
+    std::array<Object, 8> functions_{};            // id<MTLFunction>
     std::array<Object, kPassCount> compute_{};     // id<MTLComputePipelineState>
     Object no_depth_ = nullptr;                    // id<MTLDepthStencilState>: the multiply's
     struct Apply {
         Format color = Format::None;
         unsigned samples = 0;
+        bool fused = false;         // makes the multiplier from the denoised occlusion (AO_PASS_apply_ps)
         Object pipeline = nullptr;  // id<MTLRenderPipelineState>
     };
-    std::array<Apply, 8> apply_{};
+    std::array<Apply, 16> apply_{};
+    // This frame's occlusion is one pixel per scene target pixel: no multiplier image or pass; the multiply reads the
+    // denoised occlusion.
+    bool fused_ = false;
+    unsigned target_width_ = 0u;  // the scene target's size at the last prepare()
+    unsigned target_height_ = 0u;
     std::shared_ptr<Texture> distance_;
     std::shared_ptr<Texture> raw_;
     std::shared_ptr<Texture> denoised_;
     std::shared_ptr<Texture> scale_;
-    std::uint64_t clock_ = 0;  // trim_idle() calls
-    std::uint64_t used_ = 0;   // the clock at the last prepare()
+    std::uint64_t used_ = 0;   // idle_clock() at the last prepare()
     ao::Constants constants_{};
     std::vector<float> object_values_;
     std::vector<std::uint32_t> object_tiles_;

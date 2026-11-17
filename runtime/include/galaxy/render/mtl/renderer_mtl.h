@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// The renderer on Metal (docs/APPLE.md), with the interface RenderCore uses on RendererD3D12 and RendererVk.
+// The renderer on Metal, with the interface RenderCore uses on RendererD3D12 and RendererVk.
 //
 // The scene target is a colour texture (RGB10A2) and a depth texture (Depth32Float_Stencil8) drawn through one render
 // command encoder, the scene pass; a scene target copy, screen probe or present ends that encoder, and the next scene
 // target operation begins another, loading what the last stored. kFramesInFlight frames are recorded ahead of the GPU.
 // A frame is a row of command buffers committed in order: the frame's texture uploads (a blit encoder), then its
-// draws; a pass recorded on several threads (parallel_record_*) is a command buffer of its own in that row.
+// draws; a pass recorded on several threads (parallel_record_*) runs inside the scene pass on a tile-based GPU, else in a
+// command buffer of its own in that row.
 //
 // Draw bindings follow gpu::Encoder (core/gpu_encoder.h, mtl/shader_msl.h). Addresses (gpu::Address) name a buffer
 // and an offset (mtl::Context::resolve). Metal's clip space is Direct3D's: nothing is turned over.
@@ -13,6 +14,7 @@
 // Plain C++: Metal's objects are mtl::Object here (mtl_context.h), and the Objective-C++ sources turn them back.
 #pragma once
 
+#include "galaxy/platform_time.h"
 #include "galaxy/content_viewport.h"
 #include "galaxy/render/ambient_occlusion_objects.h"
 #include "galaxy/render/display_modes.h"
@@ -34,9 +36,14 @@
 #include "galaxy/render/rt_types.h"
 #include "galaxy/render/window_owner.h"
 #include "galaxy/render_api.h"
+#include "galaxy/render/mod_post.h"
+#include "galaxy/render/idle_clock.h"
+#include "galaxy/render/dynamic_resolution.h"
+#include <nebula_frame_list.h>
 #include "render/core/draw_record.h"
 #include "render/core/gpu_encoder.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -74,6 +81,9 @@ public:
     [[nodiscard]] Kept take_apart_lost_device();
     void keep(const Kept& kept, bool) noexcept { window_ = kept.window; }
     void shutdown();
+    // The pictures handed to an extension, taken from the GPU and written (render thread; RenderCore::finish_pictures,
+    // at a host's exit that skips shutdown).
+    void finish_pictures();
     [[nodiscard]] UploadBuffer create_upload_buffer(std::size_t bytes, const char* name);
 
     // SMAA or FXAA of the 3D scene in the scene target before the 2D layer draws (mtl::PostProcessor).
@@ -95,7 +105,7 @@ public:
     [[nodiscard]] bool temporal_interpolation() const noexcept { return temporal_interp_; }
     [[nodiscard]] unsigned temporal_output_width() const noexcept { return temporal_output_w_; }
     [[nodiscard]] double gpu_ms_per_tick() const noexcept { return 0.0; }  // the tracer's measure: none yet
-    // Smoothed GPU time of a frame that drew the scene (0 until measured): the tracer's build budget (5.3 G-3).
+    // Smoothed GPU time of a frame that drew the scene (0 until measured): the tracer's build budget.
     [[nodiscard]] double scene_gpu_ema_ms() const noexcept { return native_scene_gpu_ema_ms_; }
     void set_scene_view(const std::array<float, 12>* view) noexcept {
         scene_view_known_ = view != nullptr;
@@ -110,7 +120,7 @@ public:
     [[nodiscard]] std::int64_t last_present_qpc() const noexcept { return swap_present_qpc_; }
     // The 3D scene in a wide target while `wanted` (the enhanced lighting), its camera at the end (mtl::SceneCamera).
     bool begin_wide_scene(bool wanted, const SceneClearValues* initial_clear = nullptr);
-    void end_wide_scene();
+    void end_wide_scene(unsigned finish = 0u);  // finish: the traced relight's camera (none on Metal yet)
     [[nodiscard]] bool temporal_mode() const;
     // The upscaler reads the motion but no reactive mask (SGSR 2): every draw of the scene shares the motion pass.
     [[nodiscard]] bool motion_pass_only() const;
@@ -224,11 +234,24 @@ public:
     [[nodiscard]] gpu::Address zero_stream(std::uint32_t bytes);
     // The frame so far is the frame's picture now: `fresh` (or a new target) takes its place.
     [[nodiscard]] gpu::TextureRef take_frame_picture(gpu::TextureRef fresh);
+    // draw.post and draw.native (mod_post.h, luma_draw_native.h): not on Metal yet. No compiler is installed, so every
+    // post program is refused at post_register ("no compiler for post programs on this renderer") and no list names
+    // one; draw.native's backend values are D3D12 and Vulkan only, so no native call reaches here.
+    void record_mod_post(const ModPostProgram&, ModPostConstants, const gpu::TextureRef&, bool) {}
+    void record_native_call(const NebulaCall&, LumaDrawNativeFrame&, bool) {}
     [[nodiscard]] bool can_take_scene() const noexcept;
+    // The scene target's colour may trade places with another of its size, for a pass that then writes all of it that
+    // is read (the frame, or dynamic resolution's rectangle): can_take_scene less the game's whole-frame need.
+    [[nodiscard]] bool can_trade_scene() const noexcept;
     bool take_scene(std::uint64_t key, gpu::TextureRef fresh, TextureStore& textures, gpu::TextureRef& released);
     void open_frame_for_pass(std::uint64_t color_key, std::uint8_t channels, std::uint64_t depth_key, TextureStore& textures);
     void close_frame_for_pass(TextureStore& textures);
     [[nodiscard]] bool draw_frame_pass(const FramePassRequest& params, TextureStore& textures);
+    // A frame copy made before the list writes the frame: the frame is still the picture shown last (`shown`), as a
+    // console's frame buffer still holds it, never what the display copy left in the frame's target. Copied into the
+    // frame's target, or the output scene target's when it is the picture's size, for this copy; a picture that fits
+    // neither (a size or format changed since it was shown) leaves the frame as it is (draw_frame_pass).
+    [[nodiscard]] bool draw_shown_frame_pass(const FramePassRequest& params, const DisplayTexture& shown, TextureStore& textures);
     // `black`: the frame is presented black (the pass clears; the display picture is not drawn).
     bool present(const DisplayTexture* source, bool capture_backbuffer = false, bool black = false);
 
@@ -238,6 +261,8 @@ public:
     [[nodiscard]] bool target_picture(std::uint64_t key, TextureHandle& out) const;
     [[nodiscard]] bool target_pass_active() const noexcept { return target_pass_active_; }
     void end_output_scene();
+    // HDR output's 2D layer (RendererD3D12::begin_layer_2d): Metal draws no float scene.
+    void begin_layer_2d() noexcept {}
     [[nodiscard]] bool output_scene_active() const noexcept { return output_scene_active_; }
     // Temporal upscaling.
     [[nodiscard]] bool scene_temporal_begin(float& jitter_x, float& jitter_y);
@@ -277,6 +302,14 @@ public:
 
     [[nodiscard]] gpu::Device* device() const noexcept { return static_cast<gpu::Device*>(mtl::Context::get().device()); }
     [[nodiscard]] const FrameMap& frame_map() const noexcept { return scene_map_; }
+    // The bound scene target's allocated size: the render size while dynamic resolution draws the scene in a part of it
+    // (frame_map, the step's rectangle), else frame_map itself. Pictures for the game and target passes take this size.
+    [[nodiscard]] const FrameMap& frame_extent() const noexcept { return frame_extent_; }
+    // The 3D scene's pass opens (its clear, or walk_scene_begin): dynamic resolution decides this picture's rectangle
+    // (once a frame) and the main scene target is drawn in it from here to the end of the frame.
+    void begin_scene_rectangle();
+    // The rectangle the last scene was drawn in (the render size while dynamic resolution is off).
+    [[nodiscard]] const FrameMap& scene_rectangle() const noexcept { return scene_rectangle_; }
     [[nodiscard]] std::uint8_t scene_samples_log2() const noexcept {
         return static_cast<std::uint8_t>(std::countr_zero(scene_.samples));
     }
@@ -288,6 +321,10 @@ public:
     [[nodiscard]] void* pipeline_backend() noexcept { return this; }
     [[nodiscard]] double display_refresh_hz() const noexcept { return display_refresh_hz_; }
     [[nodiscard]] bool vblank_grid(std::int64_t& vblank, std::int64_t& period) const noexcept;
+    // The moment the next present shows (RenderCore's interpolation slots): this API has no presentation times, so
+    // the presents pace themselves (PresentPacer, the swap chain's vblanks).
+    void set_present_moment(std::int64_t) noexcept {}
+    [[nodiscard]] bool take_present_skip() noexcept { return false; }
     [[nodiscard]] UploadRing& vertex_ring() noexcept { return vertex_ring_; }
     [[nodiscard]] UploadRing& index_ring() noexcept { return index_ring_; }
     [[nodiscard]] UploadRing& constant_ring() noexcept { return constant_ring_; }
@@ -436,9 +473,13 @@ private:
 
     // Frame recording.
     void begin_scene_pass(const SceneClearValues* clear = nullptr, const char* caller = __builtin_FUNCTION());
-    // `parallel`: the pass is a parallel one whose chunks have encoders of their own (parallel_record_begin).
+    // With parallel_scene_pass_ the pass is a parallel encoder and pass_ its encoder for the draws in order.
     void begin_scene_pass_with(unsigned aux, const SceneClearValues* clear = nullptr, bool discard_color = false,
                                const char* caller = __builtin_FUNCTION(), unsigned clear_depth = 0u);
+    // pass_, new in the open scene pass: the textures its draws read, the walker's encoder, the scene's rectangles.
+    void attach_scene_encoder();
+    // The chunks as encoders of the open parallel scene pass, between the draws before them and those after.
+    [[nodiscard]] bool parallel_record_in_pass(const std::uint8_t* chunk_aux, unsigned chunk_count);
     // The scene pass's descriptor (an MTLRenderPassDescriptor*, the caller's to release) for the live set.
     [[nodiscard]] mtl::Object scene_pass_descriptor(unsigned aux, const SceneClearValues* clear, bool discard_color,
                                                     unsigned clear_depth, mtl::Object visibility);
@@ -481,6 +522,11 @@ private:
     Frame* frame_ = &frames_[0];
     mtl::Object commands_ = nullptr;  // id<MTLCommandBuffer> where work records (frame_->lists.back())
     mtl::Object pass_ = nullptr;      // id<MTLRenderCommandEncoder>: the open scene pass
+    // id<MTLParallelRenderCommandEncoder>: the open scene pass when it is a parallel one (pass_ is then one of its
+    // encoders). A tile-based GPU's scene passes are, once a walk has recorded a pass in chunks: the chunks then run in
+    // the pass, where a pass of their own stored the targets and loaded them again before and after.
+    mtl::Object scene_parallel_ = nullptr;
+    bool parallel_scene_pass_ = false;
     std::uint64_t frame_index_ = 0;
     std::uint64_t last_submitted_ = 0;
 
@@ -493,7 +539,29 @@ private:
     mtl::Object probe_pipeline_ = nullptr;  // id<MTLComputePipelineState>
 
     // The scene target.
-    FrameMap scene_map_{};
+    FrameMap scene_map_{};     // the bound scene target's map: the part of it drawn in
+    FrameMap frame_extent_{};  // the bound scene target's allocated size (frame_extent)
+    FrameMap scene_extent_{};  // the size the main scene targets are made at (the render size)
+    // Dynamic resolution (dynamic_resolution.h): its rectangle is the main scene's scene_map_ from begin_scene_rectangle
+    // to the frame's end.
+    DynamicResolution dynamic_resolution_;
+    FrameMap scene_rectangle_{};
+    std::uint64_t rectangle_frame_ = ~std::uint64_t{0};  // the frame whose rectangle was decided last
+    // begin_frame: the frame starts with the main scene target whole.
+    void apply_dynamic_resolution();
+    // The smallest share of the render size (sixteenths) the running temporal upscaler takes; 8 without one.
+    [[nodiscard]] unsigned dynamic_resolution_floor() const;
+    // The bound target's drawn part, within its textures (the viewport and scissor of its passes).
+    [[nodiscard]] FrameMap scene_part() const noexcept {
+        return scene_.color ? FrameMap(std::min(scene_map_.width, scene_.color->width),
+                                       std::min(scene_map_.height, scene_.color->height))
+                            : scene_map_;
+    }
+    // A depth picture for the game at the extent's size holding the whole frame (dynamic resolution's rectangle
+    // resampled, point sampled), for a frame pass over the frame; its colour is draw_frame_pass's.
+    bool publish_scene_depth_copy(std::uint64_t key, TextureStore& textures);
+    // R32 float where the device filters it (a material may sample the picture so), else 16-bit float.
+    mtl::Format depth_copy_format_ = mtl::Format::R32f;
     SceneSet scene_;
     SceneSet wide_scene_;
     bool ensure_wide_set(SceneSet& set);
@@ -503,22 +571,21 @@ private:
     std::uint64_t scene_depth_serial_ = 0;
     SceneSet alt_scene_;
     FrameMap alt_scene_map_{};
+    FrameMap alt_scene_extent_{};  // its allocated size (alt_scene_map_: the part drawn), traded with frame_extent_
     std::unordered_map<std::uint64_t, Picture> pictures_;
     bool publish_picture(std::uint64_t key, std::uint32_t width, std::uint32_t height, gpu::TextureRef texture,
                          std::uint8_t channels, TextureStore& textures);
     bool publish_frame_pass(const FramePassRequest& params, gpu::TextureRef texture, TextureStore& textures);
     void drop_picture(Picture& picture, TextureStore& textures);
-    static constexpr std::uint64_t kTargetIdleFrames = 600u;  // frames at the game's 60 a second
-    [[nodiscard]] std::uint64_t target_idle_frames() const noexcept {
-        const double rate = measured_present_hz_.load(std::memory_order_relaxed);
-        return kTargetIdleFrames * std::max<std::uint64_t>(1u, static_cast<std::uint64_t>(rate / kGameStepRate + 0.5));
-    }
     std::unordered_map<std::uint64_t, TargetSlot> target_slots_;
+    static constexpr std::uint64_t kTargetSweepSteps = 60u;  // begin_frame's sweep: once a second of the game
+    std::uint64_t target_swept_step_ = 0u;                    // idle_clock() at the last sweep
     void retire_target_slot(TargetSlot& slot);
     void sweep_target_slots();
     std::uint64_t target_key_ = 0;
     SceneSet target_scene_;
     FrameMap target_scene_map_{};
+    FrameMap target_scene_extent_{};  // traded with frame_extent_ as target_scene_map_ with scene_map_
     bool target_pass_active_ = false;
     bool output_scene_active_ = false;
     [[nodiscard]] FrameMap output_frame_for_window() const;
@@ -588,10 +655,10 @@ private:
     bool scene_set_storage_ = false;  // create_scene_set: its colour takes the upscaler's output
     bool alt_scene_storage_ = false;
     bool present_black_ = false;
-    std::uint64_t motion_used_frame_ = 0u;
-    std::uint64_t output_scene_used_frame_ = 0u;
-    std::uint64_t wide_scene_used_frame_ = 0u;
-    std::uint64_t capture_used_frame_ = 0u;
+    std::uint64_t motion_used_step_ = 0u;
+    std::uint64_t output_scene_used_step_ = 0u;
+    std::uint64_t wide_scene_used_step_ = 0u;
+    std::uint64_t capture_used_step_ = 0u;
 
     // The renderer's parts (fx_mtl.h).
     mtl::PostProcessor post_;
@@ -723,7 +790,7 @@ private:
     std::atomic<double> measured_present_hz_{0.0};
     double display_refresh_hz_ = 0.0;
     bool variable_refresh_ = false;
-    std::uint64_t display_refresh_checks_ = 0;
+    galaxy::ClockInterval display_refresh_{500, true};  // refresh_display_rate twice a second on the clock
     std::int64_t measured_present_window_qpc_ = 0;
     std::int64_t swap_present_qpc_ = 0;
     std::uint64_t measured_present_count_ = 0;
@@ -736,12 +803,14 @@ private:
     std::array<bool, kFramesInFlight> frame_scene_drawn_{};
     double generated_gpu_ms_ = 0.0;
     std::uint64_t generated_gpu_samples_ = 0;
-    // Every 600 frames ([metal-gpu]): the GPU's frame time, and how often the scene pass reopened (each reopening
+    // Every ten seconds ([metal-gpu]): the GPU's frame time, and how often the scene pass reopened (each reopening
     // loads and stores the whole scene target on a tile-based GPU) and the scene target was copied.
+    galaxy::ClockInterval gpu_report_{10'000};  // the report every ten seconds
     struct GpuWindow {
         double ms = 0.0;
         double max_ms = 0.0;
-        unsigned frames = 0;
+        unsigned frames = 0;     // pictures with GPU times read
+        unsigned recorded = 0;   // pictures recorded since the last report
         std::uint64_t passes = 0;
         std::uint64_t copies = 0;
         struct Open {

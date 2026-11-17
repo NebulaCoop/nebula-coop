@@ -57,7 +57,7 @@ struct HostClientExtent {
 [[nodiscard]] HostClientExtent current_host_client_extent() noexcept;
 
 // The picture shape selected by the aspect setting, latched each video frame: the window's client
-// extent limited to 4:3..32:9, or the chosen ratio.
+// extent limited to kNarrowestContentAspect..kWidestContentAspect, or the chosen ratio.
 [[nodiscard]] HostClientExtent aspect_latch_extent() noexcept;
 
 // Creates the window and the renderer (device, swap chain, queues, root signature, pipelines, upload buffers).
@@ -73,9 +73,17 @@ void set_frame_end_presents(bool enabled) noexcept;
 // Walks the frame list attached (attach_frame_list) and optionally presents: the newest picture, or black when
 // `black`. Nothing attached: at most a present.
 void render_frame(bool present_swap_chain = true, bool black = false);
+// Simulation thread, as each step starts: the moment its step clock set for it (qpc_now() ticks). The frame the next
+// render_frame hands over arrives at that moment for the interpolation's clock, not when the thread got to run: a late
+// wake would otherwise move the frame's place in time. Used once; 0 or none: render_frame's own time.
+void set_step_moment(std::int64_t qpc) noexcept;
 
 // Blocks until the render queue and every in-flight render chunk are idle.
 void wait_for_render_idle();
+
+// At a host's exit that ends the process without the renderer's shutdown: the pictures handed to an extension are
+// taken from the GPU and written first. False when the render thread did not answer within `limit_ms`.
+bool finish_pictures(std::uint32_t limit_ms);
 
 
 // The services' registries and texture store; any thread.
@@ -161,8 +169,9 @@ void request_sharp_2d(bool on) noexcept;
 // Keys the game's Wii Remote has no button for, held in the window outside Nebula's settings menu, for online co-op
 // (NEBULA_COOP_KEY_*: Tab, the main menu's reset and the player list; Escape, its back). Any thread.
 [[nodiscard]] unsigned coop_keys_held() noexcept;
-// Nebula closes and starts again (the main menu's Host, for mods that change the disc): Windows through the launcher,
-// Linux in place. False when this system can't (Android, no launcher beside the game), and nothing happens.
+
+// Nebula closes and starts again (the main menu's Host, for mods that change the disc), as restart_game does. False
+// where this system can't (Android), and nothing happens.
 bool request_restart() noexcept;
 
 // The native game's HOME Menu with its choices, taking the keyboard and controllers while open: return
@@ -189,7 +198,16 @@ bool native_settings_pad_key(std::uintptr_t virtual_key);
 [[nodiscard]] bool native_settings_capture_mouse(galaxy::input::MouseButton button);
 // The wheel's turn in 120ths of a notch; false while the menu is closed.
 [[nodiscard]] bool native_settings_wheel(int delta);
+// Text typed while a mod's text option is being typed in (UTF-8: WM_CHAR, SDL's text input). False: none is.
+[[nodiscard]] bool native_settings_handle_window_text(std::string_view utf8);
+// A text option is being typed in: the host shows its on-screen keyboard (SDL_StartTextInput).
+[[nodiscard]] bool native_settings_text_wanted() noexcept;
 void native_settings_files_dropped(std::vector<std::filesystem::path> files);
+// The files this start was given to import (--import: Open with, a file's association), once: the window hands them to
+// native_settings_files_dropped. From then on a restart of this start leaves them out (--imports-taken), so an import
+// that restarts the game is not made again.
+[[nodiscard]] std::vector<std::filesystem::path> native_settings_take_launch_imports();
+[[nodiscard]] bool native_settings_launch_imports_taken() noexcept;
 void native_settings_window_resized(unsigned width, unsigned height);
 // The graphics device lost at the renderer's next frame, as a driver reset loses it (an extension's lose_gpu_device).
 void lose_gpu_device() noexcept;
@@ -200,6 +218,11 @@ void native_settings_post_key(std::uintptr_t virtual_key) noexcept;
 [[nodiscard]] bool native_settings_typing() noexcept;
 // A character typed (WM_CHAR, SDL's text input) into the name being typed; false when none is.
 bool native_settings_type(char32_t character);
+// Delivers a keyboard key to the window thread, as the keyboard gives it (a harness's `key` step): a keyboard binding
+// waiting for its key takes it, which a controller's key never does.
+void native_settings_post_keyboard_key(std::uintptr_t virtual_key) noexcept;
+// The bit the SDL and Apple hosts' menu-key queues mark a keyboard key with (above every key code).
+inline constexpr std::uintptr_t kMenuKeyKeyboard = std::uintptr_t{1} << 30;
 // The mods saved differ from the ones this run started with.
 [[nodiscard]] bool native_settings_mods_changed();
 
@@ -256,6 +279,20 @@ enum class NativeSettingsStatus : unsigned {
                       // page's from 1, or -(page * 4 + 1 loading, 2 unreadable, 3 missing) for a picture not shown
                       // (next: Apply, before: Revert, back: Close)
     ModRemoveAsk,     // remove the mod whose page is open? status_number 1: to the recycle bin (yes: Apply, no: Close)
+    ModForgetAsk,     // forget what a removed mod kept? (status_text: its id; yes: Apply, no: Close)
+    BenchmarkAsk,     // restart and run the benchmark? (yes: Apply, no: Close)
+    BenchmarkResults, // the benchmark's results, a page at a time: status_text the title, long_text the table
+                      // (settings_benchmark_page.h), status_number page << 8 | pages, the summary's picture its graph
+                      // (next: Apply, before: Revert, back: Close)
+    BenchmarkSendAsk, // send the last result? status_number 1: Revert shows the report (yes: Apply, no: Close)
+    RendererRestart,  // the new renderer applies at the next start
+    BenchmarkSending, // the report is being sent (no answer until it ends)
+    BenchmarkSent,    // the report reached the developer (OK: Apply or Close)
+    BenchmarkSendFailed, // the report was not sent: status_number's low byte why (benchmark_menu::SendOutcome),
+                         // status_text the error (OK: Apply or Close)
+    HdrCalibration,      // the HDR calibration (ui/hdr_calibration.h): status_number its step, the slider's place and its
+                         // last place, status_text the level (next or save: Apply, back: Revert, cancel: Close; the
+                         // slider: Change, SetValue)
 };
 // A picture the menu shows (a mod's icon or one of its pictures): RGBA8 rows, tightly packed, straight alpha.
 struct NativeSettingsPicture {
@@ -271,6 +308,14 @@ inline constexpr int kJoyConRightHeldBit = 8;  // its R is held
 inline constexpr int kJoyConPairedBit = 16;    // a pair was just made
 inline constexpr int kJoyConLeftPressesShift = 8;    // 4 bits: the left halves' button presses, counted round
 inline constexpr int kJoyConRightPressesShift = 12;  // 4 bits: the right halves'
+// The benchmark's frame-time graph in a NativeSettingsView's picture (nebula_game_api.h graph_*): the plot in texels,
+// the scale in milliseconds, the column where each stage starts. All 0 when the picture is no graph.
+struct NativeSettingsGraph {
+    unsigned left = 0u, top = 0u, right = 0u, bottom = 0u;
+    float top_fps = 0.0f, step_fps = 0.0f;
+    std::vector<unsigned> stage_starts;
+    bool operator==(const NativeSettingsGraph&) const = default;
+};
 struct NativeSettingsView {
     bool open = false;
     unsigned page = 0u;
@@ -282,17 +327,26 @@ struct NativeSettingsView {
     unsigned selected_button = 0u;  // the selected row's, when it has buttons
     bool editing = false;           // the selected row's text is being typed (A or Enter keeps it, B or Escape drops it)
     std::string help;
+    bool help_as_is = false;  // the help is already in the played language (a mod's refusal): not translated
     NativeSettingsStatus status = NativeSettingsStatus::Help;
     int status_number = 0;
     std::string status_text;
     std::string long_text;
     std::shared_ptr<const NativeSettingsPicture> picture;
+    NativeSettingsGraph graph;  // the picture's plot when it is the benchmark's frame-time graph
 };
 // The menu as it stands. The first call hands the drawing to the game: the overlay draws nothing of its own after.
 [[nodiscard]] NativeSettingsView native_settings_view();
+// What the hints name now (NativeSettingsView::input): the button style chosen, else what the player last used.
+[[nodiscard]] unsigned native_settings_hint_input();
 // The pointer's input to the menu (the game's own menu takes the pointer; the window thread the keyboard and pads).
-enum class NativeSettingsInput : unsigned { Open = 1, Close, SelectPage, SelectRow, Change, Apply, Revert, Press, MoveMod, SetValue };
+// CloseUnseen is the host's own: the game's close where it shows no menu (before its first 3D scene, the boot). It
+// closes a menu that asks nothing; one that asks is hidden as it stands, nothing answered, until
+// native_settings_reopen_held at the game's first 3D scene opens it again (asked at each scene frame: the first one no
+// host extension holds, galaxy::extensions::holds_menus).
+enum class NativeSettingsInput : unsigned { Open = 1, Close, SelectPage, SelectRow, Change, Apply, Revert, Press, MoveMod, SetValue, CloseUnseen };
 void native_settings_input(NativeSettingsInput input, int arg);
+void native_settings_reopen_held();
 
 // GPU time by pass (the settings overlay's SYSTEM page): off at every start; while it is on, the renderer writes a timestamp at
 // each pass boundary of every frame and reads them back a frame later; while it is off it records and reads nothing. A pass's
@@ -305,6 +359,10 @@ void set_gpu_timing(bool on) noexcept;
 [[nodiscard]] bool gpu_timing_on() noexcept;
 // The passes that have a time, at most `capacity`; how many.
 [[nodiscard]] std::size_t gpu_pass_times(GpuPassTime* out, std::size_t capacity) noexcept;
+
+// The process's use of the GPU's memory and the system's budget for it, in bytes (false before the renderer starts or where
+// the device cannot say). The render thread: the renderer keeps its last reading unguarded.
+[[nodiscard]] bool video_memory(std::uint64_t& usage, std::uint64_t& budget) noexcept;
 
 // The frames the game has shown (display copies) and how the presents met them.
 [[nodiscard]] std::uint64_t pictures_made() noexcept;

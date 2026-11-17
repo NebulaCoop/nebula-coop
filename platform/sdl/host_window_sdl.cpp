@@ -3,6 +3,7 @@
 // the SDL window and its Vulkan surface; its events (size, focus, quit, the finger and the mouse as the pointer, keys,
 // gamepads); on Android the activity's touch controls and HOME Menu through JNI.
 
+#include "galaxy/benchmark.h"
 #include "galaxy/content_viewport.h"
 #include "galaxy/coop_menu.h"
 #include "galaxy/render/galaxy_select.h"
@@ -15,6 +16,9 @@
 #include "galaxy/native_settings_pad.h"
 #include "galaxy/render_api.h"
 #include "galaxy/render/host_window.h"
+#include "galaxy/luma_system_platform.h"
+#include "galaxy/luma_input_service.h"
+#include "galaxy/ui/launcher.h"
 #include <deque>
 #include "sdl_host.h"
 
@@ -43,6 +47,9 @@ namespace galaxy::render::vk {
 #include "galaxy/virtual_keys.h"
 
 #include <SDL3/SDL.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 #if defined(NEBULA_GPU_METAL)
 #include <SDL3/SDL_metal.h>
 #else
@@ -95,6 +102,7 @@ std::mutex g_input_mutex;
 InputState g_input;                 // guarded by g_input_mutex
 SDL_Window* g_window = nullptr;
 std::atomic<bool> g_background{false};
+std::atomic<bool> g_low_memory{false};
 std::atomic<bool> g_menu_context{false};
 std::atomic<unsigned> g_coop_keys_held{0u};  // galaxy::render::coop_keys_held
 std::atomic<bool> g_title_screen{false};
@@ -173,6 +181,7 @@ std::atomic<float> g_touch_slop_px{0.0f};
 void forward_output_to_logcat() {
     static int pipe_fds[2];
     if (pipe(pipe_fds) != 0) {
+        install_crash_log(-1);
         return;
     }
     std::FILE* file = nullptr;
@@ -186,6 +195,8 @@ void forward_output_to_logcat() {
     setvbuf(stderr, nullptr, _IONBF, 0);
     dup2(pipe_fds[1], STDOUT_FILENO);
     dup2(pipe_fds[1], STDERR_FILENO);
+    // A crash's report goes to the file itself: the thread below stops with the rest when the system dumps the process.
+    install_crash_log(file != nullptr ? fileno(file) : -1);
     std::thread([file] {
         char line[1024];
         std::size_t used = 0;
@@ -289,7 +300,8 @@ void run_activity_calls() {
 // most variable-rate panels until it asks for more.
 std::atomic<float> g_panel_fastest_hz{0.0f};
 
-// The surface's frame-rate vote for the frame-rate setting (max_fps; 0: the display's own). The game's own 30 or 60
+// The surface's frame-rate vote for the frame-rate setting (max_fps; 0: the display's own; unlimited: the panel's
+// fastest). The game's own 30 or 60
 // frames are a fixed source, so a variable-rate panel shows each for the same time; interpolated rates are the app's
 // own rate, switched to at once (the player chose it) rather than at the next seamless moment.
 void vote_frame_rate(ANativeWindow* native, float max_fps) {
@@ -297,7 +309,7 @@ void vote_frame_rate(ANativeWindow* native, float max_fps) {
         ANativeWindow_setFrameRate(native, max_fps, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
         return;
     }
-    const float rate = max_fps > 0.0f ? max_fps : g_panel_fastest_hz.load(std::memory_order_relaxed);
+    const float rate = max_fps > 0.0f && std::isfinite(max_fps) ? max_fps : g_panel_fastest_hz.load(std::memory_order_relaxed);
     ANativeWindow_setFrameRateWithChangeStrategy(native, rate, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT,
                                                  ANATIVEWINDOW_CHANGE_FRAME_RATE_ALWAYS);
 }
@@ -997,6 +1009,8 @@ bool start() noexcept {
     g_sdl_thread = std::this_thread::get_id();
 #if defined(__ANDROID__)
     forward_output_to_logcat();
+#else
+    install_crash_log(-1);
 #endif
     // Landscape either way up: the game lays out for shapes from 4:3 wide; taller ones come with Vert+ framing.
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
@@ -1036,7 +1050,12 @@ void run_requests() {
             key = g_menu_keys.front();
             g_menu_keys.pop_front();
         }
-        (void)galaxy::render::native_settings_pad_key(key);
+        if ((key & galaxy::render::kMenuKeyKeyboard) != 0u) {
+            const std::uintptr_t vk = key & ~galaxy::render::kMenuKeyKeyboard;
+            (void)galaxy::render::native_settings_handle_window_key(vk, false, static_cast<std::uint32_t>(vk));
+        } else {
+            (void)galaxy::render::native_settings_pad_key(key);
+        }
     }
 #if defined(__ANDROID__)
     run_activity_calls();
@@ -1046,10 +1065,15 @@ void run_requests() {
         s_captured = captured;
         call_activity(captured ? "menuOpened" : "menuClosed");
     }
-    // The controls follow the game to and from a pointer screen.
+    // The controls follow the game to and from a pointer screen or the title, and its corner buttons coming, going or
+    // moving (TouchControlsView.syncMenuContext).
     static bool s_pointer_screen = false;
-    if (const bool pointer_screen = g_menu_context.load(std::memory_order_relaxed); pointer_screen != s_pointer_screen) {
+    static float s_corner_foot = -1.0f;
+    const bool pointer_screen = g_menu_context.load(std::memory_order_relaxed) || g_title_screen.load(std::memory_order_relaxed);
+    const float corner_foot = galaxy::host::corner_buttons_foot();
+    if (pointer_screen != s_pointer_screen || std::fabs(corner_foot - s_corner_foot) >= 1.0f) {
         s_pointer_screen = pointer_screen;
+        s_corner_foot = corner_foot;
         call_activity("menuContextChanged");
     }
 #endif
@@ -1076,6 +1100,14 @@ void run_requests() {
 
 void pump_events(int timeout_ms) noexcept {
     SDL_Event event;
+    // A mod's text option being typed in, or LumaCore's text request (input.text_request) open: SDL's text events, and
+    // the system's on-screen keyboard where there is one.
+    if (g_window != nullptr) {
+        const bool wanted = galaxy::render::native_settings_text_wanted() || galaxy::luma_input::text_open();
+        if (wanted != SDL_TextInputActive(g_window)) {
+            (void)(wanted ? SDL_StartTextInput(g_window) : SDL_StopTextInput(g_window));
+        }
+    }
     // Every 10 s: this thread's CPU time and how much SDL's event wait took (a wait that polls rather than sleeps).
     static std::int64_t report_cpu = 0;
     static std::int64_t wait_cpu = 0;
@@ -1131,13 +1163,26 @@ void pump_events(int timeout_ms) noexcept {
     std::vector<MenuKey> menu_keys;
     int menu_wheel = 0;
     std::vector<std::filesystem::path> dropped;
+#if !defined(__ANDROID__)
+    // What the system opened Nebula with (--import; the desktop entry's %u), at the first pump: a
+    // file goes where a drop goes, as on Windows (host_window_win32.cpp); a nebula:// link too, which opens the MODS
+    // page (native_settings_files_dropped).
+    for (std::filesystem::path& opened : galaxy::render::native_settings_take_launch_imports()) {
+        dropped.push_back(std::move(opened));
+    }
+#endif
+    bool luma_display = false;  // LumaCore's display snapshot changes (services-system 4), read after the events
     {
     std::lock_guard<std::mutex> lock(g_input_mutex);
     while (any) {
+        luma_display = luma_display || galaxy::luma_system::sdl_display_event(event.type);
         switch (event.type) {
         case SDL_EVENT_QUIT:
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
             galaxy::render::host_window::quit_request.store(true, std::memory_order_release);
+            break;
+        case SDL_EVENT_LOW_MEMORY:
+            g_low_memory.store(true, std::memory_order_release);
             break;
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
             update_window_size();
@@ -1169,6 +1214,7 @@ void pump_events(int timeout_ms) noexcept {
             g_input.window_focused = false;
             g_input.keys = {};
             g_coop_keys_held.store(0u, std::memory_order_relaxed);
+            galaxy::luma_input::text_focus_lost();
             break;
         case SDL_EVENT_FINGER_DOWN:
         case SDL_EVENT_FINGER_MOTION:
@@ -1218,8 +1264,42 @@ void pump_events(int timeout_ms) noexcept {
             g_input.mouse_inside = true;
             break;
         }
+        case SDL_EVENT_TEXT_INPUT:
+            // An open text request takes the text first (its keys too, below); otherwise a Settings text field.
+            if (event.text.text != nullptr) {
+                if (galaxy::luma_input::text_open()) {
+                    galaxy::luma_input::text_utf8(event.text.text);
+                } else if (!galaxy::render::native_settings_handle_window_text(event.text.text)) {
+                    // Typed characters (UTF-8): the printable ASCII the game's font draws, to a Settings text row or
+                    // the co-op menu's text.
+                    for (const char* text = event.text.text; *text != '\0'; ++text) {
+                        const unsigned char c = static_cast<unsigned char>(*text);
+                        if (c >= 0x20u && c < 0x7Fu && !galaxy::render::native_settings_type(static_cast<char32_t>(c))) {
+                            galaxy::render::push_coop_text(static_cast<char32_t>(c));
+                        }
+                    }
+                }
+            }
+            break;
         case SDL_EVENT_KEY_DOWN:
         case SDL_EVENT_KEY_UP:
+            if (event.type == SDL_EVENT_KEY_DOWN && galaxy::luma_input::text_open()) {
+                using galaxy::luma_input::TextKey;
+                switch (event.key.scancode) {
+                case SDL_SCANCODE_RETURN:
+                case SDL_SCANCODE_KP_ENTER: galaxy::luma_input::text_key(TextKey::Enter); break;
+                case SDL_SCANCODE_ESCAPE:
+                case SDL_SCANCODE_AC_BACK: galaxy::luma_input::text_key(TextKey::Escape); break;
+                case SDL_SCANCODE_BACKSPACE: galaxy::luma_input::text_key(TextKey::Backspace); break;
+                case SDL_SCANCODE_DELETE: galaxy::luma_input::text_key(TextKey::Delete); break;
+                case SDL_SCANCODE_LEFT: galaxy::luma_input::text_key(TextKey::Left); break;
+                case SDL_SCANCODE_RIGHT: galaxy::luma_input::text_key(TextKey::Right); break;
+                case SDL_SCANCODE_HOME: galaxy::luma_input::text_key(TextKey::Home); break;
+                case SDL_SCANCODE_END: galaxy::luma_input::text_key(TextKey::End); break;
+                default: break;
+                }
+                break;
+            }
             if (event.key.scancode == SDL_SCANCODE_AC_BACK) {
                 // Android's back gesture: the HOME button, as the HOME Menu opens with it; in an open menu, back.
                 const bool down = event.type == SDL_EVENT_KEY_DOWN;
@@ -1236,15 +1316,6 @@ void pump_events(int timeout_ms) noexcept {
             }
             menu_keys.push_back({virtual_key(event.key.scancode), event.type == SDL_EVENT_KEY_DOWN, event.key.repeat});
             break;
-        case SDL_EVENT_TEXT_INPUT:
-            // Typed characters (UTF-8): the printable ASCII the game's font draws.
-            for (const char* text = event.text.text; text != nullptr && *text != '\0'; ++text) {
-                const unsigned char c = static_cast<unsigned char>(*text);
-                if (c >= 0x20u && c < 0x7Fu && !galaxy::render::native_settings_type(static_cast<char32_t>(c))) {
-                    galaxy::render::push_coop_text(static_cast<char32_t>(c));
-                }
-            }
-            break;
         case SDL_EVENT_GAMEPAD_ADDED:
             open_gamepad(event.gdevice.which);
             break;
@@ -1255,8 +1326,8 @@ void pump_events(int timeout_ms) noexcept {
             close_gamepad(event.gdevice.which);
             break;
 #if !defined(__ANDROID__)
-        // Files dropped on the window: mods to the importer (native_settings_files_dropped,
-        // after the input lock). Android's launcher takes files there ("Open with", share, drag and drop).
+        // Files dropped on the window: a save to the save import, mods to the importer, Mii files to the Mii import
+        // (native_settings_files_dropped, after the input lock). Android's launcher takes files there ("Open with", share, drag and drop).
         case SDL_EVENT_DROP_FILE:
             if (event.drop.data != nullptr) {
                 dropped.emplace_back(galaxy::text_path(event.drop.data));
@@ -1273,6 +1344,9 @@ void pump_events(int timeout_ms) noexcept {
 #endif
     sample_gamepads();
     }
+    if (luma_display) {
+        galaxy::luma_system::sdl_window_changed(g_window);
+    }
     // Pad 0 of the connected ones drives the menu as a controller does on Windows.
     {
         const InputState state = input_state();
@@ -1283,7 +1357,9 @@ void pump_events(int timeout_ms) noexcept {
             // The unified buttons are the menu's, by their labels (Nintendo's A is the right face button), as on Windows.
             const std::uint16_t buttons = galaxy::input::settings_pad_buttons(sample.scheme, sample.buttons);
             const galaxy::input::NativeSettingsPadStep step = galaxy::input::native_settings_pad_step(
-                g_menu_pad, buttons, sample.axes[0], sample.axes[1], galaxy::render::native_settings_overlay_visible(), galaxy::steady_ms());
+                g_menu_pad, buttons, sample.axes[0], sample.axes[1],
+                galaxy::render::native_settings_overlay_visible() || galaxy::render::home_menu_visible() ||
+                    galaxy::ui::launcher_visible() || galaxy::bench::running(), galaxy::steady_ms());
             for (std::size_t i = 0; i < step.key_count; ++i) {
                 galaxy::render::native_settings_post_key(step.keys[i]);
             }
@@ -1366,6 +1442,10 @@ void set_direct_touch(bool direct) noexcept {
 
 bool in_background() noexcept {
     return g_background.load(std::memory_order_acquire);
+}
+
+bool take_low_memory() noexcept {
+    return g_low_memory.exchange(false, std::memory_order_acq_rel);
 }
 
 InputState input_state() noexcept {
@@ -1507,6 +1587,11 @@ extern "C" JNIEXPORT jboolean JNICALL Java_dev_nebula_galaxy_GameActivity_native
     return galaxy::host::touch_target_at(x, y) ? JNI_TRUE : JNI_FALSE;
 }
 
+// How far down the game's own buttons in the top corners reach, in the picture's pixels; -1 while there are none.
+extern "C" JNIEXPORT jfloat JNICALL Java_dev_nebula_galaxy_GameActivity_nativeCornerButtonsFoot(JNIEnv*, jclass) {
+    return galaxy::host::corner_buttons_foot();
+}
+
 // Whether the game is on a pointer screen (set_menu_context), for the controls deciding what a touch is.
 extern "C" JNIEXPORT jboolean JNICALL Java_dev_nebula_galaxy_GameActivity_nativeMenuContext(JNIEnv*, jclass) {
     return galaxy::sdl::g_menu_context.load(std::memory_order_relaxed) ? JNI_TRUE : JNI_FALSE;
@@ -1584,7 +1669,14 @@ OpenedWindow open_game_window(WindowOwner& owner, int window_width, int window_h
 #if defined(__ANDROID__)
     flags |= SDL_WINDOW_FULLSCREEN;
 #endif
-    if (hidden) {
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+    // The system's launch screen stands until the first picture.
+    constexpr bool kShownWithFirstPicture = false;
+#else
+    // Shown with its first picture (show_window): the start draws no empty window.
+    constexpr bool kShownWithFirstPicture = true;
+#endif
+    if (hidden || kShownWithFirstPicture) {
         flags |= SDL_WINDOW_HIDDEN;
     }
     SDL_Window* window = SDL_CreateWindow("Nebula", std::max(window_width, 320), std::max(window_height, 240), flags);
@@ -1595,12 +1687,16 @@ OpenedWindow open_game_window(WindowOwner& owner, int window_width, int window_h
     {
         std::lock_guard<std::mutex> lock(galaxy::sdl::g_input_mutex);
         galaxy::sdl::g_window = window;
+        galaxy::luma_input::set_text_entry_available(true);
         galaxy::sdl::update_window_size();
         backbuffer_width = static_cast<unsigned>(galaxy::sdl::g_input.window_width);
         backbuffer_height = static_cast<unsigned>(galaxy::sdl::g_input.window_height);
     }
     owner.window = window;
-    return {window, !hidden};
+    // LumaCore's clipboard and links on SDL, and the first display snapshot (services-system 4 to 6).
+    galaxy::luma_system::set_platform(galaxy::luma_system::sdl_platform());
+    galaxy::luma_system::sdl_window_changed(window);
+    return {window, !hidden && !kShownWithFirstPicture};
 }
 
 void close_game_window(WindowOwner& owner) noexcept {
@@ -1612,7 +1708,13 @@ void close_game_window(WindowOwner& owner) noexcept {
 }
 
 void show_window(NativeWindow window) noexcept {
-    SDL_ShowWindow(static_cast<SDL_Window*>(window));
+    // On the main thread, as SDL asks for a window's changes; it takes the focus as a new window does.
+    (void)SDL_RunOnMainThread(
+        [](void* shown) {
+            SDL_ShowWindow(static_cast<SDL_Window*>(shown));
+            SDL_RaiseWindow(static_cast<SDL_Window*>(shown));
+        },
+        window, false);
 }
 
 // The system's vsync rate where there is one (Android: SDL's display mode can lag a refresh-rate switch), to the
@@ -1704,7 +1806,58 @@ void pick_files(FilePick kind, std::function<void(std::vector<std::filesystem::p
         done({});
         return;
     }
-    galaxy::sdl::call_activity(galaxy::sdl::ActivityCall{"pickFiles", true, kind == FilePick::Miis ? 0 : 1});
+    galaxy::sdl::call_activity(
+        galaxy::sdl::ActivityCall{"pickFiles", true, kind == FilePick::Miis ? 0 : kind == FilePick::Saves ? 2 : 1});
+}
+
+// The save dialog (GameActivity.saveCopy: a document the player creates, the file copied into it). One at a time.
+namespace {
+std::mutex g_save_copy_mutex;
+std::function<void(SaveCopy)> g_save_copy_done;
+std::string g_save_copy_file;
+}  // namespace
+
+void save_copy(const std::filesystem::path& file, std::function<void(SaveCopy)> done) {
+    bool busy = false;
+    {
+        const std::lock_guard<std::mutex> lock(g_save_copy_mutex);
+        busy = static_cast<bool>(g_save_copy_done);
+        if (!busy) {
+            g_save_copy_done = std::move(done);
+            g_save_copy_file = galaxy::path_text(file);
+        }
+    }
+    if (busy) {
+        done(SaveCopy::Failed);
+        return;
+    }
+    galaxy::sdl::call_activity("saveCopy");
+}
+
+// The file saveCopy offers, as UTF-8 bytes; empty when none is asked for.
+extern "C" JNIEXPORT jbyteArray JNICALL Java_dev_nebula_galaxy_GameActivity_nativeSaveCopyFile(JNIEnv* env, jclass) {
+    std::string file;
+    {
+        const std::lock_guard<std::mutex> lock(g_save_copy_mutex);
+        if (g_save_copy_done) file = g_save_copy_file;
+    }
+    jbyteArray bytes = env->NewByteArray(static_cast<jsize>(file.size()));
+    if (bytes != nullptr && !file.empty()) {
+        env->SetByteArrayRegion(bytes, 0, static_cast<jsize>(file.size()), reinterpret_cast<const jbyte*>(file.data()));
+    }
+    return bytes;
+}
+
+// saveCopy's answer: 0 saved, 1 cancelled, 2 failed.
+extern "C" JNIEXPORT void JNICALL Java_dev_nebula_galaxy_GameActivity_nativeCopySaved(JNIEnv*, jclass, jint result) {
+    std::function<void(SaveCopy)> done;
+    {
+        const std::lock_guard<std::mutex> lock(g_save_copy_mutex);
+        done = std::move(g_save_copy_done);
+        g_save_copy_done = nullptr;
+        g_save_copy_file.clear();
+    }
+    if (done) done(result == 0 ? SaveCopy::Saved : result == 1 ? SaveCopy::Cancelled : SaveCopy::Failed);
 }
 
 // The picker's answer: the copies' paths as UTF-8 bytes (JNI's own strings are modified UTF-8), none when cancelled.
@@ -1767,8 +1920,43 @@ void pick_files(FilePick kind, std::function<void(std::vector<std::filesystem::p
     static constexpr SDL_DialogFileFilter kMods[] = {
         {"Mods and texture packs (luma, zip, 7z, rar, tar)", "luma;zip;7z;rar;tar;tgz;gz;txz;xz;tbz2;bz2;tzst;zst"},
         {"All files", "*"}};
-    const SDL_DialogFileFilter* filters = kind == FilePick::Miis ? kMiis : kMods;
-    SDL_ShowOpenFileDialog(picked, request, galaxy::sdl::g_window, filters, 2, nullptr, true);
+    static constexpr SDL_DialogFileFilter kSaves[] = {
+        {"Saves (zip, Nebula.sav, GameData.bin, Wii SD data.bin)", "zip;sav;bin"},
+        {"All files", "*"}};
+    const SDL_DialogFileFilter* filters = kind == FilePick::Miis ? kMiis : kind == FilePick::Saves ? kSaves : kMods;
+    SDL_ShowOpenFileDialog(picked, request, galaxy::sdl::g_window, filters, 2, nullptr, kind != FilePick::Saves);
+}
+
+// SDL's save dialog; the file is copied where the player chose (a ".zip" added when the name has no extension).
+namespace {
+struct SaveRequest {
+    std::filesystem::path file;
+    std::function<void(SaveCopy)> done;
+};
+
+void SDLCALL save_chosen(void* userdata, const char* const* files, int) {
+    std::unique_ptr<SaveRequest> request(static_cast<SaveRequest*>(userdata));
+    if (files == nullptr) {
+        request->done(SaveCopy::Failed);
+        return;
+    }
+    if (files[0] == nullptr) {
+        request->done(SaveCopy::Cancelled);
+        return;
+    }
+    std::filesystem::path target(files[0]);
+    if (!target.has_extension()) target += ".zip";
+    std::error_code error;
+    std::filesystem::copy_file(request->file, target, std::filesystem::copy_options::overwrite_existing, error);
+    request->done(error ? SaveCopy::Failed : SaveCopy::Saved);
+}
+}  // namespace
+
+void save_copy(const std::filesystem::path& file, std::function<void(SaveCopy)> done) {
+    static constexpr SDL_DialogFileFilter kZip[] = {{"Zip archive", "zip"}};
+    auto* request = new SaveRequest{file, std::move(done)};
+    const std::string name = galaxy::path_text(file.filename());
+    SDL_ShowSaveFileDialog(save_chosen, request, galaxy::sdl::g_window, kZip, 1, name.c_str());
 }
 
 // The file manager at the folder (made first, as on Windows).
@@ -1808,10 +1996,6 @@ unsigned dlss_min_width(unsigned, unsigned, unsigned) noexcept {
     return 0u;
 }
 
-bool launcher_available() {
-    return false;
-}
-
 bool dlss_files_present() {
     return false;
 }
@@ -1845,33 +2029,50 @@ VendorLicense vendor_license(std::string&) {
     return VendorLicense::Failed;
 }
 
-bool restart_game(bool) {
-#if defined(__ANDROID__)
-    galaxy::sdl::call_activity("restartGame");
-    return true;
-#elif defined(_WIN32)
-    return false;
-#else
-    // The same program with the same arguments, in this process's place.
-    std::FILE* file = std::fopen("/proc/self/cmdline", "rb");
-    if (file == nullptr) return false;
-    std::string line;
-    char buffer[4096];
-    for (std::size_t read = 0; (read = std::fread(buffer, 1, sizeof(buffer), file)) > 0;) line.append(buffer, read);
-    std::fclose(file);
-    std::vector<char*> args;
-    for (std::size_t at = 0; at < line.size(); at = line.find('\0', at) + 1u) {
-        args.push_back(line.data() + at);
-        if (line.find('\0', at) == std::string::npos) break;
-    }
-    if (args.empty()) return false;
-    args.push_back(nullptr);
-    std::fflush(stderr);
-    execv("/proc/self/exe", args.data());
-    std::fprintf(stderr, "[host] could not start Nebula again: %s\n", std::strerror(errno));
-    return false;
-#endif
+void quit_game() noexcept {
+    quit_request.store(true, std::memory_order_release);
 }
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+// An iOS app cannot start itself again (host_main kHostStartsAgain).
+bool restart_game(Restart) {
+    return false;
+}
+
+int restart_wanted() noexcept {
+    return 0;
+}
+
+bool can_restart() noexcept {
+    return false;
+}
+#else
+namespace {
+std::atomic<int> restart_request{0};  // restart_wanted: 0 none, else a Restart's value
+}  // namespace
+
+// The game ends as for Quit, and the host starts it again as it leaves (host_main finish_and_exit: an exec of this
+// executable with the arguments of the start `kind` asks for; on Android the activity's new process, start_again).
+bool restart_game(Restart kind) {
+    restart_request.store(static_cast<int>(kind), std::memory_order_release);
+    quit_request.store(true, std::memory_order_release);
+    return true;
+}
+
+int restart_wanted() noexcept {
+    return restart_request.load(std::memory_order_acquire);
+}
+
+bool can_restart() noexcept {
+    return true;
+}
+
+#if defined(__ANDROID__)
+void start_again(Restart kind) {
+    galaxy::sdl::call_activity(galaxy::sdl::ActivityCall{"restartGame", true, static_cast<int>(kind)});
+}
+#endif
+#endif
 
 #if defined(NEBULA_GPU_METAL)
 // The Metal renderer on this host (a development build: Apple's own host is platform/apple/host): SDL's Metal view.
@@ -1968,6 +2169,11 @@ unsigned coop_keys_held() noexcept {
 void native_settings_post_key(std::uintptr_t virtual_key) noexcept {
     const std::lock_guard<std::mutex> lock(galaxy::sdl::g_menu_keys_mutex);
     galaxy::sdl::g_menu_keys.push_back(virtual_key);
+}
+
+void native_settings_post_keyboard_key(std::uintptr_t virtual_key) noexcept {
+    const std::lock_guard<std::mutex> lock(galaxy::sdl::g_menu_keys_mutex);
+    galaxy::sdl::g_menu_keys.push_back(virtual_key | kMenuKeyKeyboard);
 }
 
 }  // namespace galaxy::render
@@ -2160,11 +2366,6 @@ bool keyboard_or_mouse_attached() noexcept {
 #else
     return SDL_HasKeyboard() || SDL_HasMouse();
 #endif
-}
-
-// A second player on this system: not yet.
-bool native_game_co_star(galaxy::input::PlayerInput*) noexcept {
-    return false;
 }
 
 JoyConStatus joycon_status() noexcept {

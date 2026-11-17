@@ -3,7 +3,7 @@
 
 // TextureStore's GPU side: shader views by slot, mapped upload staging, textures, and the recorded upload of a
 // texture's levels. The cache's logic (keys, maps, aliases, eviction, retirement) is shared; each API implements
-// this class (gpu_texture_backend_d3d12.cpp, vk/texture_backend_vk.cpp).
+// this class (gpu_texture_backend_d3d12.cpp, vk/texture_backend_vk.cpp, mtl/, d3d11/texture_backend_d3d11.cpp).
 
 #include "galaxy/render/gpu_types.h"
 #include "galaxy/render/texel_format.h"
@@ -16,6 +16,8 @@
 #include "galaxy/render/vk/texture_backend_vk.h"
 #elif defined(NEBULA_GPU_METAL)
 #include "galaxy/render/mtl/texture_backend_mtl.h"
+#elif defined(NEBULA_GPU_D3D11)
+#include "galaxy/render/d3d11/texture_backend_d3d11.h"
 #else
 #include "galaxy/render/gpu_placed_textures.h"
 
@@ -47,6 +49,28 @@ public:
     [[nodiscard]] gpu::TextureRef create_texture(
         std::uint32_t width, std::uint32_t height, unsigned levels, std::uint64_t& allocation_bytes,
         TexelFormat format = TexelFormat::Rgba8, bool writable = false);
+    // create_texture in two steps, for a texture made away from the render thread (the texture packs' loaders): making one
+    // can take tens of milliseconds (new GPU memory). make_texture runs on any thread; adopt_texture takes the texture in on
+    // the render thread before anything records it. With `fill`, a texture made in CPU-visible memory is written there and
+    // then (`filled`: record_upload is not called for it).
+    // The staged levels make_texture may write (as record_upload takes them).
+    struct Levels {
+        const UploadChunk* staging = nullptr;
+        std::uint64_t offset = 0u;
+        const std::uint64_t* offsets = nullptr;
+        const std::uint32_t* pitches = nullptr;
+    };
+    struct MadeTexture {
+        gpu::TextureRef texture;
+        std::uint64_t allocation_bytes = 0u;
+        bool async = false;   // made for the copy queue
+        bool filled = false;  // its levels are written
+    };
+    static constexpr bool kMakesAnywhere = true;
+    [[nodiscard]] MadeTexture make_texture(std::uint32_t width, std::uint32_t height, unsigned levels,
+                                           TexelFormat format = TexelFormat::Rgba8, bool writable = false,
+                                           const Levels* fill = nullptr);
+    void adopt_texture(const MadeTexture& made);
     // True on an adapter with one memory shared by the CPU and the GPU and cache coherence between them
     // (D3D12_FEATURE_DATA_ARCHITECTURE UMA and CacheCoherentUMA): textures are written from the CPU (WriteToSubresource) into
     // custom write-back heap memory, and staging chunks are write-back memory the CPU also reads.
@@ -54,6 +78,8 @@ public:
     // A texture create_texture made in CPU-visible memory: it is never uploaded again in place.
     [[nodiscard]] static bool direct_written(ID3D12Resource* texture) noexcept;
     [[nodiscard]] static bool supports_bc1() noexcept { return true; }
+    [[nodiscard]] static bool supports_astc4x4() noexcept { return false; }
+    [[nodiscard]] static bool supports_rgb565() noexcept { return false; }
     // A texture made by create_texture that the pool may hand out again for the same extent.
     [[nodiscard]] static bool poolable(ID3D12Resource* texture, std::uint32_t& width, std::uint32_t& height,
                                        std::uint32_t& levels);

@@ -38,8 +38,11 @@ public:
 
     struct Inputs {
         ID3D12Resource* depth = nullptr;  // the scene target's single-sample depth, in a shader-readable state
-        unsigned width = 0;               // its size in pixels
+        unsigned width = 0;               // the part of it the scene is drawn in, in pixels
         unsigned height = 0;
+        unsigned extent_width = 0;        // its whole size (0: the part's)
+        unsigned extent_height = 0;
+        unsigned lowest_sixteenths = 16u; // the smallest dynamic resolution step the scene may take (16: none)
         D3D12_CPU_DESCRIPTOR_HANDLE color_rtv{};  // the scene target's colour (multisampled with MSAA)
         unsigned samples = 1;
         bool hdr = false;                 // the colour is the HDR scene scene target (kSceneHdrColorFormat)
@@ -52,7 +55,7 @@ public:
     // and render target bound. Returns false when nothing was recorded.
     bool record(ID3D12GraphicsCommandList* list, DescriptorRing& ring, const Inputs& in, std::uint64_t frame_index,
                 unsigned frames_in_flight);
-    // Once a frame: frees what record() released, and hands back the targets no record() has asked for in 600 frames
+    // Once a frame: frees what record() released, and hands back the targets no record() has asked for in kIdleSteps game steps (idle_clock.h)
     // (the occlusion switched off), at the frame's fence; the next record() makes them again.
     void trim_idle(std::uint64_t frame_index, unsigned frames_in_flight);
 
@@ -61,8 +64,9 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource> resource;
         unsigned width = 0;
         unsigned height = 0;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         gpu::Use use = gpu::Use::ComputeRead;
-        std::uint64_t used_frame = 0;   // the last frame record() asked for it
+        std::uint64_t used_step = 0;  // idle_clock() when last asked for
     };
     struct Retired {
         Microsoft::WRL::ComPtr<ID3D12Resource> resource;
@@ -83,13 +87,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D12PipelineState> occlusion_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> ssao_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> denoise_;
-    Microsoft::WRL::ComPtr<ID3D12PipelineState> upsample_;
     // 1, 2, 4, 8 samples; then HDR.
     std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 8> apply_{};
     Target distance_;  // eye distance per occlusion pixel (R32F)
     Target raw_;       // occlusion, eye distance (R16G16F)
     Target denoised_;
-    Target scale_;     // the colour multiplier per scene target pixel (RGBA8)
     std::vector<Retired> retired_;
 };
 

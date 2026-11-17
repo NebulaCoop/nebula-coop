@@ -1,4 +1,5 @@
 #include "Game/System/NebulaCoopMods.hpp"
+#include "Game/System/LumaCoop.hpp"
 #include "Game/Player/NebulaCharacter.hpp"
 #include "Game/Player/NebulaCharacters.hpp"
 #include "Game/Player/NebulaPalette.hpp"
@@ -47,6 +48,7 @@ namespace {
         // A few a frame at most: one typed line is one command.
         for (s32 i = 0; i < 4 && NebulaHost::coopCommandTake(command, sizeof(command), &word) != 0; i++) {
             NebulaMods::fire(NEBULA_MOD_EVENT_COOP_COMMAND, word, nullptr, command);
+            luma::coop::command(command, word);
         }
     }
 
@@ -88,7 +90,7 @@ namespace {
 
 namespace NebulaCoopMods {
     void update() {
-        if (!NebulaMods::hasCode()) {
+        if (!NebulaMods::hasCode() && !luma::coop::used()) {
             return;
         }
         sBefore = sNow;
@@ -97,9 +99,11 @@ namespace NebulaCoopMods {
         if (sNow.mIn && !sBefore.mIn) {
             // The players already there come with the room, as sm64coopdx's joined game: no join for each.
             NebulaMods::fire(NEBULA_MOD_EVENT_COOP_ROOM_JOINED, sNow.mMe);
+            luma::coop::event(LUMA_COOP_EVENT_JOINED, sNow.mMe);
             for (s32 i = 0; i < cSlots; i++) {
                 if (sNow.mHas[i] && sNow.mPlayers[i].stage[0] != '\0') {
                     NebulaMods::fire(NEBULA_MOD_EVENT_COOP_PLAYER_PLACE, i, nullptr, sNow.mPlayers[i].stage);
+                    luma::coop::event(LUMA_COOP_EVENT_PLAYER_PLACE, i);
                 }
             }
             return;
@@ -110,6 +114,7 @@ namespace NebulaCoopMods {
                     clearDescription(i);
                 }
                 NebulaMods::fire(NEBULA_MOD_EVENT_COOP_ROOM_CLOSED);
+                luma::coop::event(LUMA_COOP_EVENT_CLOSED, 0);
             }
             return;
         }
@@ -121,12 +126,15 @@ namespace NebulaCoopMods {
             if (was && !is) {
                 clearDescription(i);
                 NebulaMods::fire(NEBULA_MOD_EVENT_COOP_PLAYER_LEAVE, i, nullptr, sBefore.mPlayers[i].name);
+                luma::coop::event(LUMA_COOP_EVENT_PLAYER_LEAVE, i);
             }
             if (is && !was) {
                 NebulaMods::fire(NEBULA_MOD_EVENT_COOP_PLAYER_JOIN, i, nullptr, sNow.mPlayers[i].name);
+                luma::coop::event(LUMA_COOP_EVENT_PLAYER_JOIN, i);
             }
             if (is && sNow.mPlayers[i].stage[0] != '\0' && (!was || !samePlaceAs(sBefore.mPlayers[i], sNow.mPlayers[i]))) {
                 NebulaMods::fire(NEBULA_MOD_EVENT_COOP_PLAYER_PLACE, i, nullptr, sNow.mPlayers[i].stage);
+                luma::coop::event(LUMA_COOP_EVENT_PLAYER_PLACE, i);
             }
         }
     }
@@ -206,6 +214,13 @@ namespace NebulaCoopMods {
             return (rPlayer.flags & NEBULA_COOP_LIST_LUIGI) != 0 ? "luigi" : "mario";
         }
         return rPlayer.character;
+    }
+
+    u32 listFlags(s32 index) {
+        if (!sNow.mIn) {
+            return index == 0 ? (NEBULA_COOP_LIST_YOU | NEBULA_COOP_LIST_HOST) : 0;
+        }
+        return valid(index) ? sNow.mPlayers[index].flags : 0;
     }
 
     s32 paletteColor(s32 index, s32 part) {

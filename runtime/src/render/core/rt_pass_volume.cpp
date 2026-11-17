@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// The light volume (rt_volume.hlsl; the master plan's 15.2): the light in the air over the scene camera's view, 96 x
+// The light volume (rt_volume.hlsl): the light in the air over the scene camera's view, 96 x
 // 54 x 48 froxels, this frame's and the frame before's by turns (VolumeA, VolumeB). On High where the stage has air,
 // the light the air scatters toward the eye, integrated through it (rt_scatter.hlsl, 15.4: Scatter). Published after
 // the light pass as pictures the programs sample (rt_walk.cpp rt_light, pictures 4 and 5): a particle draw that is
@@ -11,7 +11,7 @@ namespace galaxy::render {
 
 namespace {
 
-// The air (15.4) is a stage's number (rt_stages.tsv's air column, per unit: 0.00002 thin air, more in fog and dust),
+// The air is a stage's number (rt_stages.tsv's air column, per unit: 0.000001 a day sky's, more in haze, dust),
 // none in space. A stage without a row has none: most stages are in space, and a sky's brightness does not tell
 // (Ghostly's and Melty Molten's domes are bright and in space).
 
@@ -19,9 +19,9 @@ namespace {
 
 bool RenderCore::rt_pass_volume_on() const { return rt_levels_[kFbVolume] != 0u && !rt_fb_reference(); }
 
-// The stage's air: its row's (b34, after the stage table's air column lands); none without one.
+// The stage's air: its row's (rt_stage_air_, kept by the walk); none without one.
 float RenderCore::rt_air_density() const {
-    return 0.0f;
+    return rt_stage_air_;
 }
 
 void RenderCore::rt_pass_volume() {

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -22,7 +23,7 @@ struct SettingsRow {
     std::string help;
     bool heading = false;
     std::string key;  // names the row across rebuilds (a mod's buttons)
-    std::uint8_t names = 0u;  // the mod's own words, shown as they are: 1 its label, 2 its value
+    std::uint8_t names = 0u;  // words shown as they are: 1 its label, 2 its value (a mod's own), 4 its help (already in the played language)
     // A row of buttons (nothing to change): their words, and what pressing the one at an index does. Left and right
     // move between them; A, Space or a click presses one (Right too when there is only one).
     std::vector<std::string> buttons;
@@ -55,7 +56,16 @@ struct FrameRateCaps {
     bool generated_dynamic = false;
     unsigned generated_max = 0;
     bool fsr_generation_offered = false;
+    // VSync off on a surface that can present before the refresh: native interpolation offers Unlimited
+    // (render_config.h kUnlimitedFrameRate).
+    bool unlimited = false;
+    // The surface presents only at its refresh (render_config.h present_waits_for_refresh): VSync stays on.
+    bool vsync_fixed = false;
 };
+// A frame-rate target as the settings list it: frames a second, 0 for the display's rate, kUnlimitedTarget for no cap.
+inline constexpr unsigned kUnlimitedTarget = std::numeric_limits<unsigned>::max();
+unsigned frame_rate_target(float max_fps);
+float frame_rate_of_target(unsigned target);
 Interpolation interpolation_of(const RenderConfig& render);
 std::vector<unsigned> interpolation_targets(Interpolation mode, const FrameRateCaps& caps);
 std::vector<Interpolation> interpolation_modes(const FrameRateCaps& caps);
