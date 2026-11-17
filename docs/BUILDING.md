@@ -8,7 +8,7 @@
 - LLVM/clang 19 or newer (`C:\Program Files\LLVM`), for the game module.
 - CMake 3.24+ and Ninja.
 - Rust stable (MSVC target), for the disc import tool.
-- The .NET 8 SDK, for Setup and the launcher.
+- LLVM 22 for a release's game module (`native\build.ps1 -Llvm`); Setup itself is plain C++ built with the MSVC tools.
 
 In PowerShell, dot-source `tools\enter_msvc_environment.ps1` first. CMake downloads the remaining dependencies at
 configure time from pinned archives checked by SHA-256: the FidelityFX SDK (FSR 3), and for the Vulkan renderer
@@ -53,7 +53,7 @@ Put `Nebula.exe` and `smg_game.dll` in one folder with the `content` folder from
 .\Nebula.exe
 ```
 
-With no arguments it finds `content\game.pak` next to it (or in the current folder) and uses the launcher's saves,
+With no arguments it finds `content\game.pak` next to it (or in the current folder) and uses the installed game's saves,
 `%LOCALAPPDATA%\NebulaCoop\saves`. `--pak <game.pak>` and `--nand <folder>` name others:
 
 ```powershell
@@ -69,25 +69,22 @@ ctest --test-dir build\host --output-on-failure
 cargo test -p nebula-import
 sh native/tests/run_tests.sh
 .\tools\audit_repo.ps1
-.\installer\tests\run-launcher-tests.ps1
-.\installer\tests\run-beta-updater-tests.ps1
-.\installer\tests\run-update-flow-tests.ps1
 ```
 
-The Build workflow runs only what a change can affect: a change under `installer/` runs the installer tests (the last
-three above) and not the game builds, and any other change to the code runs the game builds and their tests and not
+The Build workflow runs only what a change can affect: a change under `installer/` compiles Setup (`installer/native`)
+and not the game builds, and any other change to the code runs the game builds and their tests and not
 the installer's. `installer/assets/`, `runtime/include/galaxy/store_version.inc` and `build.yml` itself run both;
 documentation, `tools/`, `nebulanet/` and the other workflows run neither. The **Build result** check reports either
 way, so it is the one to require before merging. It covers the Windows build (host, game module, disc import tool) and
-the installer tests; the Linux, Android and macOS builds run and show their own checks but don't block a merge.
+Setup's compile; the Linux, Android and macOS builds run and show their own checks but don't block a merge.
 
 ## Setup
 
 ```powershell
-.\installer\build-native-setup.ps1 -Version <version> -Dxc <unpacked DirectX Shader Compiler release> -Bin <folder with Nebula.exe and smg_game.dll>
+.\installer\build-native-setup.ps1 -Version <version> -Dxc <unpacked DirectX Shader Compiler release> -Bin <folder with Nebula.exe and smg_game.dll> -Names <names> -ShippedMods <folder with lumakit.luma>
 ```
 
-Builds the disc import tool, the launcher and Setup, and writes `Nebula-Setup.exe` with the host and game module
+Builds the disc import tool, the install root's `Nebula.exe` and Setup (`installer/native`), and writes `Nebula-Setup.exe` with the host and game module
 inside it.
 
 ## Releases
@@ -110,10 +107,10 @@ the repository. `Nebula.pdb` is kept as the run's `release-symbols` download for
 
 Setup installs NebulaCoop beside an installed upstream Nebula, never over it: `%LOCALAPPDATA%\Programs\NebulaCoop`,
 data in `%LOCALAPPDATA%\NebulaCoop`, its own Start menu folder, `HKCU\Software\NebulaCoop` and Add/Remove Programs entry
-(`installer/src/Common/NebulaPaths.cs`, `ProductName`; the game's own `galaxy::kDataFolderName`). A first install asks
-whether to import from Nebula: the player picks Nebula's install folder (or its data folder), and Setup copies its saves
-and settings, and its packed game when this version can read it, so the disc is not asked for. Nebula's folders are only
-read. `--unattended --import-from <folder>` does the same without the questions. Updates never ask.
+(`installer/native/common.h`, `paths::kProductName`; the game's own `galaxy::kDataFolderName`). It registers no `.luma`
+file type and no `nebula:` links: those stay Nebula's. When a first install finds Nebula (its registered install folder
+or its data folder), Setup offers to copy its saves and settings, and its packed game when this version can read it,
+so the disc is not asked for. Nebula's folders are only read. Updates never ask.
 
 Updates run only a Setup signed with the release key, the private half of `installer/release-public-key.xml`. Put
 that private key (RSA XML) in the repository secret `NEBULA_RELEASE_KEY`; without it Setup is published unsigned and

@@ -92,12 +92,12 @@ void SaveDataHandleSequence::startPreLoad() {
 }
 
 void SaveDataHandleSequence::startReload() {
-    // The constructor's start: every file as new, then whatever the folder holds read over it.
-    // (The handler's six user files, as its constructor makes them.)
-    for (int user = 1; user <= 6; user++) {
-        mSaveDataHandler->initializeUserFileMemory(user, mNewUserFile);
-    }
-    mSucceeded = false;
+    mCurrentUserFile->resetAllData();
+    mCurrentUserFile->mIsPlayerMario = true;
+    mSaveDataHandler->initializeAllUserFileMemory(mCurrentUserFile);
+    mSaveCopyLoading = 0;
+    mSaveDamaged = false;
+    mPreLoadState = 0;
     startPreLoad();
 }
 

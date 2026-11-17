@@ -14,6 +14,7 @@ on:
       - .github/workflows/release.yml
       - installer/**
       - native/build.ps1
+      - tools/enter_msvc_environment.ps1
       - tools/release_check.ps1
       - tools/release-allow.txt
   workflow_dispatch:
@@ -27,6 +28,8 @@ permissions:
   contents: read
 
 env:
+  # The LLVM the game module is built with (its row generator needs libclang 21 or later), as upstream's releases use.
+  LLVM_VERSION: '22.1.6'
   # The DirectX Shader Compiler Setup ships (a mod's shaders are built with it): the release cmake/rt_shaders.cmake pins.
   DXC_URL: https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip
   DXC_SHA256: ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1
@@ -74,99 +77,103 @@ jobs:
           echo "Nebula $version: $setup (pre-release: $prerelease, publish: $publish)"
 
   host:
-    name: Host
-    # Visual Studio 2022's MSVC, as the Build workflow's host job uses.
+    name: Windows programs (${{ matrix.level }})
+    # Visual Studio 2022's MSVC, as the Build workflow's host job uses. Each CPU level builds the three renderers'
+    # programs (Nebula, NebulaVk, NebulaD11); the AVX2 run also brings D3D12\ and glslang\.
     runs-on: windows-2022
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - level: avx2
+            baseline: 'OFF'
+          - level: x86-64-v2
+            baseline: 'ON'
     steps:
       - uses: actions/Checkout@v7
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-      # The libraries CMake builds at configure time, from the Build workflow's Direct3D 12 job: restored only, so a
-      # release never writes the cache.
-      - name: Configure-time dependencies
-        uses: actions/cache/restore@v6
-        with:
-          path: |
-            build/host/archive-deps
-            build/host/fidelityfx.built
-            build/host/_deps
-          key: host-deps-OFF-${{ hashFiles('cmake/**', 'third_party/archive/**') }}
-      - name: Configure
+      - name: Build Nebula, NebulaVk and NebulaD11
         # A release build: cross-file optimization on (NEBULA_HOST_IPO's default). There is one build kind: tests
-        # attach their hooks from outside (tools/release_check.ps1 checks no source names a build kind). Direct3D 11's
-        # program (NebulaD11.exe) is built beside the game's.
-        run: cmake -S . -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release -DNEBULA_D3D11=ON
-      - name: Build
-        # The programs Setup ships, not the tests.
-        run: cmake --build build/host --target Nebula NebulaD11
-      - name: Configure (x86-64-v2)
-        # The same two for CPUs without x86-64-v3 (NEBULA_HOST_BASELINE): Nebula-x86-64-v2.exe, NebulaD11-x86-64-v2.exe.
-        run: cmake -S . -B build/host-v2 -G Ninja -DCMAKE_BUILD_TYPE=Release -DNEBULA_D3D11=ON -DNEBULA_HOST_BASELINE=ON
-      - name: Build (x86-64-v2)
-        run: cmake --build build/host-v2 --target Nebula NebulaD11
-      - name: glslang
-        # glslang's compiler, which LumaLink checks a mod's shaders with (cmake/vulkan_deps.cmake nebula_glslang).
-        run: |
-          cmake -S . -B build/host-vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DNEBULA_VULKAN=ON
-          cmake --build build/host-vk --target nebula_glslang
-      - name: Stage
+        # attach their hooks from outside (tools/release_check.ps1 checks no source names a build kind).
         shell: pwsh
         run: |
-          $bin = New-Item -ItemType Directory -Force 'dist/bin'
-          Copy-Item build/host/Nebula.exe, build/host/NebulaD11.exe, build/host-v2/Nebula-x86-64-v2.exe, build/host-v2/NebulaD11-x86-64-v2.exe $bin
-          Copy-Item -Recurse build/host/D3D12 (Join-Path $bin 'D3D12')
-          Copy-Item -Recurse build/host-vk/glslang-tool (Join-Path $bin 'glslang')
-          $symbols = New-Item -ItemType Directory -Force 'dist/symbols'
-          Copy-Item build/host/*.pdb, build/host-v2/*.pdb $symbols -ErrorAction SilentlyContinue
-          Get-ChildItem -Recurse $bin | Select-Object -ExpandProperty FullName
+          . .\tools\enter_msvc_environment.ps1 | Out-Null
+          $build = Join-Path $env:RUNNER_TEMP 'host'
+          cmake -S . -B $build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNEBULA_VULKAN=ON -DNEBULA_D3D11=ON `
+            "-DNEBULA_HOST_BASELINE=${{ matrix.baseline }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build $build --target Nebula NebulaVk NebulaD11 nebula_glslang
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $out = Join-Path $env:RUNNER_TEMP 'out'
+          New-Item -ItemType Directory -Force $out, (Join-Path $out 'glslang'), (Join-Path $out 'symbols') | Out-Null
+          Get-ChildItem -LiteralPath $build -Filter 'Nebula*.exe' | Copy-Item -Destination $out
+          Get-ChildItem -LiteralPath $build -Filter 'Nebula*.pdb' | Copy-Item -Destination (Join-Path $out 'symbols')
+          Copy-Item -Recurse -LiteralPath (Join-Path $build 'D3D12') -Destination (Join-Path $out 'D3D12')
+          Copy-Item (Join-Path $build 'glslang-tool\glslang.exe'), (Join-Path $build 'glslang-tool\LICENSE.txt') (Join-Path $out 'glslang')
+          Get-ChildItem -Recurse -File $out | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.FullName.Substring($out.Length + 1) }
       - uses: actions/upload-artifact@v7
         with:
-          name: release-host
-          path: dist/bin
+          name: release-host-${{ matrix.level }}
+          path: ${{ runner.temp }}/out
           retention-days: 1
           if-no-files-found: error
       # Kept for reading crash dumps of this release (docs/DIAGNOSTICS.md); not published.
       - uses: actions/upload-artifact@v7
         with:
-          name: release-symbols
-          path: dist/symbols
+          name: release-symbols-${{ matrix.level }}
+          path: ${{ runner.temp }}/out/symbols
           retention-days: 90
           if-no-files-found: warn
 
   game:
     name: Game module
-    runs-on: windows-2025
+    runs-on: windows-2022
+    timeout-minutes: 300
     steps:
       - uses: actions/Checkout@v7
-      - name: Configure-time dependencies
-        uses: actions/cache/restore@v6
-        with:
-          path: |
-            build/game/archive-deps
-          key: game-archive-deps-${{ hashFiles('cmake/**', 'third_party/archive/**') }}
-      - name: Build
-        # Both modules (smg_game with the mods' rows, smg_game_plain without), for x86-64-v3 and x86-64-v2\.
-        run: .\native\build.ps1 -Petari native\petari -Build build\game -Target "smg_game smg_game_plain"
+      - name: LLVM
+        # The row generator needs libclang 21 or later (tools/lumacore/instrument.py), the runner's may be older.
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o llvm.tar.xz \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/clang+llvm-$LLVM_VERSION-x86_64-pc-windows-msvc.tar.xz"
+          mkdir llvm
+          tar -xJf llvm.tar.xz -C llvm --strip-components=1
+          rm llvm.tar.xz
+          llvm/bin/clang --version
+      - name: Build the game module
+        shell: pwsh
+        run: |
+          $build = Join-Path $env:RUNNER_TEMP 'game'
+          $llvm = Join-Path $env:RUNNER_TEMP 'llvm\bin'
+          # The players' build: ThinLTO with the profile in native/pgo. Both modules, the self-description and the
+          # services list, for both CPU levels.
+          foreach ($target in 'smg_game', 'smg_game_plain', 'luma_self_description', 'luma_services_file') {
+            & .\native\build.ps1 -Petari native\petari -Build $build -Pgo -Llvm $llvm -Target $target
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $out = Join-Path $env:RUNNER_TEMP 'out'
+          $names = Join-Path $out 'names'
+          New-Item -ItemType Directory -Force (Join-Path $out 'bin\x86-64-v2'), (Join-Path $names 'luma_types') | Out-Null
+          Copy-Item (Join-Path $build 'smg_game.dll'), (Join-Path $build 'smg_game_plain.dll') (Join-Path $out 'bin')
+          Copy-Item (Join-Path $build 'x86-64-v2\smg_game.dll'), (Join-Path $build 'x86-64-v2\smg_game_plain.dll') (Join-Path $out 'bin\x86-64-v2')
+          # The game build folder's self-description, as build-native-setup.ps1 -Names and LumaLink's --names read it.
+          Copy-Item -Recurse -LiteralPath (Join-Path $build 'luma') -Destination (Join-Path $names 'luma')
+          foreach ($file in 'luma_types.json', 'luma_functions.json', 'luma_numbers.json', 'luma_services.json') {
+            Copy-Item (Join-Path $build "luma_types\$file") (Join-Path $names 'luma_types')
+          }
+          Copy-Item (Join-Path $build 'smg_game.luma-placement.json'), (Join-Path $build 'smg_game.luma-self.json') $names
+          # names/ holds some 15,000 small files: as one tar, the artifact downloads as one file.
+          Push-Location $out
+          tar -cf names.tar names
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          Remove-Item -Recurse -Force $names
       - uses: actions/upload-artifact@v7
         with:
           name: release-game
-          path: |
-            build/game/smg_game.dll
-            build/game/smg_game_plain.dll
-            build/game/x86-64-v2/smg_game.dll
-            build/game/x86-64-v2/smg_game_plain.dll
-          retention-days: 1
-          if-no-files-found: error
-      # The game's self-description LumaLink reads (build-native-setup.ps1 -Names): its rows, types and placement facts.
-      - uses: actions/upload-artifact@v7
-        with:
-          name: release-names
-          path: |
-            build/game/luma/
-            build/game/luma_types/*.json
-            build/game/smg_game.luma-placement.json
-            build/game/smg_game.luma-self.json
+          path: ${{ runner.temp }}/out
           retention-days: 1
           if-no-files-found: error
 
@@ -186,16 +193,34 @@ jobs:
       # Outside the tree, so that build-native-setup.ps1 records a clean commit.
       - uses: actions/download-artifact@v8
         with:
-          name: release-host
-          path: ${{ runner.temp }}/bin
+          name: release-host-avx2
+          path: ${{ runner.temp }}/avx2
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-host-x86-64-v2
+          path: ${{ runner.temp }}/v2
       - uses: actions/download-artifact@v8
         with:
           name: release-game
-          path: ${{ runner.temp }}/bin
-      - uses: actions/download-artifact@v8
-        with:
-          name: release-names
-          path: ${{ runner.temp }}/names
+          path: ${{ runner.temp }}/game
+      - name: Bin folder
+        # The AVX2 programs with D3D12\ and glslang\, the x86-64-v2 programs beside them, the game modules; the
+        # game's self-description as names\; LumaKit (installer/lumakit) as the mod that ships with the game.
+        shell: pwsh
+        run: |
+          $temp = $env:RUNNER_TEMP
+          Push-Location (Join-Path $temp 'game')
+          tar -xf names.tar
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          $bin = Join-Path $temp 'bin'
+          New-Item -ItemType Directory -Force $bin | Out-Null
+          Copy-Item -Recurse -Path (Join-Path $temp 'avx2\*') -Destination $bin -Exclude 'symbols'
+          Copy-Item (Join-Path $temp 'v2\*-x86-64-v2.exe') $bin
+          Copy-Item -Recurse -Path (Join-Path $temp 'game\bin\*') -Destination $bin -Force
+          $shipped = New-Item -ItemType Directory -Force (Join-Path $temp 'shipped')
+          Copy-Item installer\lumakit\lumakit.luma $shipped
+          Get-ChildItem -Recurse -File $bin | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.FullName.Substring($bin.Length + 1) }
       - name: DirectX Shader Compiler
         run: |
           $zip = Join-Path $env:RUNNER_TEMP 'dxc.zip'
@@ -225,7 +250,7 @@ jobs:
       - name: Setup
         run: >-
           .\installer\build-native-setup.ps1 -Version $env:VERSION -Bin (Join-Path $env:RUNNER_TEMP 'bin')
-          -Names (Join-Path $env:RUNNER_TEMP 'names') -Dxc (Join-Path $env:RUNNER_TEMP 'dxc')
+          -Names (Join-Path $env:RUNNER_TEMP 'game\names') -ShippedMods (Join-Path $env:RUNNER_TEMP 'shipped') -Dxc (Join-Path $env:RUNNER_TEMP 'dxc')
           -OutputDirectory (Join-Path $env:RUNNER_TEMP 'dist')
           -SetupName $env:SETUP -Repository $env:GITHUB_REPOSITORY
       - name: Release check

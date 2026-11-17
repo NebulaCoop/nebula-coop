@@ -6,8 +6,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
-#include "galaxy/render/program_table.h"
-
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -20,14 +18,6 @@
 #include <thread>
 #include <vector>
 
-namespace {
-
-// The layout core/program_table.cpp reads (programs_msl writes it with the traced forms left empty).
-constexpr char kMagic[] = "NBPROG03";
-constexpr std::size_t kRow = 16u + 8u * galaxy::render::kProgramStored;
-
-}  // namespace
-
 int main(int argc, char** argv) {
     @autoreleasepool {
         if (argc < 2) {
@@ -37,7 +27,11 @@ int main(int argc, char** argv) {
         const unsigned shown = argc > 2 ? static_cast<unsigned>(std::atoi(argv[2])) : 5u;
         std::ifstream input(argv[1], std::ios::binary);
         const std::vector<char> in((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-        if (in.size() < 64u || std::memcmp(in.data(), kMagic, 8u) != 0) {
+        // core/program_table.h: a 64-byte header, then a row per program of 16 bytes and kProgramStored (16) variants
+        // of offset and size; a pixel program's bound-table forms are variants 5 to 9, its other forms read arrays.
+        constexpr std::size_t kStored = 16u, kRow = 16u + 8u * kStored;
+        constexpr unsigned kBoundOffset = 5u, kTracedOffset = 10u;
+        if (in.size() < 64u || std::memcmp(in.data(), "NBPROG03", 8u) != 0) {
             std::fprintf(stderr, "%s is not a programs file\n", argv[1]);
             return 1;
         }
@@ -51,15 +45,14 @@ int main(int argc, char** argv) {
         std::vector<Stage> stages;
         std::set<std::uint32_t> seen;
         for (std::size_t row = 0; row < std::size_t{vertex_rows} + pixel_rows; ++row) {
-            for (unsigned variant = 0; variant < galaxy::render::kProgramStored; ++variant) {
+            for (unsigned variant = 0; variant < kStored; ++variant) {
                 std::uint32_t offset = 0u, size = 0u;
                 std::memcpy(&offset, in.data() + 64u + row * kRow + 16u + variant * 8u, 4u);
                 std::memcpy(&size, in.data() + 64u + row * kRow + 20u + variant * 8u, 4u);
-                // A pixel program's array forms: its variants and (were any kept) its traced forms; between them the
-                // bound-table forms.
-                const bool arrays = variant < galaxy::render::kProgramBoundOffset || variant >= galaxy::render::kProgramPrepass;
                 if (size != 0u && seen.insert(offset).second) {
-                    stages.push_back({offset, row >= vertex_rows, row >= vertex_rows && arrays});
+                    const bool pixel = row >= vertex_rows;
+                    const bool bound = variant >= kBoundOffset && variant < kTracedOffset;
+                    stages.push_back({offset, pixel, pixel && !bound});
                 }
             }
         }

@@ -13,8 +13,7 @@ if(nebula_apple_builds_tools)
         "${nebula_apple_utility_spirv_dir}/utility_spirv_data.h")
     target_include_directories(nebula_apple_utility_msl PRIVATE "${nebula_apple_utility_spirv_dir}")
     target_link_libraries(nebula_apple_utility_msl PRIVATE nebula_msl)
-    # utility_spirv_data.h is made by the SDL build's folder (platform/sdl): only its own target there builds it.
-    add_dependencies(nebula_apple_utility_msl galaxy_utility_spirv_data)
+    add_dependencies(nebula_apple_utility_msl galaxy_utility_spirv_header)  # made in platform/sdl
     set_target_properties(nebula_apple_utility_msl PROPERTIES
         OUTPUT_NAME utility_msl RUNTIME_OUTPUT_DIRECTORY "${NEBULA_HOST_TOOLS}")
     set(nebula_apple_utility_msl_tool "$<TARGET_FILE:nebula_apple_utility_msl>")
@@ -61,6 +60,17 @@ target_include_directories(galaxy_render_mtl PUBLIC "${nebula_root}/runtime/src"
 target_include_directories(galaxy_render_mtl PRIVATE "${nebula_root}/third_party/smaa" "${nebula_root}/native/include"
     "${nebula_apple_utility_msl_dir}")
 target_link_libraries(galaxy_render_mtl PRIVATE nebula_msl)
+# As platform/sdl gives galaxy_render_vk: TLS and gzip for the net services (luma_net.cpp), the save import's AES,
+# hashes and inflate (save_transfer.cpp), and the game's GameData.bin check (a source property is its folder's, so
+# platform/sdl's does not reach this folder's target).
+target_link_libraries(galaxy_render_mtl PRIVATE nebula_bssl_ssl nebula_zinflate)
+set_property(SOURCE "${nebula_root}/runtime/src/save_transfer.cpp" APPEND PROPERTY INCLUDE_DIRECTORIES
+    "${nebula_root}/native/petari/include")
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    # The settings' UPDATES rows (native_settings.cpp), as galaxy_render_vk has them on macOS: the service is
+    # nebula_native's (CMakeLists.txt); iOS updates through its store.
+    target_compile_definitions(galaxy_render_mtl PRIVATE NEBULA_UPDATE_CHECK=1)
+endif()
 target_link_libraries(galaxy_render_mtl PUBLIC "-framework Metal" "-framework QuartzCore" "-framework Foundation"
     "-framework CoreGraphics" "-framework IOSurface")
 # MetalFX is asked for at run time (macOS 13, iOS 16): the program starts without it.
@@ -72,18 +82,13 @@ set_source_files_properties("${nebula_root}/runtime/src/render/core/program_tabl
     COMPILE_DEFINITIONS "GALAXY_PROGRAM_BLOB=\"${nebula_apple_programs_blob}\"" OBJECT_DEPENDS "${nebula_apple_programs_blob}")
 add_dependencies(galaxy_render_mtl nebula_apple_programs_msl_file)
 
-# The game API's and online play's fingerprints (cmake/nebula_fingerprint.cmake) for both hosts' host_main.cpp, as
-# platform/sdl's own host has them.
-include("${nebula_root}/cmake/nebula_fingerprint.cmake")
-nebula_fingerprint("${nebula_root}" "${nebula_root}/native/petari" "${CMAKE_BINARY_DIR}/generated")
-
 # The game on the Metal renderer with the SDL host: a development build until Apple's own host (host/) carries it.
 get_target_property(nebula_apple_main_sources main SOURCES)
 add_executable(nebula_metal ${nebula_apple_main_sources})
 set_target_properties(nebula_metal PROPERTIES OUTPUT_NAME nebula-metal
     BUILD_RPATH "@executable_path;@executable_path/../Frameworks")
 target_include_directories(nebula_metal PRIVATE "${nebula_root}/native/include" "${nebula_root}/runtime/include"
-    "${nebula_root}/platform/sdl" "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/generated")
+    "${nebula_root}/platform/sdl" "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(nebula_metal PRIVATE NEBULA_HOST_RENDERER=1 NEBULA_HOST_SDL=1 NEBULA_HOST_APPLE=1)
 set_source_files_properties(${nebula_apple_host_sources} PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 target_link_libraries(nebula_metal PRIVATE galaxy_render_mtl SDL3::SDL3
@@ -102,7 +107,7 @@ add_executable(nebula_native
     "${CMAKE_CURRENT_SOURCE_DIR}/setup_apple.mm")
 set_target_properties(nebula_native PROPERTIES OUTPUT_NAME Nebula)
 target_include_directories(nebula_native PRIVATE "${nebula_root}/native/include" "${nebula_root}/runtime/include"
-    "${nebula_root}/platform/sdl" "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/generated")
+    "${nebula_root}/platform/sdl" "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(nebula_native PRIVATE NEBULA_HOST_RENDERER=1 NEBULA_HOST_SDL=1 NEBULA_HOST_APPLE=1
     NEBULA_HOST_NATIVE_APPLE=1)
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/host_window_apple.mm" "${CMAKE_CURRENT_SOURCE_DIR}/luma_system_apple.mm" "${CMAKE_CURRENT_SOURCE_DIR}/audio_device_apple.mm"

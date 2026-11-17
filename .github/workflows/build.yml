@@ -34,9 +34,9 @@ env:
 jobs:
   # Sorts the changed files into what they affect:
   #   game:      the host, the game module, the disc import tool and the Windows, Linux and Android test builds;
-  #   installer: the launcher, Nebula Settings and Setup (installer/), and their tests.
+  #   installer: Nebula Setup and the install root's Nebula.exe (installer/native), compiled.
   # Documentation, the other workflows, NebulaNet and tools/ affect neither. A file both use (the icon the host and
-  # the launcher are both built with, the save format version the launcher reads) and this workflow itself run both.
+  # Setup are both built with, the store version Setup writes) and this workflow itself run both.
   # Run workflow builds everything.
   changes:
     name: Changes
@@ -473,22 +473,38 @@ jobs:
     needs: changes
     if: needs.changes.outputs.installer == 'true'
     runs-on: windows-2025
-    # Windows PowerShell, as the scripts are run by hand: they compile with the in-box .NET Framework csc.exe and load
-    # its System.Drawing.
-    defaults:
-      run:
-        shell: powershell
     steps:
       - uses: actions/Checkout@v7
-      # The launcher's first start, settings form, launch arguments and folder moves, Setup's cases, and nebula.ico in
-      # every executable: against a stub game, with its own %LOCALAPPDATA%.
-      - name: Launcher and Setup
-        run: .\installer\tests\run-launcher-tests.ps1
-      - name: Update channels
-        run: .\installer\tests\run-beta-updater-tests.ps1
-      # The update path end to end on a local release server, with a signing key made for the run.
-      - name: Update flow
-        run: .\installer\tests\run-update-flow-tests.ps1
+      # Setup and the install root's Nebula.exe (installer/native) compiled as build-native-setup.ps1 compiles them, with
+      # warnings as errors, against a stand-in build_info.h: the release build needs a whole game to pack, this does not.
+      - name: Native Setup compiles
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\tools\enter_msvc_environment.ps1
+          $gen = Join-Path $env:RUNNER_TEMP 'setup-gen'
+          $obj = Join-Path $env:RUNNER_TEMP 'setup-obj'
+          New-Item -ItemType Directory -Force $gen, $obj | Out-Null
+          $key = (Get-Content -Raw installer\release-public-key.xml).Trim().Replace('\', '\\').Replace('"', '\"')
+          $store = (Get-Content -Raw runtime\include\galaxy\store_version.inc).Trim()
+          Set-Content -Encoding utf8 (Join-Path $gen 'build_info.h') @"
+          #pragma once
+          namespace nebula::build {
+          inline constexpr const wchar_t kVersion[] = L"0.0.0-ci";
+          inline constexpr const wchar_t kFileVersion[] = L"0.0.0.0";
+          inline constexpr const wchar_t kCommit[] = L"$env:GITHUB_SHA";
+          inline constexpr const wchar_t kRepository[] = L"$env:GITHUB_REPOSITORY";
+          inline constexpr const wchar_t kReleasePublicKeyXml[] = L"$key";
+          inline constexpr unsigned kStoreVersion = $store;
+          }
+          "@
+          $cxx = @('/nologo', '/c', '/std:c++20', '/O2', '/MT', '/DNDEBUG', '/EHsc', '/W4', '/WX', '/permissive-', '/utf-8', '/Zc:__cplusplus',
+              '/GS', '/guard:cf', '/DUNICODE', '/D_UNICODE', '/D_WIN32_WINNT=0x0A00', '/DWINVER=0x0A00', "/I$gen", '/Iinstaller\native',
+              '/Ithird_party\miniz')
+          foreach ($name in 'common', 'archive', 'ui', 'text', 'setup', 'setup_engine', 'start') {
+              & cl.exe @cxx "/Fo$(Join-Path $obj "$name.obj")" "installer\native\$name.cpp"
+              if ($LASTEXITCODE -ne 0) { throw "$name.cpp did not compile" }
+          }
 
   # The one check to require before merging: it fails when the Windows build (host, game module, disc import tool and
   # the test build put together from them) or the installer tests failed or were cancelled, and passes when they passed

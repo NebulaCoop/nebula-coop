@@ -198,6 +198,10 @@ namespace GameSequenceFunction {
         ::getSaveDataHandleSequence()->startPreLoad();
     }
 
+    void startReloadSaveDataSequence() {
+        ::getSaveDataHandleSequence()->startReload();
+    }
+
 
     void startGameDataLoadSequence(int userFileIndex, bool isPlayerMario) {
         ::getSaveDataHandleSequence()->startLoad(userFileIndex, isPlayerMario);
