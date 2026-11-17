@@ -6,3 +6,7 @@
 	path = lumalink
 	url = https://github.com/NebulaCoop/lumalink-coop
 	branch = main
+[submodule "web"]
+	path = web
+	url = https://github.com/NebulaCoop/website.git
+	branch = main

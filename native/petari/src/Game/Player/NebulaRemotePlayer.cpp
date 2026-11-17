@@ -18,6 +18,7 @@
 #include "Game/LiveActor/ModelManager.hpp"
 #include "Game/LiveActor/HitSensor.hpp"
 #include "Game/Player/PlayerModel.hpp"
+#include "Game/Player/NebulaPalette.hpp"
 #include "Game/Player/Mario.hpp"
 #include "Game/Player/MarioActor.hpp"
 #include "Game/Player/MarioAnimator.hpp"
@@ -203,6 +204,7 @@ NebulaRemotePlayer::NebulaRemotePlayer(s32 character)
     memset(mTrackName, 0, sizeof(mTrackName));
     memset(mTrackBck, 0, sizeof(mTrackBck));
     mCharacter = character;
+    mPaletteSkin = nullptr;
 }
 
 void NebulaRemotePlayer::forgetAll() {
@@ -414,6 +416,10 @@ void NebulaRemotePlayer::init(const TableIter& rIter) {
     initModelManagerWithAnm(NebulaCharacters::modelName(mCharacter, mIsLuigi ? "Luigi" : "Mario"), nullptr, true);
     MR::initMaterialFog(this, true);
     MR::prepareMaterials(this);
+    // Its player's colours (NebulaPalette): its model's own until the session tells them.
+    mPaletteSkin = new NebulaPaletteSkin();
+    mPaletteSkin->addModel(MR::getModelData(this));
+    static_cast< PlayerModel* >(MR::getModel(this))->setPaletteSkin(mPaletteSkin);
 
     // Lit as the local Mario is (MR::initLightCtrlForPlayer), by the player light of the light area it stands in: its
     // own, as it may stand in another area than he does. No draw buffer of its own to sort it in.
@@ -484,6 +490,8 @@ void NebulaRemotePlayer::show(const NebulaCoopRemotePlayer& rRemote) {
     }
     nebula_snprintf(mName, sizeof(mName), "%s", rRemote.name);
     mState = rRemote.player;
+    const nebula_palette::Palette& rOwn = NebulaCharacters::palette(mCharacter);
+    mPaletteSkin->setColors(rOwn, NebulaPalette::ofRemote(mState, mCharacter));
     mState.group[sizeof(mState.group) - 1] = '\0';
     mState.animation[sizeof(mState.animation) - 1] = '\0';
     mPosition.set(mState.position[0], mState.position[1], mState.position[2]);

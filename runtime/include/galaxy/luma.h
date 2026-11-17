@@ -169,6 +169,9 @@ struct Character {
     std::string name;     // as the Options page shows it; empty: the id in capitals
     std::string like = "mario";
     std::string archive;  // empty: the id with a capital first letter
+    // Its own colours ("palette": {"cap": "e8b000", ...}), 0xRRGGBB by part in nebula_palette.hpp's order; -1 for a
+    // part it doesn't say (its base's). Empty: all its base's.
+    std::vector<int> palette;
 };
 
 // A new galaxy, and the hungry Luma that opens it.

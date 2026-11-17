@@ -34,6 +34,7 @@ namespace {
         rCharacter.mLuigi = luigi;
         rCharacter.mTable = getMarioConstGameTable(luigi ? 1 : 0);
         rCharacter.mMod = nullptr;
+        rCharacter.mPalette = luigi ? nebula_palette::cLuigi : nebula_palette::cMario;
         sCount++;
     }
 
@@ -114,7 +115,8 @@ namespace NebulaCharacters {
         return -1;
     }
 
-    s32 add(const NebulaPlugin* pMod, const char* pId, const char* pName, const char* pLike, const char* pArchive) {
+    s32 add(const NebulaPlugin* pMod, const char* pId, const char* pName, const char* pLike, const char* pArchive,
+            const nebula_palette::Palette* pPalette) {
         initBuiltIns();
         if (!isGoodId(pId) || find(pId) >= 0 || sCount >= cMax) {
             return -1;
@@ -160,6 +162,7 @@ namespace NebulaCharacters {
         rCharacter.mLuigi = luigi;
         rCharacter.mTable = newMarioConstTable(luigi);
         rCharacter.mMod = pMod;
+        rCharacter.mPalette = pPalette != nullptr ? *pPalette : sCharacters[luigi ? cLuigi : cMario].mPalette;
         const s32 index = sCount++;
         nebula_log("characters: %s added, like %s, model %s\n", rCharacter.mId, luigi ? "luigi" : "mario", rCharacter.mArchive);
         return index;
@@ -178,6 +181,11 @@ namespace NebulaCharacters {
     const char* id(s32 index) {
         const Character* pCharacter = at(index);
         return pCharacter != nullptr ? pCharacter->mId : "mario";
+    }
+
+    const nebula_palette::Palette& palette(s32 index) {
+        const Character* pCharacter = at(index);
+        return pCharacter != nullptr ? pCharacter->mPalette : sCharacters[cMario].mPalette;
     }
 
     const char* modelName(s32 index, const char* pGameName) {

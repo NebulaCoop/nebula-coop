@@ -1,4 +1,5 @@
 #include "Game/Player/PlayerModel.hpp"
+#include "Game/Player/NebulaPalette.hpp"
 #include "Game/Render/FrameList.hpp"
 #include "Game/Render/RenderTexture.hpp"
 #include "Game/Util/MathUtil.hpp"
@@ -132,8 +133,20 @@ void PlayerModel::drawIn(Material* pMaterial, u32 index) {
         mImages[index] = mNextImages[index];
         mNextImages[index] = nullptr;
     }
-    if (mImages[index] != nullptr) {
-        draw.swapImage(0, RenderTexture::idOf(mImages[index]));
+    // The image map 0 draws: a swap's (the eyelids' blink), else the material's texture; the player's colours' copy of it.
+    const void* pImage = mImages[index];
+    if (mSkin != nullptr) {
+        const void* pSource = pImage;
+        if (pSource == nullptr) {
+            const u32 texture = draw.getMaterial()->getTextureIndex(0);
+            pSource = texture < mModelData->getTextureCount() ? mModelData->getTexture(texture)->image() : nullptr;
+        }
+        if (const void* pCopy = mSkin->find(pSource)) {
+            pImage = pCopy;
+        }
+    }
+    if (pImage != nullptr) {
+        draw.swapImage(0, RenderTexture::idOf(pImage));
     }
     if (override >= 0) {
         const OverrideColor& rColor = kOverrideColors[override];
@@ -304,6 +317,7 @@ PlayerModel::PlayerModel(ModelData* pData, u32 flags, u32 unused) : Model(pData,
     mTint = nullptr;
     mNextTint = nullptr;
     mDrawHook = nullptr;
+    mSkin = nullptr;
     mExtraPoses = nullptr;
 
     const u32 count = mModelData->getMaterialCount();

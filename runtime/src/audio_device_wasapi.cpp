@@ -35,6 +35,10 @@ constexpr REFERENCE_TIME kBufferDuration = 400000;  // 40 ms
 // period at a time, up to this many; ten quiet seconds lower it a period.
 constexpr std::uint32_t kMostFillPeriods = 4u;
 constexpr LONGLONG kQuietSecondsToLower = 10;
+// A stream the engine drains slower than real time while it never ran dry: under this share of a second's frames, this many
+// seconds in a row, is a stalled stream (issue #145).
+constexpr double kSlowDrain = 0.75;
+constexpr int kSlowSeconds = 2;
 
 void set_mmcss() {
     using SetFn = HANDLE(WINAPI*)(LPCWSTR, LPDWORD);
@@ -172,6 +176,9 @@ private:
             return false;
         }
         client_ = client;
+        low_latency_ = true;
+        least_frames_ = least;
+        standard_frames_ = standard;
         return true;
     }
 
@@ -188,7 +195,8 @@ private:
         format.Samples.wValidBitsPerSample = 32;
         format.dwChannelMask = mask;
         format.SubFormat = GUID{0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};  // IEEE float
-        if (initialize_low_latency(device, &format.Format)) {
+        low_latency_ = false;
+        if (!plain_only_ && initialize_low_latency(device, &format.Format)) {
             set_speakers(mask);
             return true;
         }
@@ -253,7 +261,12 @@ private:
         fill_frames_ = std::min(period_frames_, buffer_frames_);
         rate_.store(rate, std::memory_order_relaxed);
         std::cout << "[audio] output " << rate << " Hz, " << speaker_count_ << " channels, buffer " << buffer_frames_
-                  << ", fill " << fill_frames_ << ", period " << period_frames << " frames\n";
+                  << ", fill " << fill_frames_ << ", period " << period_frames << " frames, ";
+        if (low_latency_) {
+            std::cout << "low-latency stream (least " << least_frames_ << ", standard " << standard_frames_ << " frames)\n";
+        } else {
+            std::cout << "plain stream\n";
+        }
         return true;
     }
 
@@ -294,6 +307,17 @@ private:
         LARGE_INTEGER last_wake{};
         QueryPerformanceCounter(&last_wake);
         LARGE_INTEGER last_trouble = last_wake;
+        // What the engine has taken (given less what it still holds), against the clock, a second at a time. Players heard a
+        // steady buzz that came and went (issue #145): the logs showed this thread waking 100 times a second as it should, with
+        // the buffer full, while the engine took a fifth of the sound, the same in two games at once. A short-period
+        // (low-latency) stream on an engine running a longer period would do this: each pass taking one short period of ours.
+        // A stalled low-latency stream is reopened as a plain one for the rest of the run. Seconds it ran dry don't count:
+        // that is this thread's lateness, not the engine's.
+        std::uint64_t written = fill_frames_;
+        LARGE_INTEGER drain_start = last_wake;
+        std::uint64_t drain_taken = 0u;
+        UINT32 drain_least_padding = fill_frames_;
+        int slow_seconds = 0;
         for (;;) {
             const DWORD woke = WaitForMultipleObjects(2, waits, FALSE, 500);
             if (woke == WAIT_OBJECT_0 + 1u) {
@@ -314,6 +338,26 @@ private:
                 last_trouble = wake;
             }
             last_wake = wake;
+            const std::uint64_t taken = written - std::min<std::uint64_t>(padding, written);
+            drain_least_padding = std::min(drain_least_padding, padding);
+            if (wake.QuadPart - drain_start.QuadPart >= frequency.QuadPart) {
+                const double expected = static_cast<double>(wake.QuadPart - drain_start.QuadPart) *
+                                        rate_.load(std::memory_order_relaxed) / static_cast<double>(frequency.QuadPart);
+                const double share = static_cast<double>(taken - drain_taken) / expected;
+                slow_seconds = share < kSlowDrain && drain_least_padding > 0u ? slow_seconds + 1 : 0;
+                if (slow_seconds == kSlowSeconds) {
+                    std::cout << "[audio] the engine took " << static_cast<int>(share * 100.0) << "% of a second's sound, "
+                              << kSlowSeconds << " s running, padding " << padding << " of " << buffer_frames_ << ": "
+                              << (low_latency_ ? "reopened as a plain stream" : "already a plain stream") << std::endl;
+                    if (low_latency_) {
+                        plain_only_ = true;
+                        return;
+                    }
+                }
+                drain_start = wake;
+                drain_taken = taken;
+                drain_least_padding = padding;
+            }
             if (padding >= fill_frames_) {
                 continue;
             }
@@ -327,12 +371,14 @@ private:
                 if (FAILED(renderer_->ReleaseBuffer(frames, AUDCLNT_BUFFERFLAGS_SILENT))) {
                     return;
                 }
+                written += frames;
                 continue;
             }
             render_(reinterpret_cast<float*>(data), frames, rate_.load(std::memory_order_relaxed));
             if (FAILED(renderer_->ReleaseBuffer(frames, 0))) {
                 return;
             }
+            written += frames;
             LARGE_INTEGER rendered{};
             QueryPerformanceCounter(&rendered);
             if (rendered.QuadPart - wake.QuadPart > period_ticks * 3 / 4) {
@@ -404,6 +450,11 @@ private:
     UINT32 buffer_frames_{};
     std::uint32_t fill_frames_{};
     std::uint32_t period_frames_{1u};
+    // The stream opened: low-latency (IAudioClient3, its least period) or plain; plain only once a low-latency one stalled.
+    bool low_latency_{};
+    bool plain_only_{};
+    UINT32 least_frames_{};
+    UINT32 standard_frames_{};
 };
 
 }  // namespace

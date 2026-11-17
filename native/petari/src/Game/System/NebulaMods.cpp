@@ -1,6 +1,7 @@
 #include "Game/System/NebulaMods.hpp"
 #include "Game/Player/NebulaCharacters.hpp"
 #include "Game/Player/NebulaCharacter.hpp"
+#include "Game/Player/NebulaPalette.hpp"
 #include "Game/System/NebulaCoopMods.hpp"
 #include "Game/System/LumaCore.hpp"
 #include "Game/System/NebulaModCalls.hpp"
@@ -496,7 +497,16 @@ namespace {
         if (pCharacter == nullptr || pCharacter->size < offsetof(NebulaCharacterClass, archive) + sizeof(pCharacter->archive)) {
             return -1;
         }
-        return NebulaCharacters::add(pMod, pCharacter->id, pCharacter->name, pCharacter->like, pCharacter->archive);
+        // Its own colours, when the class is new enough to say them.
+        nebula_palette::Palette palette;
+        const nebula_palette::Palette* pPalette = nullptr;
+        if (pCharacter->size >= offsetof(NebulaCharacterClass, palette) + sizeof(pCharacter->palette) && pCharacter->palette != nullptr) {
+            for (u32 part = 0; part < nebula_palette::PartCount; part++) {
+                nebula_palette::setColor(palette, part, static_cast< u32 >(pCharacter->palette[part]));
+            }
+            pPalette = &palette;
+        }
+        return NebulaCharacters::add(pMod, pCharacter->id, pCharacter->name, pCharacter->like, pCharacter->archive, pPalette);
     }
 
     int32_t apiCharacterCount() {
@@ -532,6 +542,29 @@ namespace {
         }
         const s32 index = NebulaCharacters::find(pId);
         return index >= 0 && NebulaCharacter::setOverride(index) ? 1 : 0;
+    }
+
+    // Colours (NebulaPalette).
+    int32_t apiCharacterPaletteColor(int32_t index, int32_t part) {
+        if (NebulaCharacters::at(index) == nullptr || part < 0 || part >= static_cast< int32_t >(nebula_palette::PartCount)) {
+            return -1;
+        }
+        return static_cast< int32_t >(nebula_palette::color(NebulaCharacters::palette(index), static_cast< u32 >(part)));
+    }
+
+    int32_t apiPlayerPaletteColor(int32_t part) {
+        if (part < 0 || part >= static_cast< int32_t >(nebula_palette::PartCount)) {
+            return -1;
+        }
+        return static_cast< int32_t >(nebula_palette::color(NebulaPalette::local(), static_cast< u32 >(part)));
+    }
+
+    int32_t apiSetPlayerPaletteColor(int32_t part, int32_t color) {
+        return part >= 0 && NebulaPalette::setOverride(static_cast< u32 >(part), color) ? 1 : 0;
+    }
+
+    void apiResetPlayerPalette() {
+        NebulaPalette::resetOverride();
     }
 
     struct ObjectClass {
@@ -610,6 +643,11 @@ namespace {
         apiPlayerCharacter,
         apiSetPlayerCharacterId,
         NebulaCoopMods::characterId,
+        apiCharacterPaletteColor,
+        apiPlayerPaletteColor,
+        apiSetPlayerPaletteColor,
+        apiResetPlayerPalette,
+        NebulaCoopMods::paletteColor,
     };
 }  // namespace
 

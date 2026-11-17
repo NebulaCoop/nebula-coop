@@ -470,6 +470,18 @@ std::size_t start_plugins(const std::vector<PluginFile>& plugins, const ModRows&
             character.name = row.name.empty() ? nullptr : row.name.c_str();
             character.like = row.like.empty() ? nullptr : row.like.c_str();
             character.archive = row.archive.empty() ? nullptr : row.archive.c_str();
+            // Its own colours: the ones luma.json gives, its base's for the rest.
+            std::int32_t palette[NEBULA_PALETTE_PARTS];
+            if (!row.palette.empty()) {
+                const int base = g_api.character_find != nullptr ? g_api.character_find(row.like.empty() ? "mario" : row.like.c_str()) : 0;
+                for (int part = 0; part < NEBULA_PALETTE_PARTS; ++part) {
+                    const int given = static_cast<std::size_t>(part) < row.palette.size() ? row.palette[static_cast<std::size_t>(part)] : -1;
+                    palette[part] = given >= 0 ? given
+                                    : NEBULA_MOD_API_HAS(&g_api, character_palette_color) ? g_api.character_palette_color(base, part)
+                                                                                         : 0;
+                }
+                character.palette = palette;
+            }
             if (g_api.add_character == nullptr || g_api.add_character(nullptr, &character) < 0) {
                 say(row.mod_id + ": the character " + row.id + " can't be added (its id is taken, or there are too many)");
             }

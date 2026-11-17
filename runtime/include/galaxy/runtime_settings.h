@@ -1,7 +1,9 @@
 // Player settings in runtime_settings.ini: input mode, audio gains, text speed, language, Discord status, online co-op.
 #pragma once
 
+#include <array>
 #include <filesystem>
+#include <optional>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -98,6 +100,10 @@ struct RuntimeCoopSettings {
     // A mod's character played on `character` (its base), by id ("wario": the game's NebulaCharacters); empty for
     // `character` itself. Kept while the mod is off, so the page shows it again when the mod is back.
     std::string character_id;
+    // The player's colours (Options' PLAYER page, sm64coopdx's palette): eight "rrggbb" joined by commas, the parts in
+    // nebula_palette.hpp's order (pants, shirt, gloves, shoes, hair, skin, cap, emblem); empty for their character's
+    // own (format_coop_palette, parse_coop_palette).
+    std::string palette;
     std::string password;       // a host's: joining needs it; a joiner's: sent to the host. Empty: none
     std::string join_address;   // the Join page's last room code or address, "host[:port]" (empty: none yet)
     // The Host page's NETWORK: NebulaNet, where friends join by the room's code with no port forwarded
@@ -149,6 +155,12 @@ struct RuntimeCoopPopups {
 [[nodiscard]] std::string clean_character_id(std::string_view id);
 // The character's id a player plays: a mod's, else "mario" or "luigi".
 [[nodiscard]] std::string coop_character_id(const RuntimeCoopSettings& coop);
+// A player's colours (RuntimeCoopSettings::palette): 24 bytes, red, green and blue of each part in nebula_palette.hpp's
+// order.
+using CoopPalette = std::array<std::uint8_t, 24>;
+// Eight "rrggbb" (any case, '#' allowed) joined by commas; nothing for anything else.
+[[nodiscard]] std::optional<CoopPalette> parse_coop_palette(std::string_view text);
+[[nodiscard]] std::string format_coop_palette(const CoopPalette& palette);
 
 // A character the Options page's CHARACTER row offers (sm64coopdx's character list): the game's two, then the running
 // mods' (the game's NebulaCharacters, set as plugins start).
@@ -156,10 +168,28 @@ struct PlayableCharacter {
     std::string id;    // "mario", "luigi", "wario"
     std::string name;  // as the row shows it ("WARIO")
     CoopCharacter base = CoopCharacter::Mario;
+    CoopPalette palette{};  // its own colours (NebulaCharacters' palette)
 };
 // Mario and Luigi until set_playable_characters gives the game's list (which starts with them).
 [[nodiscard]] std::vector<PlayableCharacter> playable_characters();
 void set_playable_characters(std::vector<PlayableCharacter> characters);
+
+// The colours of a set the Options page's COLOURS row offers (sm64coopdx's preset palettes): every character's own,
+// by its name, then a few of the game's other looks (FIRE MARIO) and other characters' that no mod adds.
+struct PalettePreset {
+    std::string name;
+    CoopPalette palette{};
+};
+[[nodiscard]] std::vector<PalettePreset> palette_presets();
+// The colours a part's row steps through, by name ("RED").
+struct NamedColor {
+    const char* name;
+    std::uint32_t rgb;
+};
+[[nodiscard]] std::span<const NamedColor> named_colors();
+// The character's own colours a player wears when the page's COLOURS are its own: the listed character by `id`, else
+// its base's.
+[[nodiscard]] CoopPalette own_palette(const RuntimeCoopSettings& coop);
 
 // What the game does while its window is not in front (another program is; Windows): goes on, pauses through its own pause menu
 // (the pause button's path, so its timers stop), or goes on with its sound silent. A minimised window holds the game in every

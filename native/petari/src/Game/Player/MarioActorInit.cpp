@@ -245,6 +245,7 @@ void MarioActor::initMember() {
     mEyeLidReset = 0;
     mEyeLidFrame = 0;
     mSwapImages = 0;
+    mPaletteSkin = nullptr;
     mEyeLidTexBase = 0;
     mBlinkFrame = 0;
     mBlinkTimer = 0;

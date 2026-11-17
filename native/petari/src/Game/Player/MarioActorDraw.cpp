@@ -8,6 +8,7 @@
 #include "Game/Player/DrawAdaptor.hpp"
 #include "Game/Player/JetTurtleShadow.hpp"
 #include "Game/Player/PlayerModel.hpp"
+#include "Game/Player/NebulaPalette.hpp"
 #include "Game/Render/Model.hpp"
 #include "Game/Render/ModelData.hpp"
 #include "Game/Player/MarioActor.hpp"
@@ -106,6 +107,7 @@ void MarioActor::initDrawAndModel() {
     initHand();
 
     initFace();
+    initPaletteSkin();
 
     mFogRate = 0.0f;
 
@@ -401,6 +403,7 @@ void MarioActor::changeDisplayMode(u8 mode) {
 
 void MarioActor::calcViewAndEntry() {
     decideShadowMode();
+    updatePaletteSkin();
 
     PlayerModel* model = getModel();
     model->mDrawPasses &= ~PlayerModel::Pass_BehindMark;
@@ -672,6 +675,28 @@ void MarioActor::initFace() {
 
     for (u32 i = 0; i < mFacePoseCount; i++) {
         copyMaterial(MR::getModel(mFaceModel), MR::getJointIndex(this, "Face0"), i);
+    }
+}
+
+// The player's colours (NebulaPalette, sm64coopdx's palette): the textures of the body, the face (the body's) and the
+// hands that hold parts drawn as the skin's recoloured copies.
+void MarioActor::initPaletteSkin() {
+    mPaletteSkin = new NebulaPaletteSkin();
+    mPaletteSkin->addModel(MR::getModelData(this));
+    mPaletteSkin->addModel(MR::getModelData(mHandL));
+    mPaletteSkin->addModel(MR::getModelData(mHandR));
+    mModels[0]->setPaletteSkin(mPaletteSkin);
+    static_cast< PlayerModel* >(MR::getModel(mFaceModel))->setPaletteSkin(mPaletteSkin);
+    static_cast< PlayerModel* >(MR::getModel(mHandL))->setPaletteSkin(mPaletteSkin);
+    static_cast< PlayerModel* >(MR::getModel(mHandR))->setPaletteSkin(mPaletteSkin);
+    updatePaletteSkin();
+}
+
+// Each frame: the copies follow the colours the player wears now (the Options page's, a mod's), against their
+// character's own.
+void MarioActor::updatePaletteSkin() {
+    if (mPaletteSkin != nullptr) {
+        mPaletteSkin->setColors(NebulaCharacters::palette(gPlayerCharacter), NebulaPalette::local());
     }
 }
 

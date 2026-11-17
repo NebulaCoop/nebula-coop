@@ -5,6 +5,7 @@
 #include <nebula_game_api.h>
 
 class NebulaBubble;
+class NebulaPaletteSkin;
 class XanimePlayer;
 class XanimeGroupInfo;
 class Clip;
@@ -113,4 +114,6 @@ public:
     const XanimeGroupInfo* mWantedInfo;
     // The character it shows (NebulaCharacters); mIsLuigi is its base.
     s32 mCharacter;
+    // The player's colours on its model (NebulaPalette), as the session last told them.
+    NebulaPaletteSkin* mPaletteSkin;
 };

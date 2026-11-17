@@ -6,6 +6,8 @@
 #include "Game/Player/MarioModelTint.hpp"
 #include "Game/Render/Model.hpp"
 
+class NebulaPaletteSkin;
+
 // A model of the player's: more than one set of matrices at a time (the main view, its reflection, its shadows), and the
 // passes its draws go through instead of a draw buffer.
 class PlayerModel : public Model {
@@ -33,6 +35,10 @@ public:
     void setDrawHook(void (*pHook)(MaterialDraw&)) {
         mDrawHook = pHook;
     }
+    // The player's colours: its textures drawn as the skin's copies of them (null: as they are).
+    void setPaletteSkin(const NebulaPaletteSkin* pSkin) {
+        mSkin = pSkin;
+    }
 
     // The passes the next draws take, as bits; drawIn adds each one's state (sendPassState) and its flat colour.
     enum DrawPass : u32 {
@@ -59,4 +65,5 @@ public:
     u8 mBlurPoseFresh;   // the blur took a pose since its last draw
     u8 mBlurDrawMissed;  // the blur drew with no pose taken: it starts over
     void (*mDrawHook)(MaterialDraw&);
+    const NebulaPaletteSkin* mSkin;
 };

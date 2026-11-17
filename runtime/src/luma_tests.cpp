@@ -178,7 +178,7 @@ int main() {
         };
         const std::optional<Manifest> wario = parse_manifest(
             R"({"format":1,"id":"a","name":"b","game":"RMG","requires":["characters"],"layers":[{"characters":[{"id":"wario","name":"WARIO","archive":"Wario"},)"
-            R"({"id":"waluigi","like":"luigi"}],"player_constants":{"wario":{"mJumpHeight":[20,null,30]},"luigi":{"mJumpHeight":25}}}]})");
+            R"({"id":"waluigi","like":"luigi","palette":{"cap":"#5A22A0","overalls":"202020"}}],"player_constants":{"wario":{"mJumpHeight":[20,null,30]},"luigi":{"mJumpHeight":25}}}]})");
         check(wario && wario->layers.size() == 1u && wario->layers[0].characters.size() == 2u, "characters read");
         if (wario && wario->layers.size() == 1u && wario->layers[0].characters.size() == 2u) {
             const Layer& layer = wario->layers[0];
@@ -186,6 +186,10 @@ int main() {
                       layer.characters[0].name == "WARIO",
                   "a character's fields");
             check(layer.characters[1].like == "luigi" && layer.characters[1].archive.empty(), "a character like Luigi, its archive by its id");
+            check(layer.characters[0].palette.empty() && layer.characters[1].palette.size() == 8u &&
+                      layer.characters[1].palette[6] == 0x5a22a0 && layer.characters[1].palette[0] == 0x202020 &&
+                      layer.characters[1].palette[1] == -1,
+                  "a character's colours by part, the rest its base's");
             check(layer.player_constants.size() == 3u && layer.player_constants[0].character_id == "wario" &&
                       layer.player_constants[1].character_id == "wario" && layer.player_constants[1].index == 2 &&
                       layer.player_constants[2].character_id.empty() && layer.player_constants[2].character == 1,
@@ -196,6 +200,8 @@ int main() {
         for (const char* bad : {R"("characters":[{"id":"Wario"}])", R"("characters":[{"id":""}])", R"("characters":[{"id":"mario"}])",
                                 R"("characters":[{"id":"w","like":"wario"}])", R"("characters":[{"id":"w","archive":"../Wario"}])",
                                 R"("characters":[{"id":"w","archive":"Wario.arc"}])", R"("characters":{"id":"w"})",
+                                R"("characters":[{"id":"w","palette":{"hat":"ff0000"}}])",
+                                R"("characters":[{"id":"w","palette":{"cap":"red"}}])", R"("characters":[{"id":"w","palette":["ff0000"]}])",
                                 R"("player_constants":{"Wario Bros":{"mJumpHeight":1}})"}) {
             check(!parse_manifest(with_layer(bad)).has_value(), bad);
         }

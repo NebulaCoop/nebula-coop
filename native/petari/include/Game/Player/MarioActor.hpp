@@ -66,6 +66,7 @@ enum PlayerMode {
 };
 
 extern bool gIsLuigi;  // set by MarioActor::init2 from MR::isPlayerLuigi
+class NebulaPaletteSkin;
 extern s32 gPlayerCharacter;  // set with it: the character played (NebulaCharacters), Mario's or Luigi's or a mod's
 
 class MarioActor : public LiveActor {
@@ -204,6 +205,8 @@ public:
     bool isAllHidden() const;
     void calcViewMainModel();
     void initFace();
+    void initPaletteSkin();
+    void updatePaletteSkin();
     void updateFace();
     void drawIndirect() const;
     void drawIndirectModel() const;
@@ -809,6 +812,7 @@ public:
     u8 mEyeLidReset;  // the eyelid came from the eye resource: the blink restarts (updateBlink)
     u16 mEyeLidFrame;  // the eyelid texture's frame (swapTexture EyeLid_v)
     const void** mSwapImages;  // the swap textures' images by slot
+    NebulaPaletteSkin* mPaletteSkin;  // the player's colours on the body's, face's and hands' textures (NebulaPalette)
     u32 mEyeLidTexBase;  // the first eyelid texture's index
     u8 mBlinkFrame;  // frames left of the blink
     u16 mBlinkTimer;  // frames until the next blink

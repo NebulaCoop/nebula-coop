@@ -624,7 +624,8 @@ int main() {
                "coop_room_name=  Star Hunt\x02  \n"
                "coop_player_interaction=Friendly_Fire\ncoop_knockback_strength=60\ncoop_pvp_mode=revamped\ncoop_cheats=1\n"
                "coop_bubble_death=0\ncoop_character=Luigi\ncoop_character_id=Waluigi\ncoop_join_address=192.168.1.20:7778\ncoop_star_counter=1\n"
-               "coop_network=Direct\ncoop_nebulanet=http://127.0.0.1:8787\ncoop_public=1\n");
+               "coop_network=Direct\ncoop_nebulanet=http://127.0.0.1:8787\ncoop_public=1\n"
+               "coop_palette=#083084,DC0000,ffffff,6e3214,4a1400,ffaa84,00b400,c40000\n");
     galaxy::load_runtime_settings_from_file();
     const galaxy::RuntimeCoopSettings coop = galaxy::get_runtime_settings().coop;
     passed &= expect(static_cast<unsigned>(coop.port) == 9000u && coop.max_players == 8u &&
@@ -636,7 +637,8 @@ int main() {
                          coop.character == galaxy::CoopCharacter::Luigi && coop.character_id == "waluigi" &&
                          galaxy::coop_character_id(coop) == "waluigi" && coop.join_address == "192.168.1.20:7778" &&
                          coop.star_counter && !coop.nebulanet && coop.nebulanet_server == "http://127.0.0.1:8787" &&
-                         coop.public_room,
+                         coop.public_room &&
+                         coop.palette == "083084,dc0000,ffffff,6e3214,4a1400,ffaa84,00b400,c40000",
                      "co-op keys load; an out-of-range count and control characters are dropped");
     passed &= expect(galaxy::save_runtime_settings_to_file(), "co-op settings save");
     galaxy::load_runtime_settings_from_file();
@@ -648,10 +650,29 @@ int main() {
                          read_text(settings_path).find("coop_") == std::string::npos,
                      "default co-op settings write no coop_ keys");
     write_text(settings_path, "coop_player_interaction=sticky\ncoop_knockback_strength=256\ncoop_pvp_mode=new\n"
-                              "coop_network=carrier pigeon\ncoop_nebulanet=ftp://example.com\ncoop_character_id=../mario\n");
+                              "coop_network=carrier pigeon\ncoop_nebulanet=ftp://example.com\ncoop_character_id=../mario\n"
+                              "coop_palette=ff0000,00ff00\n");
     galaxy::load_runtime_settings_from_file();
     passed &= expect(galaxy::get_runtime_settings().coop == galaxy::RuntimeCoopSettings{},
-                     "unknown player interaction, knockback, PvP, network, server and character values keep the defaults");
+                     "unknown player interaction, knockback, PvP, network, server, character and colour values keep the defaults");
+
+    // The player's colours: eight "rrggbb", the presets every character's own and a few more, a character's own by id.
+    const auto colours = galaxy::parse_coop_palette("ffffff,FF0000,#00ff00,0000ff,000000,123456,abcdef,a0b0c0");
+    passed &= expect(colours && (*colours)[0] == 0xffu && (*colours)[3] == 0xffu && (*colours)[4] == 0u &&
+                         (*colours)[8] == 0x00u && (*colours)[23] == 0xc0u &&
+                         galaxy::format_coop_palette(*colours) == "ffffff,ff0000,00ff00,0000ff,000000,123456,abcdef,a0b0c0",
+                     "a palette parses and formats");
+    passed &= expect(!galaxy::parse_coop_palette("") && !galaxy::parse_coop_palette("ffffff") &&
+                         !galaxy::parse_coop_palette("ffffff,ff0000,00ff00,0000ff,000000,123456,abcdef,a0b0c0,ffffff") &&
+                         !galaxy::parse_coop_palette("fffffg,ff0000,00ff00,0000ff,000000,123456,abcdef,a0b0c0"),
+                     "a palette of too few or many colours, or a bad one, is refused");
+    const std::vector<galaxy::PalettePreset> presets = galaxy::palette_presets();
+    passed &= expect(presets.size() > 2u && presets[0].name == "MARIO" && presets[1].name == "LUIGI" &&
+                         presets[0].palette[3] == 0xdcu && presets[1].palette[4] == 0x94u,
+                     "the colour sets start with the characters' own");
+    galaxy::RuntimeCoopSettings as_luigi{};
+    as_luigi.character = galaxy::CoopCharacter::Luigi;
+    passed &= expect(galaxy::own_palette(as_luigi) == presets[1].palette, "Luigi's own colours are Luigi's");
 
     // The kept ban and moderator lists: addresses, each once.
     write_text(settings_path, "coop_bans=192.168.1.9, ::1,not an address,192.168.1.9\ncoop_moderators=fe80::2\n");

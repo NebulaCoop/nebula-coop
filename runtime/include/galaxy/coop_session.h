@@ -25,6 +25,7 @@
 #include "galaxy/net/web.h"
 #include "galaxy/runtime_settings.h"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -66,6 +67,9 @@ struct SessionPlayer {
     bool moderator = false;
     // Their character's id ("mario", "luigi", a mod's "wario": galaxy::clean_character_id), `character` its base.
     std::string character_id;
+    // Their colours (sm64coopdx's palette, NebulaCoopPlayer::palette), once their game told them (has_palette).
+    std::array<std::uint8_t, 24> palette{};
+    bool has_palette = false;
 };
 
 // How the host removes a player (remove_player), as sm64coopdx's /kick, /ban and /permban.
@@ -226,8 +230,9 @@ public:
     void set_name(const std::string& name);
     // The character this player plays now (sm64coopdx's live character change), told to everyone as it changes:
     // their player list, nametags and chat colours follow. Nothing outside a room.
-    // `id`: the character's (a mod's on `character`), empty for `character`'s own.
-    void set_character(CoopCharacter character, const std::string& id = {});
+    // `id`: the character's (a mod's on `character`), empty for `character`'s own. `palette`: the colours the player
+    // wears (24 bytes, NebulaCoopPlayer::palette), null when not known yet; they travel with the character.
+    void set_character(CoopCharacter character, const std::string& id = {}, const std::array<std::uint8_t, 24>* palette = nullptr);
     // The host: `player` got a Power Star new to the room's save (the shared world settled it): their count goes up
     // and everyone is told. Nothing for a joiner or outside a room; each room starts from 0.
     void credit_star(net::PeerId player);

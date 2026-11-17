@@ -154,7 +154,7 @@ front of it, as its own screen.
   | Main | Host, Join, Options, Quit; Nebula's version in a corner |
   | Host | Save (any number, each with its name and Power Stars; New, Rename and Erase), network (NebulaNet or Direct), NebulaNet's room name and server or Direct's port, password, NebulaNet's lobby (public or friends only), max players, Player Interaction, Knockback Strength, PvP Mode, Bubble on Death, Cheats, Mods, then Host and Back |
   | Join | Room code or address (`host[:port]`), password, then Join; the last one is remembered. Rooms: NebulaNet's public rooms, or its private ones by the password |
-  | Options | Nebula's settings pages, with PLAYER in the MODS page's old place: name, character (Mario, Luigi or a mod's, as sm64coopdx's player options pick a model: docs/modding/CHARACTERS.md). MODS is the last page |
+  | Options | Nebula's settings pages, with PLAYER in the MODS page's old place: name, character (Mario, Luigi or a mod's, as sm64coopdx's player options pick a model: docs/modding/CHARACTERS.md), colours (sm64coopdx's palettes, each player's seen by the room). MODS is the last page |
   | Quit | "Quit to desktop?" yes or no |
 
 - **Saves: any number, no characters.** The game's own format (`GameData.bin`: six user files, each with a Mario
