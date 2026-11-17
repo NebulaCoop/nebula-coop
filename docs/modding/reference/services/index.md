@@ -46,6 +46,7 @@ Each page lists a service's limits, types, events and functions as its C header 
 | `content.model` | [content.model](content-model.md) | Models on actors, materials and parts. |
 | `movie` | [movie](movie.md) | Video files. |
 | `player` | [player](player.md) | The player character. |
+| `coop` | [coop](coop.md) | NebulaCoop's online room (NebulaCoop only). |
 
 ## Further reading
 
