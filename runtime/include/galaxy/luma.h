@@ -157,6 +157,14 @@ struct Character {
     std::vector<int> palette;
 };
 
+// A chat command the mod's scripts answer ("commands"), as sm64coopdx's hook_chat_command: /name in a co-op room's
+// chat sends chat_command to the scripts with the word after it by its place in `options`.
+struct Command {
+    std::string name;         // 1-24 of letters, digits, '_' and '-'
+    std::string description;  // its /help line after the name; a "[On|Off]" in it gives `options` when none are listed
+    std::vector<std::string> options;
+};
+
 // A new galaxy, and the hungry Luma that opens it.
 struct Galaxy {
     std::string name;
@@ -226,6 +234,7 @@ struct Layer {
     std::vector<Form> forms;
     std::vector<ScriptObject> objects;
     std::vector<std::string> scripts;  // mod-wide scripts ("scripts"): scripts/<name>.lumascript, one instance each
+    std::vector<Command> commands;     // chat commands its scripts answer ("commands")
     std::vector<SoundEffect> sound_effects;
     std::vector<PlayerAnimation> player_animations;
     std::vector<Character> characters;

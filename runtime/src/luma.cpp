@@ -248,6 +248,14 @@ private:
     std::size_t at_ = 0;
 };
 
+// A chat command's name or one of its words: 1-24 of letters, digits, _ and -.
+bool command_name_ok(std::string_view name) {
+    if (name.empty() || name.size() > 24) return false;
+    return std::all_of(name.begin(), name.end(), [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+    });
+}
+
 // A script's name: letters, digits, _ and -, in folders split by /; never empty, absolute or climbing out.
 bool script_name_ok(std::string_view name) {
     if (name.empty() || name.size() > 128 || name.front() == '/' || name.back() == '/') return false;
@@ -894,6 +902,25 @@ std::optional<Manifest> parse_manifest(std::string_view text) {
                 layer.scripts.push_back(*name);
             }
         }
+        if (const Value* commands = entry.get("commands"); commands != nullptr) {
+            if (commands->array() == nullptr) return std::nullopt;
+            for (const Value& row : *commands->array()) {
+                if (row.object() == nullptr) return std::nullopt;
+                const Value* name = row.get("name");
+                const Value* description = row.get("description");
+                if (name == nullptr || name->string() == nullptr || !command_name_ok(*name->string())) return std::nullopt;
+                if (description == nullptr || description->string() == nullptr) return std::nullopt;
+                Command command{*name->string(), *description->string(), {}};
+                if (const Value* options = row.get("options"); options != nullptr) {
+                    if (options->array() == nullptr) return std::nullopt;
+                    for (const Value& option : *options->array()) {
+                        if (option.string() == nullptr || !command_name_ok(*option.string())) return std::nullopt;
+                        command.options.push_back(*option.string());
+                    }
+                }
+                layer.commands.push_back(std::move(command));
+            }
+        }
         // "switches" gave way to "tunables": the mod is refused, naming the tunable for its first switch.
         if (const Value* switches = entry.get("switches"); switches != nullptr && out.retired.empty()) {
             out.retired = "\"SWITCHES\" ARE NOW \"TUNABLES\"";
@@ -1183,7 +1210,7 @@ bool layer_sets_game(const Layer& layer) noexcept {
     return rows_set_game(layer.rows) || !layer.materials.empty() || !layer.object_changes.empty() || !layer.comet_time_limits.empty() ||
            !layer.stages.empty() || !layer.player_constants.empty() || !layer.tunables.empty() || !layer.object_classes.empty() || !layer.forms.empty() ||
            !layer.objects.empty() || !layer.scripts.empty() || !layer.sound_effects.empty() || !layer.player_animations.empty() ||
-           !layer.characters.empty();
+           !layer.characters.empty() || !layer.commands.empty();
 }
 
 bool manifest_sets_game(const Manifest& manifest) noexcept {

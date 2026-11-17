@@ -141,6 +141,28 @@ int main() {
         }
     }
     {
+        // A co-op mod's chat commands (sm64coopdx's hook_chat_command): a name, its /help line, its words.
+        const auto with_layer = [](const std::string& layer) {
+            return std::string(R"({"format":1,"id":"a","name":"b","version":"1.0.0","game":"RMG","requires":["coop"],"layers":[{)") + layer + "}]}";
+        };
+        const std::optional<Manifest> psc = parse_manifest(
+            with_layer(R"("commands":[{"name":"psc","description":"CoopCmdPscHelp","options":["on","off"]},{"name":"x-1","description":"d"}])"));
+        check(psc && psc->layers.size() == 1u && psc->layers[0].commands.size() == 2u, "commands read");
+        if (psc && psc->layers.size() == 1u && psc->layers[0].commands.size() == 2u) {
+            const Layer& layer = psc->layers[0];
+            check(layer.commands[0].name == "psc" && layer.commands[0].description == "CoopCmdPscHelp" &&
+                      layer.commands[0].options == std::vector<std::string>({"on", "off"}) && layer.commands[1].options.empty(),
+                  "a command's fields");
+            check(layer_sets_game(layer), "commands change the game");
+        }
+        for (const char* bad : {R"("commands":[{"name":"psc"}])", R"("commands":[{"name":"","description":"d"}])",
+                                R"("commands":[{"name":"/psc","description":"d"}])", R"("commands":[{"name":"a b","description":"d"}])",
+                                R"("commands":[{"name":"psc","description":"d","options":["on off"]}])",
+                                R"("commands":[{"name":"psc","description":"d","options":"on"}])", R"("commands":{"name":"psc"})"}) {
+            check(!parse_manifest(with_layer(bad)).has_value(), bad);
+        }
+    }
+    {
         // The page's metadata: the icon and pictures stay inside the mod, at most kMaxPictures of them.
         std::string text = R"({"format":1,"id":"a","name":"b","game":"RMG","layers":[],"license":"MIT","homepage":"https://x.example",)"
                            R"("icon":"../icon.png","pictures":["p/1.png","../2.png","/abs.png","C:/x.png","",3)";

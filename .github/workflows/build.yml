@@ -102,7 +102,9 @@ jobs:
             case "$file" in
               "") ;;
               .github/workflows/build.yml) game=true; installer=true ;;
-              *.md | docs/* | LICENSE | .github/* | nebulanet/* | lumalink/* | web/* | tools/*) ;;
+              # The lumalink submodule's commit carries the built-in mods the host embeds.
+              lumalink) game=true ;;
+              *.md | docs/* | LICENSE | .github/* | nebulanet/* | web/* | tools/*) ;;
               installer/assets/* | runtime/include/galaxy/store_version.inc) game=true; installer=true ;;
               installer/*) installer=true ;;
               *) game=true ;;
@@ -162,6 +164,9 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/Checkout@v7
+      # The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake).
+      - name: Built-in mods
+        run: git submodule update --init --depth 1 lumalink
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
@@ -219,6 +224,9 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/Checkout@v7
+      # The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake).
+      - name: Built-in mods
+        run: git submodule update --init --depth 1 lumalink
       - name: Clang version
         run: '& "C:\Program Files\LLVM\bin\clang.exe" --version'
       # Archive deps (zlib, xz, libarchive) built at configure time: skip when already built.
@@ -275,6 +283,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/Checkout@v7
+      # The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake).
+      - name: Built-in mods
+        run: git submodule update --init --depth 1 lumalink
       - name: System packages
         # SDL3's video, audio and input back ends (X11, Wayland, ALSA, PulseAudio, PipeWire, udev).
         run: |
@@ -340,6 +351,9 @@ jobs:
     runs-on: windows-2025
     steps:
       - uses: actions/Checkout@v7
+      # The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake).
+      - name: Built-in mods
+        run: git submodule update --init --depth 1 lumalink
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,x86_64-linux-android
@@ -404,6 +418,9 @@ jobs:
       MOLTENVK_TAG: v1.4.2
     steps:
       - uses: actions/Checkout@v7
+      # The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake).
+      - name: Built-in mods
+        run: git submodule update --init --depth 1 lumalink
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Ninja

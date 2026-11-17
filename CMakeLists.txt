@@ -531,6 +531,9 @@ add_executable(NebulaNative native/host/host_main.cpp runtime/src/frame_phase.cp
 # The game API's and online play's fingerprints (cmake/nebula_fingerprint.cmake): no version to bump by hand.
 include(cmake/nebula_fingerprint.cmake)
 nebula_fingerprint("${CMAKE_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/native/petari" "${CMAKE_BINARY_DIR}/generated")
+# The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake), for mods.cpp.
+include(cmake/nebula_builtin_mods.cmake)
+nebula_builtin_mods("${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/generated")
 if(WIN32)
     enable_language(RC)
 endif()

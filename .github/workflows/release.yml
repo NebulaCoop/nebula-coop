@@ -79,6 +79,9 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/Checkout@v7
+      # The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake).
+      - name: Built-in mods
+        run: git submodule update --init --depth 1 lumalink
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
@@ -118,6 +121,9 @@ jobs:
     runs-on: windows-2025
     steps:
       - uses: actions/Checkout@v7
+      # The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake).
+      - name: Built-in mods
+        run: git submodule update --init --depth 1 lumalink
       - name: Configure-time dependencies
         uses: actions/cache/restore@v6
         with:

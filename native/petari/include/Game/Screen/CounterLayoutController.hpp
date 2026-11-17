@@ -1,10 +1,11 @@
 #pragma once
 
 #include "Game/Screen/LayoutActor.hpp"
+#include "nebula_mod_api.h"
 
 class CoinCounter;
 class MarioMeter;
-class NebulaStarCounter;
+class NebulaHudCounter;
 class PlayerLeft;
 class StarCounter;
 class StarPieceCounter;
@@ -41,8 +42,7 @@ public:
     PlayerLeft* mPlayerLeft;
     StarCounter* mStarCounter;
     MarioMeter* mHPMeter;
-    // The Personal Star Counter's two under the save's star counter (this room's, every star's): shown and hidden
+    // The mods' counters under the save's star counter (hud_counter; the Personal Star Counter's): shown and hidden
     // with it.
-    NebulaStarCounter* mRoomStarCounter;
-    NebulaStarCounter* mAllTimeStarCounter;
+    NebulaHudCounter* mHudCounters[NEBULA_HUD_COUNTER_LINES];
 };

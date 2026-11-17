@@ -137,9 +137,9 @@ void set_mods_store_file(const std::filesystem::path& store);
 void set_mods_folder(const std::filesystem::path& folder, const std::filesystem::path& settings_file,
                      const std::string& game_id);
 [[nodiscard]] std::filesystem::path mods_folder();
-// NebulaCoop's built-in mods (runtime/src/builtin_mods.inc, made in LumaLink-coop's builtin/): each one's folder in
-// the mods folder, written again when missing or changed, so they are always there as their latest. Off until the
-// player turns one on. Call after set_mods_folder; false when one could not be written.
+// NebulaCoop's built-in mods (LumaLink-coop's builtin/*.lumacoop, embedded from the lumalink submodule): each one's
+// folder in the mods folder, written again when missing or changed, so they are always there as their latest. Off
+// until the player turns one on. Call after set_mods_folder; false when one could not be written.
 bool install_builtin_mods();
 // A built-in mod's id.
 [[nodiscard]] bool is_builtin_mod(std::string_view id);

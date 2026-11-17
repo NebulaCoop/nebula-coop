@@ -10,6 +10,7 @@
 #include <functional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -105,6 +106,30 @@ void test_registry() {
     expect(commands.run("/secret"), "but it still runs (it says why it won't)");
     commands.remove("secret");
     expect(!commands.run("/secret"), "and goes");
+}
+
+// A co-op mod's command (luma.json "commands"): its word goes to the mod's scripts by its place in the options.
+void test_mod_command() {
+    galaxy::coop::Commands commands;
+    std::vector<std::pair<std::string, int>> sent;
+    const auto send = [&](const std::string& name, int word) { sent.emplace_back(name, word); };
+    expect(galaxy::coop::add_mod_command(commands, "psc", "CoopCmdPscHelp", {"on", "off"}, send, {}), "a mod's command added");
+    expect(commands.run("/psc") && commands.run("/psc OFF") && commands.run("/psc on "),
+           "alone, a word case aside, spaces around");
+    expect(sent == std::vector<std::pair<std::string, int>>({{"psc", 0}, {"psc", 2}, {"psc", 1}}), "sent as 0, 2 and 1");
+    expect(!commands.run("/psc maybe") && !commands.run("/psc on off") && sent.size() == 3u, "another word is refused");
+    expect(commands.complete("/psc ", {}) == std::vector<std::string>({"/psc on", "/psc off"}), "Tab offers its words");
+    expect(galaxy::coop::add_mod_command(commands, "stars", "[Red|Green] - colours", {}, send, {}) && commands.run("/stars green") &&
+               sent.back() == std::make_pair(std::string("stars"), 2),
+           "without options, the description's");
+    expect(!galaxy::coop::add_mod_command(commands, "PSC", "again", {}, send, {}), "a name taken stays its first owner's");
+    expect(!galaxy::coop::add_mod_command(commands, "none", "d", {}, {}, {}), "nothing to send to: refused");
+    bool shown = false;
+    expect(galaxy::coop::add_mod_command(commands, "later", "d", {}, send, [&] { return shown; }) &&
+               commands.complete("/la", {}).empty(),
+           "hidden while not shown");
+    shown = true;
+    expect(commands.complete("/la", {}) == std::vector<std::string>({"/later"}), "and there once shown");
 }
 
 void test_complete() {
@@ -341,6 +366,7 @@ void test_room() {
 int main() {
     test_options();
     test_registry();
+    test_mod_command();
     test_complete();
     test_chat();
     test_room();

@@ -104,4 +104,6 @@ namespace NebulaAchievements {
     void countStat(s32 stat, s32 num);
     void flushStats();
     u64 getStat(s32 stat);
+    // A count by its stats.ini key ("power_stars"), the mods' stat: NebulaStat_Num for no such key.
+    s32 findStat(const char* pName);
 };  // namespace NebulaAchievements

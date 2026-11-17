@@ -179,6 +179,24 @@ namespace NebulaHost {
         }
     }
 
+    // A mod's chat command this player typed: 1 with its name and its word's place, 0 when none waits.
+    inline s32 coopCommandTake(char* pCommand, u32 capacity, s32* pWord) {
+        if (capacity > 0) {
+            pCommand[0] = '\0';
+        }
+        *pWord = 0;
+        const s32 got = nebula_host()->coop_command_take(nebula_host()->user, pCommand, capacity, pWord);
+        if (capacity > 0) {
+            pCommand[capacity - 1] = '\0';
+        }
+        return got;
+    }
+
+    // A mod's line in the chat for this player alone.
+    inline void coopChatSay(const char* pUtf8) {
+        nebula_host()->coop_chat_say(nebula_host()->user, pUtf8);
+    }
+
     // The colours the player wants (24 bytes into `pPalette`): true with the Options page's, false for their character's
     // own.
     inline bool coopPaletteWanted(u8* pPalette) {
