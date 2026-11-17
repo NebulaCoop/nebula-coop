@@ -53,13 +53,15 @@ ROWS = [
      "platform/apple/**/*.plist*", r"UTExportedTypeDeclarations[\s\S]*luma", "yes"),
     ("macos", "link scheme nebula://", "6.1 import by link",
      "platform/apple/**/*.plist*", r"CFBundleURLSchemes[\s\S]*nebula", "yes"),
-    # Windows (the installer writes the registry)
+    # Windows (the installer writes the registry). NebulaCoop installs beside upstream Nebula and leaves .luma and
+    # nebula:// to it (installer/native/setup_engine.cpp Register; v1.0.3 removed its own .luma type too), so these
+    # three are listed but not required: its mods are added in the game's MODS page.
     ("windows", "file association .luma", "6.1 import: double click, Open with",
-     "installer/native/setup_engine.cpp", r'Key extension\(L"Software\\\\Classes\\\\\.luma"\)', "yes"),
+     "installer/native/setup_engine.cpp", r'Key extension\(L"Software\\\\Classes\\\\\.luma"\)', "no: upstream Nebula's"),
     ("windows", "link scheme nebula://", "6.1 import by link",
-     "installer/native/setup_engine.cpp", r'Set\(L"URL Protocol", L""\)', "yes"),
+     "installer/native/setup_engine.cpp", r'Set\(L"URL Protocol", L""\)', "no: upstream Nebula's"),
     ("windows", "both open the install's Nebula.exe with --import", "6.1 import: double click, by link",
-     "installer/native/setup_engine.cpp", r'L"\\"" \+ starter \+ L"\\" --import \\"%1\\""', "yes"),
+     "installer/native/setup_engine.cpp", r'L"\\"" \+ starter \+ L"\\" --import \\"%1\\""', "no: upstream Nebula's"),
     ("windows", "the game imports --import's files and links", "6.1 import: double click, by link",
      "runtime/src/ui/native_settings.cpp", r'launch_args\(\)\.imports', "yes"),
     ("linux", "the game imports --import's files (the desktop entry's %u)", "6.1 import: Open with, by link",
