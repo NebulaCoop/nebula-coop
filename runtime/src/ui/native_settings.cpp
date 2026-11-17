@@ -6584,7 +6584,6 @@ void open_saves_rows() {
 void route_dropped_files(std::vector<std::filesystem::path> files) {
     DroppedFiles sorted = sort_dropped_files(std::move(files));
     std::vector<std::filesystem::path>& mods = sorted.mods;
-    std::vector<std::filesystem::path>& miis = sorted.miis;
     const bool link = sorted.link;
     if (sorted.save) {
         if (sorted.more_saves != 0u) {
