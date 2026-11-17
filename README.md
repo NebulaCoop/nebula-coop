@@ -5,6 +5,7 @@
 
 You need your own copy of the game. Not affiliated with or endorsed by Nintendo. (Please don't hurt me Nintendo.)
 
+[Website](https://nebula.mackery.com) · 
 [Download](https://github.com/NebulaCoop/nebula-coop/releases/latest) ·
 [Playing online](#playing-online) ·
 [Building from source](docs/BUILDING.md) ·
