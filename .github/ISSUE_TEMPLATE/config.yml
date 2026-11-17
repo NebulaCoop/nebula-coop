@@ -1,0 +1,17 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/NebulaCoop/nebula-coop/security/advisories/new
+    about: Please report security problems privately, never in a public issue. See SECURITY.md.
+  - name: A problem that also happens in plain Nebula
+    url: https://github.com/keepvaibin/nebula/issues
+    about: Bugs in Nebula itself (graphics, controls, Setup, the game) that don't need co-op belong upstream.
+  - name: NebulaNet (the room-code server)
+    url: https://github.com/NebulaCoop/NebulaNet/issues
+    about: Problems with the NebulaNet service itself. Not sure? Report it here in nebula-coop.
+  - name: LumaLink (mod tool)
+    url: https://github.com/NebulaCoop/lumalink-coop/issues
+    about: Problems making, converting or packing mods with LumaLink.
+  - name: Ask on Discord
+    url: https://discord.gg/hNbgFtaRHv
+    about: Questions, help getting a room going, and chat.

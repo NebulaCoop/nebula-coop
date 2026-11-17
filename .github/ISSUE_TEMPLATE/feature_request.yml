@@ -1,0 +1,48 @@
+name: Feature request
+description: Suggest something new for co-op, or a change to how it plays.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check [TODO.md](https://github.com/NebulaCoop/nebula-coop/blob/main/TODO.md) and the
+        [open issues](https://github.com/NebulaCoop/nebula-coop/issues) first: it may already be planned.
+        Ideas for Nebula itself (not co-op) are best suggested to [keepvaibin/nebula](https://github.com/keepvaibin/nebula).
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Co-op gameplay (players, enemies, bosses, stars, saves)
+        - Rooms and joining (NebulaNet, direct connect, lobby options)
+        - Chat, commands and moderation
+        - Menus and pop-ups
+        - Characters, colours and mods (LumaScript coop API)
+        - Setup, the launcher and updates
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like?
+      description: Describe it from a player's point of view. What would you do, and what would happen?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why?
+      description: The problem it solves, or what it would make better.
+    validations:
+      required: true
+  - type: textarea
+    id: sm64coopdx
+    attributes:
+      label: How sm64coopdx does it
+      description: Nebula Co-Op follows sm64coopdx's design. If it has this, how does it work there?
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Alternatives you thought of, mock-ups, links.
