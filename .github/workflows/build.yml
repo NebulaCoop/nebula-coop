@@ -33,8 +33,9 @@ env:
 
 jobs:
   # Sorts the changed files into what they affect:
-  #   game:      the host, the game module, the disc import tool and the Windows and Linux test builds;
-  #   android:   the Android test build, only when platform/android changes (shared code doesn't start it);
+  #   game:      the host, the game module, the disc import tool and the Windows, Linux and macOS test builds;
+  #   android:   the Android test build: shared code and platform/android. A change to platform/android alone
+  #              builds Android only;
   #   installer: Nebula Setup and the install root's Nebula.exe (installer/native), compiled.
   # Documentation, the other workflows, NebulaNet and tools/ affect neither. A file both use (the icon the host and
   # Setup are both built with, the store version Setup writes) and this workflow itself run both.
@@ -105,14 +106,14 @@ jobs:
             case "$file" in
               "") ;;
               .github/workflows/build.yml) game=true; installer=true; android=true ;;
-              # The Android port: its own build, which needs the host's shader tools and the game module too.
-              platform/android/*) game=true; android=true ;;
+              # The Android port alone: nothing else is built for it.
+              platform/android/*) android=true ;;
               # The lumalink submodule's commit carries the built-in mods the host embeds.
-              lumalink) game=true ;;
+              lumalink) game=true; android=true ;;
               *.md | docs/* | LICENSE | .github/* | nebulanet/* | web/* | tools/*) ;;
-              installer/assets/* | runtime/include/galaxy/store_version.inc) game=true; installer=true ;;
+              installer/assets/* | runtime/include/galaxy/store_version.inc) game=true; installer=true; android=true ;;
               installer/*) installer=true ;;
-              *) game=true ;;
+              *) game=true; android=true ;;
             esac
           done <<< "$files"
           echo "$(printf '%s\n' "$files" | grep -c .) changed files, the first 100:"
@@ -369,10 +370,12 @@ jobs:
 
   android:
     name: Android
-    # The Vulkan host build's shader tools compile the SPIR-V the APK carries.
-    # Also needs the game module: if it doesn't build, the APK is useless.
+    # The Vulkan host build's shader tools compile the SPIR-V the APK carries; on a change to platform/android alone
+    # the host isn't built, so this job builds the two tools itself. A failed host or game module stops it.
     needs: [changes, host, game]
-    if: needs.changes.outputs.android == 'true'
+    if: >-
+      always() && needs.changes.outputs.android == 'true' &&
+      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: windows-2025
     steps:
       - uses: actions/Checkout@v7
@@ -403,10 +406,33 @@ jobs:
           clone KhronosGroup/glslang "$GLSLANG_TAG" glslang-src
           pin KhronosGroup/SPIRV-Tools "$SPIRV_TOOLS_COMMIT" glslang-src/External/spirv-tools
           pin KhronosGroup/SPIRV-Headers "$SPIRV_HEADERS_COMMIT" glslang-src/External/spirv-tools/external/spirv-headers
-      - uses: actions/download-artifact@v8
+      - if: needs.host.result == 'success'
+        uses: actions/download-artifact@v8
         with:
           name: spirv-tools
           path: build/spirv-tools
+      - if: needs.host.result != 'success'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - if: needs.host.result != 'success'
+        name: Cache configure-time dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/host/archive-deps
+            build/host/fidelityfx.built
+            build/host/_deps
+          key: host-deps-ON-${{ hashFiles('cmake/**', 'third_party/archive/**') }}
+      - if: needs.host.result != 'success'
+        name: Shader tools
+        run: |
+          cmake -S . -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release -DNEBULA_VULKAN=ON -DNEBULA_HOST_IPO=OFF
+          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
+          cmake --build build/host --target galaxy_native_spirv galaxy_utility_spirv
+          if ($LASTEXITCODE -ne 0) { throw "the shader tools did not build" }
+          New-Item -ItemType Directory -Force build/spirv-tools | Out-Null
+          Copy-Item build/host/galaxy_native_spirv.exe, build/host/galaxy_utility_spirv.exe build/spirv-tools
       - name: APK
         # Debug-signed: no -Signing.
         run: |
