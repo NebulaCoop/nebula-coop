@@ -62,6 +62,11 @@ foreach ($RelativePath in $TrackedFiles) {
         if ($File.Length -gt 16MB) { $Failures.Add("Shader-cache seed larger than 16 MiB: $($File.FullName)") }
         continue
     }
+    # LumaKit, the library mod Setup ships (installer/lumakit), packed by its own repository.
+    if ($RelativePath -eq 'installer/lumakit/lumakit.luma') {
+        if ($File.Length -gt 32MB) { $Failures.Add("LumaKit larger than 32 MiB: $($File.FullName)") }
+        continue
+    }
     # The validator's test libraries (crates/luma-validate/tests/data): tiny mods built to check its rules on code.
     if ($RelativePath -like 'crates/luma-validate/tests/data/*') {
         if ($File.Length -gt 1MB) { $Failures.Add("Validator test file larger than 1 MiB: $($File.FullName)") }
