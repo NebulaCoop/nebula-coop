@@ -92,11 +92,15 @@ A player's colours work like sm64coopdx's palettes: eight parts, each a colour. 
 | 7 | `emblem` | the letter on the cap |
 
 A player picks theirs on Options' PLAYER page, under COLOURS: SET gives a whole set (OWN for their character's own, any
-character's, or a few more: FIRE MARIO, WARIO, TOAD and others), and a row per part steps through named colours. Each
+character's, or a few more: FIRE MARIO, WARIO, TOAD and others), and a row per part steps through named colours.
+ADVANCED COLOURS gives any colour, as sm64coopdx's palette editor: PART picks a part (its colour shown as `#RRGGBB`),
+and RED, GREEN and BLUE slide its channels from 0 to 255 in fives. Each
 player's colours travel with their character, so everyone in a room sees them.
 
 The game's player models carry their colours in their textures, so a palette is drawn by recoloured copies of those
-textures, made as the player's actor is made and remade when the colours change. The material's name says which parts
+textures, made as the player's actor is made and remade when the colours change. Every frame of a texture gets a
+copy (`MarioBody.0` to `.2`, `MarioCap.0` and `.1`, the eyelids' blink), since the player's texture animations
+(MarioAnime's `ElementEnd` and `ColorChange`) draw other frames than the model's own. The material's name says which parts
 its texture may hold: `Cap` the cap and emblem, `Body` the overalls, shirt and shoes, `Hair` the hair, `Face` and
 `EyeLid` the skin, `Hand` the gloves (`Eye` none). Each texel near a part's colour in the character's own palette takes
 the wanted colour at its own lightness; texels near none (the buttons, the eyes, outlines, the white around the

@@ -87,15 +87,15 @@ void NebulaPaletteSkin::addModel(const ModelData* pData) {
             continue;
         }
         add(pData->getTexture(texture)->image(), parts);
-        // The eyelids blink through their texture's frames (MarioActor::swapTexture): every frame, all skin.
-        if (nebula_palette::detail::contains(pName, "eyelid")) {
-            const char* pTexture = pData->getTextureName(texture);
-            const u32 length = stemLength(pTexture);
-            for (u32 j = 0; j < textures; j++) {
-                const char* pOther = pData->getTextureName(j);
-                if (j != texture && stemLength(pOther) == length && std::strncmp(pOther, pTexture, length) == 0) {
-                    add(pData->getTexture(j)->image(), parts);
-                }
+        // A material draws another of its texture's frames as the model plays: the local player's MarioAnime
+        // texture patterns (MarioActor's "ElementEnd", "ColorChange": MarioBody.0 to .2, MarioCap.0 and .1) and the
+        // eyelids' blink (MarioActor::swapTexture). Every frame gets a copy, so whichever is drawn wears the colours.
+        const char* pTexture = pData->getTextureName(texture);
+        const u32 length = stemLength(pTexture);
+        for (u32 j = 0; j < textures; j++) {
+            const char* pOther = pData->getTextureName(j);
+            if (j != texture && stemLength(pOther) == length && std::strncmp(pOther, pTexture, length) == 0) {
+                add(pData->getTexture(j)->image(), parts);
             }
         }
     }
