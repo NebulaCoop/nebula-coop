@@ -405,11 +405,12 @@ bool builtin_mods() {
         brake = brake || (constant.name == "mBrakeSlide" && constant.value == 1.0f);
     }
     ok &= expect(luigi_only && brake, "on, it sets Luigi's numbers alone, his long brake among them");
-    // The Personal Star Counter: its luma.json and its compiled script, as the package in LumaLink-coop has them.
+    // The Personal Star Counter: its luma.json, its LumaScript and its code, as the package in LumaLink-coop has them.
     const fs::path psc = root / "mods" / "personal-star-counter";
     ok &= expect(galaxy::mods::is_builtin_mod("personal-star-counter") && fs::is_regular_file(psc / "luma.json") &&
-                     read_all(psc / "layers/base/files/LumaScripts/personal-star-counter/psc.lumascript").size() > 0u,
-                 "the Personal Star Counter is one, with its script");
+                     read_all(psc / "source/main.lum").size() > 0u && fs::is_regular_file(psc / "code/windows-x64/mod.dll") &&
+                     fs::is_regular_file(psc / "code/linux-x64/mod.so"),
+                 "the Personal Star Counter is one, with its code");
     const auto counter = std::find_if(mods.begin(), mods.end(), [](const galaxy::mods::ModInfo& m) { return m.id == "personal-star-counter"; });
     ok &= expect(counter != mods.end() && !counter->enabled && counter->package && counter->problem.empty(),
                  "it is listed, usable and off");
