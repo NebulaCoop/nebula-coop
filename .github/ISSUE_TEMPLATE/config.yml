@@ -1,8 +1,5 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Report a security vulnerability
-    url: https://github.com/NebulaCoop/nebula-coop/security/advisories/new
-    about: Please report security problems privately, never in a public issue. See SECURITY.md.
   - name: A problem that also happens in plain Nebula
     url: https://github.com/keepvaibin/nebula/issues
     about: Bugs in Nebula itself (graphics, controls, Setup, the game) that don't need co-op belong upstream.
