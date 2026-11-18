@@ -718,6 +718,9 @@ jobs:
     env:
       # LLVM 19 (LLVM's own macOS package), and libc++ built from the same release.
       LLVM_VERSION: 19.1.7
+      # The game module's row generator parses with libclang on this machine and needs LLVM 21 or later
+      # (tools/lumacore/instrument.py): the release's LLVM, as the Windows and Android jobs take it.
+      LIBCLANG_LLVM_VERSION: '22.1.6'
       MOLTENVK_TAG: v1.4.2
     steps:
       - uses: actions/Checkout@v7
@@ -746,6 +749,23 @@ jobs:
           "$tools/toolchain/llvm/bin/clang" --version
           platform/apple/build_libcxx.sh "$RUNNER_TEMP/llvm-src" "$tools/toolchain/llvm" "$tools/toolchain/libcxx" macos arm64
           rm -rf "$tools/toolchain/libcxx/build-macos-arm64"
+      # The row generator's libclang: only libclang.dylib (it links nothing else of the package) and its built-in headers
+      # (lib/clang/<version>/include) are kept from LLVM's package. The toolchain's own LLVM 19 is too old for it.
+      - name: Cache the row generator's libclang
+        id: libclang
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/libclang
+          key: macos-libclang-arm64-${{ env.LIBCLANG_LLVM_VERSION }}
+      - name: Row generator's libclang
+        if: steps.libclang.outputs.cache-hit != 'true'
+        run: |
+          package="LLVM-$LIBCLANG_LLVM_VERSION-macOS-ARM64"
+          mkdir -p "$RUNNER_TEMP/libclang"
+          curl -fsSL --retry 3 "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LIBCLANG_LLVM_VERSION/$package.tar.xz" |
+            tar -xJ --strip-components=1 -C "$RUNNER_TEMP/libclang" "$package/lib/libclang.dylib" "$package/lib/clang"
+          test -f "$RUNNER_TEMP/libclang/lib/libclang.dylib"
+          ls "$RUNNER_TEMP"/libclang/lib/clang/*/include/stdarg.h
       - name: Dependencies
         # What the Linux job checks out, and MoltenVK and SPIRV-Cross (platform/apple/CMakeLists.txt).
         run: |
@@ -769,6 +789,10 @@ jobs:
             exit 1
           fi
       - name: Build
+        # The game module's configure takes the row generator's libclang from LLVM_ROOT (native/CMakeLists.txt): the Apple
+        # toolchain file makes it a cross build, so it doesn't look beside the compiler.
+        env:
+          LLVM_ROOT: ${{ runner.temp }}/libclang
         run: platform/apple/build_macos.sh -t "$RUNNER_TEMP/apple" -w "$RUNNER_TEMP/apple-build" -a arm64
       - name: Stage
         run: |
