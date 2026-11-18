@@ -14,14 +14,18 @@ on:
   pull_request:
   workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# No run-wide concurrency group: GitHub settles one before any job has seen what changed, so a push that built nothing
+# (a submodule bump, documentation) cancelled the build still going. Each build job has its own group instead (the
+# branch, or pull request, and the job), and the Changes job decides which parts a run builds: only those cancel the
+# same jobs of an earlier run. The parts it leaves alone keep going, and this run takes their result (Earlier build).
 
 permissions:
   contents: read
 
 env:
+  # Whose runs the Changes, Earlier build and Android check jobs look at: this branch's, or this pull request's.
+  BUILD_BRANCH: ${{ github.head_ref || github.ref_name }}
+  BUILD_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
   # The SDL host's dependencies (platform/sdl/CMakeLists.txt, NEBULA_DEPS), at the versions cmake/vulkan_deps.cmake
   # pins for the Windows build.
   SDL_TAG: release-3.4.18
@@ -32,25 +36,30 @@ env:
   SPIRV_HEADERS_COMMIT: 496543121ce6419f23d6fa5d7194ba66c36212d2
 
 jobs:
-  # Sorts the changed files into what they affect:
+  # Sorts the changed files into the parts they affect:
   #   game:      the host, the game module, the disc import tool and the Windows, Linux and macOS test builds;
   #   android:   the Android test build: shared code and platform/android. A change to platform/android alone
   #              builds Android only;
   #   installer: Nebula Setup and the install root's Nebula.exe (installer/native), compiled.
-  # Documentation, the other workflows, NebulaNet and tools/ affect neither. A file both use (the icon the host and
-  # Setup are both built with, the store version Setup writes) and this workflow itself run both.
+  # Documentation, the other workflows, the NebulaNet and website submodules and tools/ affect none. A file both use
+  # (the icon the host and Setup are both built with, the store version Setup writes) and this workflow itself run all.
   # Run workflow builds everything.
+  #
+  # A part that changed is then left to an earlier run of the branch that is still going, when nothing in it changed
+  # since that run's commit: that run keeps building it, and this run takes its result (Earlier build). Only the parts
+  # this run builds cancel an earlier run's jobs (the jobs' concurrency groups).
   changes:
     name: Changes
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      # Reads the earlier Build runs of main.
-      actions: read
+      # Reads the Build runs of this branch, and cancels this one when a newer one is already going.
+      actions: write
     outputs:
       game: ${{ steps.filter.outputs.game }}
       installer: ${{ steps.filter.outputs.installer }}
       android: ${{ steps.filter.outputs.android }}
+      follow: ${{ steps.filter.outputs.follow }}
     steps:
       - uses: actions/Checkout@v7
         if: github.event_name != 'workflow_dispatch'
@@ -61,29 +70,84 @@ jobs:
       - id: filter
         env:
           GH_TOKEN: ${{ github.token }}
+          # The commit this run builds, without the merge GitHub makes for a pull request.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          all() {
-            echo "Building everything: $1"
-            { echo game=true; echo installer=true; echo android=true; } >> "$GITHUB_OUTPUT"
+          # Sets game, installer and android from a list of changed files, one per line.
+          sort_files() {
+            game=false
+            installer=false
+            android=false
+            while IFS= read -r file; do
+              case "$file" in
+                "") ;;
+                .github/workflows/build.yml) game=true; installer=true; android=true ;;
+                # The Android port alone: nothing else is built for it.
+                platform/android/*) android=true ;;
+                # The lumalink submodule's commit carries the built-in mods the host embeds.
+                lumalink) game=true; android=true ;;
+                # A submodule's new commit shows as its path alone: nebulanet and web are never built here.
+                *.md | docs/* | LICENSE | .github/* | nebulanet | nebulanet/* | web | web/* | tools/*) ;;
+                installer/assets/* | runtime/include/galaxy/store_version.inc)
+                  game=true; installer=true; android=true ;;
+                installer/*) installer=true ;;
+                *) game=true; android=true ;;
+              esac
+            done <<< "$1"
+          }
+          # The Build runs of this branch, or of this pull request, newest first: "id number status commit". Pushes to
+          # main and Run workflow on main are one branch's runs.
+          branch_runs() {
+            gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs" -f branch="$BUILD_BRANCH" \
+              -f per_page=30 --jq '.workflow_runs[]
+                | select(if env.GITHUB_EVENT_NAME == "pull_request"
+                         then .event == "pull_request" and .head_repository.full_name == env.BUILD_HEAD_REPO
+                         else .event == "push" or .event == "workflow_dispatch" end)
+                | "\(.id) \(.run_number) \(.status) \(.head_sha)"'
+          }
+          # "status conclusion" of one job of a run.
+          job_state() {
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$1/jobs?per_page=100" \
+              --jq ".jobs[] | select(.name == \"$2\") | \"\(.status) \(.conclusion)\""
+          }
+          finish() {
+            # A newer run of the branch already going decides for both (it compares with the same commits), and this
+            # run's jobs, starting after its, would cancel them.
+            newer=$(branch_runs | awk -v me="$GITHUB_RUN_NUMBER" '$2 > me && $3 != "completed" { print $1; exit }')
+            if [ -n "$newer" ]; then
+              echo "Run $newer of this branch is newer and still going: it builds what this one would have."
+              if gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/cancel" --silent; then
+                sleep 120
+              fi
+              # A pull request from a fork can't cancel: carry on.
+            fi
+            echo "Game: $game. Installer: $installer. Android: $android. Taken from an earlier run:${follow:- none}."
+            { echo "game=$game"; echo "installer=$installer"; echo "android=$android"; echo "follow=${follow# }"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           }
-          # The commit of the newest finished Build of main whose Build result passed. A push is compared with it, not
-          # with the commit before it: a push cancels the run still going for the one before (concurrency above), so
-          # a game change followed by a docs change would otherwise never be built. A failed build is not counted
-          # either, so its changes are built again by the next push until one passes.
+          all() {
+            echo "Building everything: $1"
+            game=true; installer=true; android=true
+            finish
+          }
+          # The commit of the newest Build of main whose Build result passed. A push is compared with it, not with the
+          # commit before it: an earlier run whose jobs a later push cancelled never finished them, so a game change
+          # followed by another would otherwise build only the second. A failed build is not counted either, so its
+          # changes are built again by the next push until one passes.
           last_good() {
             gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?branch=main&status=completed&per_page=30" \
               --jq '.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch")
-                    | select(.conclusion == "success" or .conclusion == "failure") | "\(.id) \(.head_sha)"' |
+                    | select(.conclusion != "skipped") | "\(.id) \(.head_sha)"' |
             while read -r id sha; do
-              result=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs?per_page=100" \
-                --jq '.jobs[] | select(.name == "Build result") | .conclusion')
-              if [ "$result" = success ]; then
+              if [ "$(job_state "$id" "Build result")" = "completed success" ]; then
                 echo "$sha"
                 break
               fi
             done
           }
+
+          follow=""
           case "$GITHUB_EVENT_NAME" in
             pull_request)
               # The whole pull request, so a cancelled run for an earlier push to it loses nothing.
@@ -99,32 +163,145 @@ jobs:
             *)
               all "$GITHUB_EVENT_NAME" ;;
           esac
-          game=false
-          installer=false
-          android=false
-          while IFS= read -r file; do
-            case "$file" in
-              "") ;;
-              .github/workflows/build.yml) game=true; installer=true; android=true ;;
-              # The Android port alone: nothing else is built for it.
-              platform/android/*) android=true ;;
-              # The lumalink submodule's commit carries the built-in mods the host embeds.
-              lumalink) game=true; android=true ;;
-              *.md | docs/* | LICENSE | .github/* | nebulanet/* | web/* | tools/*) ;;
-              installer/assets/* | runtime/include/galaxy/store_version.inc) game=true; installer=true; android=true ;;
-              installer/*) installer=true ;;
-              *) game=true; android=true ;;
-            esac
-          done <<< "$files"
+          sort_files "$files"
           echo "$(printf '%s\n' "$files" | grep -c .) changed files, the first 100:"
           printf '%s\n' "$files" | head -n 100 | sed 's/^/  /'
-          echo "Game: $game. Installer: $installer. Android: $android."
-          { echo "game=$game"; echo "installer=$installer"; echo "android=$android"; } >> "$GITHUB_OUTPUT"
+          need_game=$game; need_installer=$installer; need_android=$android
+
+          # The newest earlier run of the branch still going that has settled what it builds. A run never started (an
+          # outage) or still in its Changes job is passed over: the second cancels itself, as this one is newer.
+          earlier=""
+          while read -r id number status sha; do
+            if [ -n "$id" ] && [ "$number" -lt "$GITHUB_RUN_NUMBER" ] && [ "$status" != completed ] &&
+               [ "$(job_state "$id" Changes)" = "completed success" ]; then
+              earlier=$id
+              earlier_sha=$sha
+              break
+            fi
+          done <<< "$(branch_runs || true)"
+          if [ -n "$earlier" ] && git fetch -q --depth=1 origin "$earlier_sha" "$HEAD_SHA" &&
+             since=$(git diff --name-only "$earlier_sha" "$HEAD_SHA"); then
+            sort_files "$since"
+            echo "Run $earlier is still going, for $earlier_sha. Changed since then:"
+            printf '%s\n' "$since" | head -n 100 | sed 's/^/  /'
+            fresh_game=$game; fresh_installer=$installer; fresh_android=$android
+            game=$need_game; installer=$need_installer; android=$need_android
+            # A part this run needs, unchanged since that run: that run (or the one it took the part from) builds it.
+            # Android doesn't count towards Build result, so its result isn't taken.
+            if [ "$need_game" = true ] && [ "$fresh_game" = false ]; then
+              game=false
+              follow="$follow game"
+            fi
+            if [ "$need_installer" = true ] && [ "$fresh_installer" = false ]; then
+              installer=false
+              follow="$follow installer"
+            fi
+            if [ "$need_android" = true ] && [ "$fresh_android" = false ]; then android=false; fi
+          fi
+          finish
+
+  # The parts the Changes job left to an earlier run of the branch: waits for the newest earlier run that built each
+  # part and fails if it failed, so this commit's Build result still means its code built. A part whose jobs a newer
+  # run cancelled has no result for this commit: Build result then cancels this run. If that earlier run is re-run after
+  # failing, run this one again too.
+  earlier:
+    name: Earlier build
+    needs: changes
+    if: needs.changes.outputs.follow != ''
+    runs-on: ubuntu-24.04
+    # Longer than the game build takes, queued runners included.
+    timeout-minutes: 180
+    permissions:
+      actions: read
+    outputs:
+      superseded: ${{ steps.wait.outputs.superseded }}
+    steps:
+      - id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PARTS: ${{ needs.changes.outputs.follow }}
+        run: |
+          # The jobs a part's result is made of, the first being the one that shows whether a run built it.
+          part_jobs() {
+            case "$1" in
+              game) printf '%s\n' "Game module" "Disc import tool (Rust)" "Host (Direct3D 12)" "Host (Vulkan)" \
+                      "Windows test build" ;;
+              installer) echo "Installer tests" ;;
+            esac
+          }
+          branch_runs() {
+            gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs" -f branch="$BUILD_BRANCH" \
+              -f per_page=30 --jq '.workflow_runs[]
+                | select(if env.GITHUB_EVENT_NAME == "pull_request"
+                         then .event == "pull_request" and .head_repository.full_name == env.BUILD_HEAD_REPO
+                         else .event == "push" or .event == "workflow_dispatch" end)
+                | "\(.id) \(.run_number) \(.status) \(.head_sha)"'
+          }
+          # A run's jobs, one per line: "status<TAB>conclusion<TAB>name".
+          run_jobs() {
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$1/jobs?per_page=100" \
+              --jq '.jobs[] | "\(.status)\t\(.conclusion // "")\t\(.name)"'
+          }
+          job_line() { awk -F'\t' -v name="$2" '$3 == name' <<< "$1"; }
+          # The newest earlier run that built the part, "wait" while one in between hasn't listed its jobs yet, or
+          # nothing. The runs in between left the part alone: it didn't change.
+          builder() {
+            local primary id number status sha jobs line
+            primary=$(part_jobs "$1" | head -n 1)
+            while read -r id number status sha; do
+              [ -n "$id" ] && [ "$number" -lt "$GITHUB_RUN_NUMBER" ] || continue
+              jobs=$(run_jobs "$id") || { echo wait; return; }
+              [ "$(job_line "$jobs" Changes | cut -f1,2)" = "$(printf 'completed\tsuccess')" ] || continue
+              line=$(job_line "$jobs" "$primary")
+              if [ -z "$line" ]; then
+                [ "$status" = completed ] && continue
+                echo wait
+                return
+              fi
+              [ "$(cut -f2 <<< "$line")" = skipped ] && continue
+              echo "$id"
+              return
+            done <<< "$(branch_runs)"
+          }
+
+          superseded=false
+          for part in $PARTS; do
+            while id=$(builder "$part") && [ "$id" = wait ]; do sleep 30; done
+            if [ -z "$id" ]; then
+              echo "::error::No earlier run of this branch built the $part. Run this workflow again."
+              exit 1
+            fi
+            echo "The $part: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id"
+            # Until each of its jobs has finished, or the run has.
+            while :; do
+              status=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id" --jq .status || echo unknown)
+              jobs=$(run_jobs "$id" || true)
+              results=$(part_jobs "$part" | while IFS= read -r name; do
+                line=$(job_line "$jobs" "$name")
+                if [ -z "$line" ]; then echo missing; elif [ "$(cut -f1 <<< "$line")" != completed ]; then echo running
+                else cut -f2 <<< "$line"; fi
+              done)
+              if ! grep -qx 'running\|missing' <<< "$results" || [ "$status" = completed ]; then break; fi
+              sleep 60
+            done
+            echo "$results" | paste -d' ' <(part_jobs "$part") - | sed 's/^/  /'
+            if grep -qx 'failure\|timed_out' <<< "$results"; then
+              echo "::error::The $part failed in run $id."
+              exit 1
+            elif grep -qvx success <<< "$results"; then
+              echo "A newer run took the $part over from run $id: there is no result for this commit's."
+              superseded=true
+            fi
+          done
+          echo "superseded=$superseded" >> "$GITHUB_OUTPUT"
 
   import:
     name: Disc import tool (Rust)
     needs: changes
     if: needs.changes.outputs.game == 'true'
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-import
+      cancel-in-progress: true
     runs-on: windows-2025
     env:
       # The C runtime linked in, as Setup ships it: it runs on PCs without the Visual C++ runtime.
@@ -155,6 +332,9 @@ jobs:
     if: needs.changes.outputs.game == 'true'
     # Visual Studio 2022's MSVC: with 2026's (MSVC 19.51, windows-2025) the frame interpolation and interp GPU
     # tests fail every palette check, which no other compiler reproduces.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-host-${{ matrix.vulkan }}
+      cancel-in-progress: true
     runs-on: windows-2022
     strategy:
       fail-fast: false
@@ -224,6 +404,9 @@ jobs:
     name: Game module
     needs: changes
     if: needs.changes.outputs.game == 'true'
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-game
+      cancel-in-progress: true
     runs-on: windows-2025
     env:
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
@@ -269,6 +452,9 @@ jobs:
     name: Windows test build
     # What the jobs above built and tested, put together: nothing is compiled again.
     needs: [import, host, game]
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-windows
+      cancel-in-progress: true
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/Checkout@v7
@@ -297,6 +483,9 @@ jobs:
     # Needs the game module job: if the game module doesn't build, the Linux binary is useless.
     needs: [changes, game]
     if: needs.changes.outputs.game == 'true'
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-linux
+      cancel-in-progress: true
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/Checkout@v7
@@ -368,14 +557,54 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+  # Whether a newer run of the branch is already building Android: this run's Android build starts only once the game
+  # module has built, so it could otherwise start after the newer one's and cancel it (their concurrency group).
+  android-check:
+    name: Android check
+    needs: [changes, host, game]
+    if: always() && needs.changes.outputs.android == 'true' && needs.game.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+    outputs:
+      newer: ${{ steps.check.outputs.newer }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs" -f branch="$BUILD_BRANCH" \
+            -f per_page=30 --jq '.workflow_runs[]
+              | select(if env.GITHUB_EVENT_NAME == "pull_request"
+                       then .event == "pull_request" and .head_repository.full_name == env.BUILD_HEAD_REPO
+                       else .event == "push" or .event == "workflow_dispatch" end)
+              | select(.run_number > (env.GITHUB_RUN_NUMBER | tonumber)) | .id' || true)
+          for id in $runs; do
+            state=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs?per_page=100" \
+              --jq '.jobs[] | select(.name == "Android") | "\(.status) \(.conclusion)"' || true)
+            case "$state" in
+              "" | "completed skipped" | "completed cancelled") ;;
+              *)
+                echo "Run $id is newer and builds Android ($state): this run's Android build is skipped."
+                echo "newer=true" >> "$GITHUB_OUTPUT"
+                exit 0 ;;
+            esac
+          done
+          echo "No newer run builds Android."
+
   android:
     name: Android
     # The Vulkan host build's shader tools compile the SPIR-V the APK carries; on a change to platform/android alone
-    # the host isn't built, so this job builds the two tools itself. A failed host or game module stops it.
-    needs: [changes, host, game]
+    # the host isn't built, so this job builds the two tools itself. A failed host or game module stops it, and so
+    # does a newer run already building Android (Android check).
+    needs: [changes, host, game, android-check]
     if: >-
       always() && needs.changes.outputs.android == 'true' &&
-      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') &&
+      needs.android-check.outputs.newer != 'true'
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-android
+      cancel-in-progress: true
     runs-on: windows-2025
     env:
       LLVM_VERSION: '22.1.6'
@@ -482,6 +711,9 @@ jobs:
     # Also needs the game module job: if it doesn't build, the app is useless.
     needs: [changes, game]
     if: needs.changes.outputs.game == 'true'
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-macos
+      cancel-in-progress: true
     runs-on: macos-15
     env:
       # LLVM 19 (LLVM's own macOS package), and libc++ built from the same release.
@@ -577,6 +809,9 @@ jobs:
     name: Installer tests
     needs: changes
     if: needs.changes.outputs.installer == 'true'
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-installer
+      cancel-in-progress: true
     runs-on: windows-2025
     steps:
       - uses: actions/Checkout@v7
@@ -612,15 +847,35 @@ jobs:
           }
 
   # The one check to require before merging: it fails when the Windows build (host, game module, disc import tool and
-  # the test build put together from them) or the installer tests failed or were cancelled, and passes when they passed
-  # or were skipped. Linux, Android and macOS are still built and show their own checks, but don't block a merge: those
-  # ports aren't finished.
+  # the test build put together from them) or the installer tests failed, here or in the earlier run this one took them
+  # from (Earlier build), and passes when they passed or were skipped. When a newer run of the branch cancelled some of
+  # them, the run is cancelled instead. Linux, Android and macOS are still built and show their own checks, but don't
+  # block a merge: those ports aren't finished.
   result:
     name: Build result
     if: always()
-    needs: [changes, import, host, game, windows, installer]
+    needs: [changes, earlier, import, host, game, windows, installer]
     runs-on: ubuntu-24.04
+    permissions:
+      # Cancels this run when a newer one took part of it over.
+      actions: write
     steps:
       - name: Check
-        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
-        run: exit 1
+        if: >-
+          contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') ||
+          needs.earlier.outputs.superseded == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAILED: ${{ contains(needs.*.result, 'failure') }}
+        run: |
+          [ "$FAILED" = false ] || exit 1
+          # Not failed: cancelled, as the whole run was before a newer run cancelled only some of its jobs. Once its
+          # other jobs have finished, which the newer run may have left to it (an Android build).
+          echo "A newer run of this branch took part of this one over: it is cancelled once its other jobs finish."
+          while n=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
+                      --jq '[.jobs[] | select(.name != "Build result" and .status != "completed")] | length') &&
+                [ "$n" != 0 ]; do
+            sleep 60
+          done
+          gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/cancel" --silent && sleep 300
+          exit 1
