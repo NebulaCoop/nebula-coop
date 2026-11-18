@@ -183,6 +183,8 @@ add_library(galaxy_net STATIC
     runtime/src/net/link.cpp
     runtime/src/net/direct_transport.cpp
     runtime/src/net/stun.cpp
+    runtime/src/net/turn.cpp
+    runtime/src/net/digest.cpp
     runtime/src/net/json.cpp
     runtime/src/net/web.cpp
     runtime/src/net/web_win.cpp

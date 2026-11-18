@@ -58,6 +58,7 @@ const char* net_error_text(NetError error) noexcept {
 struct DirectTransport::Remote {
     Address address;
     PeerId id = kNoPeer;
+    std::string identity;  // a relayed joiner's own address (the host's punch for it said), else empty
     Link link;
     std::uint64_t join_nonce = 0u;  // the hello it joined with
     Clock::time_point last_heard{};
@@ -74,7 +75,12 @@ struct DirectTransport::Remote {
           }) {}
 };
 
-DirectTransport::DirectTransport() : random_(std::random_device{}()) {}
+DirectTransport::DirectTransport()
+    : relay_([this](const Address& to, std::span<const std::uint8_t> datagram) {
+          if (loss_ > 0.0 && std::uniform_real_distribution<double>(0.0, 1.0)(random_) < loss_) return;
+          (void)socket_.send_to(to, datagram);
+      }),
+      random_(std::random_device{}()) {}
 
 DirectTransport::~DirectTransport() { lobby_leave(); }
 
@@ -119,7 +125,7 @@ std::chrono::milliseconds DirectTransport::ping(PeerId peer) const noexcept {
 std::string DirectTransport::peer_identity(PeerId peer) const {
     if (!host_) return {};
     for (const auto& remote : remotes_) {
-        if (remote->id == peer) return remote->address.host_text();
+        if (remote->id == peer) return remote->identity.empty() ? remote->address.host_text() : remote->identity;
     }
     return {};
 }
@@ -133,7 +139,13 @@ void DirectTransport::send_raw(const Address& to, std::uint8_t type, std::span<c
     datagram[2] = kProtocol;
     datagram[3] = type;
     std::copy(body.begin(), body.end(), datagram.begin() + 4);
-    (void)socket_.send_to(to, std::span<const std::uint8_t>(datagram.data(), body.size() + 4u));
+    const std::span<const std::uint8_t> bytes(datagram.data(), body.size() + 4u);
+    // A joiner's datagrams to a host it reaches through its relay go by way of the relay.
+    if (relay_.routes(to)) {
+        (void)relay_.send(to, bytes);
+        return;
+    }
+    (void)socket_.send_to(to, bytes);
 }
 
 void DirectTransport::send_routed(Remote& remote, Channel channel, std::uint8_t kind, PeerId from, PeerId to,
@@ -188,12 +200,13 @@ bool DirectTransport::lobby_join(const JoinConfig& config) {
     }
     host_ = false;
     join_addresses_ = std::move(addresses);
-    join_timeout_ = config.timeout.count() > 0
-                        ? config.timeout
-                        : std::chrono::duration_cast<std::chrono::milliseconds>(kJoinTimeout);
     join_password_ = config.password;
     join_nonce_ = random_();
     join_started_ = Clock::now();
+    const auto timeout = config.timeout.count() > 0
+                             ? config.timeout
+                             : std::chrono::duration_cast<std::chrono::milliseconds>(kJoinTimeout);
+    join_deadline_ = join_started_ + timeout;
     join_last_hello_ = {};
     state_ = State::Joining;
     return true;
@@ -216,6 +229,8 @@ void DirectTransport::lobby_leave() {
 }
 
 void DirectTransport::close_now() {
+    // The relay's address goes back first (one datagram on the socket that's about to close).
+    relay_.stop();
     remotes_.clear();
     others_.clear();
     join_addresses_.clear();
@@ -301,15 +316,27 @@ void DirectTransport::update(std::chrono::milliseconds wait) {
     for (int i = 0; i < 4096 && state_ != State::Closed; ++i) {
         const std::ptrdiff_t size = socket_.receive_from(buffer, from);
         if (size < 0) break;
-        receive_datagram(std::span<const std::uint8_t>(buffer.data(), static_cast<std::size_t>(size)), from,
-                         Clock::now());
+        const std::span<const std::uint8_t> datagram(buffer.data(), static_cast<std::size_t>(size));
+        if (relay_.active()) {
+            // The relay's own answers, and what it passes on from the host.
+            Address peer;
+            std::span<const std::uint8_t> inner;
+            const turn::Client::Received got = relay_.receive(datagram, from, peer, inner, Clock::now());
+            if (got == turn::Client::Received::Handled) continue;
+            if (got == turn::Client::Received::Data) {
+                receive_datagram(inner, peer, Clock::now(), true);
+                continue;
+            }
+        }
+        receive_datagram(datagram, from, Clock::now());
     }
     if (state_ == State::Closed) return;
     const Clock::time_point now = Clock::now();
     update_discovery(now);
+    relay_.update(now);
     if (state_ == State::Preparing) return;
     if (state_ == State::Joining) {
-        if (now - join_started_ > join_timeout_) {
+        if (now > join_deadline_) {
             fail(NetError::LobbyNotFound);
             return;
         }
@@ -340,6 +367,36 @@ void DirectTransport::update(std::chrono::milliseconds wait) {
         drop(peer, false, error);
         if (state_ == State::Closed) return;
     }
+}
+
+bool DirectTransport::relay_through(std::string_view host, std::uint16_t port, std::string username,
+                                    std::string password) {
+    if (state_ != State::Joining || host_ || !socket_.is_open()) return false;
+    turn::Server server;
+    if (!resolve(host, port, server.address)) return false;
+    server.username = std::move(username);
+    server.password = std::move(password);
+    const Clock::time_point now = Clock::now();
+    relay_.start(std::move(server), now);
+    // The host's addresses may send through it (its punch comes from its public one, on whatever port its router
+    // gives toward the relay).
+    for (const Address& address : join_addresses_) relay_.permit(address);
+    join_deadline_ = std::max(join_deadline_, now + kRelayJoinFor);
+    return relay_.active();
+}
+
+Transport::RelayState DirectTransport::relay_state() const {
+    switch (relay_.state()) {
+    case turn::Client::State::Idle: return RelayState::Idle;
+    case turn::Client::State::Allocating: return RelayState::Allocating;
+    case turn::Client::State::Ready: return RelayState::Ready;
+    case turn::Client::State::Failed: return RelayState::Failed;
+    }
+    return RelayState::Idle;
+}
+
+bool DirectTransport::relayed() const {
+    return !host_ && state_ == State::Lobby && !remotes_.empty() && relay_.routes(remotes_.front()->address);
 }
 
 bool DirectTransport::is_join_address(const Address& address) const {
@@ -388,16 +445,17 @@ void DirectTransport::update_discovery(Clock::time_point now) {
     (void)socket_.send_to(stun_server_, stun::binding_request(stun_id_));
 }
 
-void DirectTransport::punch(const Address& joiner) {
+void DirectTransport::punch(const Address& joiner, std::string identity) {
     if (!host_ || state_ != State::Lobby || !joiner.valid() || find(joiner) != nullptr) return;
     const Clock::time_point now = Clock::now();
     for (Punch& punch : punches_) {
         if (punch.to == joiner) {
             punch.until = now + kPunchFor;
+            if (!identity.empty()) punch.identity = std::move(identity);
             return;
         }
     }
-    punches_.push_back({joiner, now + kPunchFor, {}});
+    punches_.push_back({joiner, now + kPunchFor, {}, std::move(identity)});
     update_punches(now);
 }
 
@@ -411,7 +469,7 @@ void DirectTransport::update_punches(Clock::time_point now) {
 }
 
 void DirectTransport::receive_datagram(std::span<const std::uint8_t> datagram, const Address& from,
-                                       Clock::time_point now) {
+                                       Clock::time_point now, bool relayed) {
     if (discovery_ != Discovery::Idle && stun::is_stun(datagram)) {
         // The first answer, or a host's later one (update_discovery): the address the router has for this socket now.
         Address mapped;
@@ -451,7 +509,16 @@ void DirectTransport::receive_datagram(std::span<const std::uint8_t> datagram, c
         if (reader.ok() && nonce == join_nonce_) fail(error);
         return;
     }
-    case kPunch: return;  // it opened a router on its way; nothing to do
+    case kPunch:
+        // Directly, it opened a router on its way; nothing to do. Through this joiner's relay, it's the host answering
+        // the relayed address NebulaNet gave it: the host is at `from` as the relay sees it, and the join's hellos go
+        // there now (on a channel of the relay's: 4 bytes a datagram).
+        if (relayed && state_ == State::Joining) {
+            relay_.bind(from);
+            if (!is_join_address(from)) join_addresses_.push_back(from);
+            join_last_hello_ = {};
+        }
+        return;
     default: break;
     }
     // The rest come from a member (the host, for a joiner) and carry its id, which must match its address.
@@ -528,6 +595,10 @@ void DirectTransport::receive_hello(std::span<const std::uint8_t> body, const Ad
         remotes_.push_back(std::make_unique<Remote>(*this, from, id));
         known = remotes_.back().get();
         known->join_nonce = nonce;
+        // A joiner through a relay: who it is, as NebulaNet told the punch toward the relay.
+        for (const Punch& punch : punches_) {
+            if (punch.to == from) known->identity = punch.identity;
+        }
         known->last_heard = now;
         known->last_ping = now;
         if (callbacks_.on_peer_joined) callbacks_.on_peer_joined(id);

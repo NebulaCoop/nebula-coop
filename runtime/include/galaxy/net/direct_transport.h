@@ -7,11 +7,17 @@
 // STUN server which public address its socket has (discover_public_address), NebulaNet swaps them, the host punches
 // toward the joiner (punch) while the joiner's hellos go to every address the host may have (JoinConfig's
 // alternates), and both routers let the other side in.
+//
+// When they don't (a strict router, mobile data, CGNAT), a joiner relays through a TURN server (relay_through,
+// galaxy/net/turn.h): the host punches toward the joiner's relayed address as toward any joiner's, the relay passes
+// that on, and from then on the joiner reaches the host through it. Only the joiner speaks TURN; to the host the
+// member's address is the relay's.
 #pragma once
 
 #include "galaxy/net/link.h"
 #include "galaxy/net/stun.h"
 #include "galaxy/net/transport.h"
+#include "galaxy/net/turn.h"
 #include "galaxy/net/udp.h"
 
 #include <memory>
@@ -37,6 +43,9 @@ public:
     // public address NebulaNet gives joiners would be a port that's gone. Asking keeps the mapping, and says when
     // it moved anyway (public_address changes).
     static constexpr std::chrono::seconds kStunRefreshEvery{15};
+    // A join that starts relaying tries at least this much longer: the relay's address has to reach the host through
+    // NebulaNet, and the host's punch the joiner through the relay.
+    static constexpr std::chrono::seconds kRelayJoinFor{15};
 
     // Where asking a STUN server is.
     enum class Discovery : std::uint8_t { Idle, Asking, Found, Failed };
@@ -76,10 +85,16 @@ public:
     [[nodiscard]] Address public_address() const override { return public_address_; }
     // A host's: sends a few datagrams to `joiner` for kPunchFor, so this host's router lets that joiner's hellos in
     // (its own hellos open the joiner's router). Ends early once the joiner is a member.
-    void punch(const Address& joiner) override;
+    void punch(const Address& joiner, std::string identity = {}) override;
     // Opens the socket a join will use (both IPv4 and IPv6 where the system can) so a STUN server can be asked from
     // it first; lobby_join then keeps it.
     bool open_for_join() override;
+    // Relays through a TURN server (Transport's). Blocks while the server's name is looked up. The join's time is
+    // stretched to at least kRelayJoinFor from now.
+    bool relay_through(std::string_view host, std::uint16_t port, std::string username, std::string password) override;
+    [[nodiscard]] RelayState relay_state() const override;
+    [[nodiscard]] Address relayed_address() const override { return relay_.relayed_address(); }
+    [[nodiscard]] bool relayed() const override;
 
     // Tests: drop this share (0 to 1) of the datagrams sent, at random.
     void set_test_loss(double share) noexcept { loss_ = share; }
@@ -95,7 +110,9 @@ private:
     void send_raw(const Address& to, std::uint8_t type, std::span<const std::uint8_t> body);
     void send_routed(Remote& remote, Channel channel, std::uint8_t kind, PeerId from, PeerId to,
                      std::span<const std::uint8_t> data);
-    void receive_datagram(std::span<const std::uint8_t> datagram, const Address& from, Clock::time_point now);
+    // `relayed`: it came through this joiner's TURN relay, from `from`.
+    void receive_datagram(std::span<const std::uint8_t> datagram, const Address& from, Clock::time_point now,
+                          bool relayed = false);
     void receive_hello(std::span<const std::uint8_t> body, const Address& from, Clock::time_point now);
     void receive_welcome(std::span<const std::uint8_t> body, const Address& from, Clock::time_point now);
     void receive_message(Remote& remote, const LinkMessage& message);
@@ -120,7 +137,7 @@ private:
     // Joining: the addresses tried (the first is the one asked for), the nonce the host answers with, and when it
     // began.
     std::vector<Address> join_addresses_;
-    std::chrono::milliseconds join_timeout_{kJoinTimeout};
+    Clock::time_point join_deadline_{};
     std::uint64_t join_nonce_ = 0u;
     std::string join_password_;
     Clock::time_point join_started_{};
@@ -138,8 +155,11 @@ private:
         Address to;
         Clock::time_point until{};
         Clock::time_point last{};
+        std::string identity;  // who joins from `to` when it's a relay's address
     };
     std::vector<Punch> punches_;
+    // A joiner's TURN relay, on the join's socket.
+    turn::Client relay_;
     std::mt19937_64 random_;
     double loss_ = 0.0;
 };

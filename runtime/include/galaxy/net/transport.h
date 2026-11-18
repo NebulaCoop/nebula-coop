@@ -134,8 +134,28 @@ public:
     [[nodiscard]] virtual bool discovering() const noexcept { return false; }
     // The answer (invalid when there was none).
     [[nodiscard]] virtual Address public_address() const { return {}; }
-    // A host's: opens its router to a joiner at `address` for a while.
-    virtual void punch(const Address& address) { (void)address; }
+    // A host's: opens its router to a joiner at `address` for a while. `identity`: who the joiner is when `address`
+    // isn't its own (a TURN relay's, NebulaNet's "via"): peer_identity gives it for the member that joins from there.
+    virtual void punch(const Address& address, std::string identity = {}) {
+        (void)address;
+        (void)identity;
+    }
+    // A joiner's, while it joins: relays through the TURN server `host`:`port` (galaxy/net/turn.h) with NebulaNet's
+    // credentials, for a host its hellos don't reach. The host then punches toward relayed_address() (NebulaNet tells
+    // it) and the join carries on through the relay. False when it can't (not joining, the name didn't resolve).
+    virtual bool relay_through(std::string_view host, std::uint16_t port, std::string username, std::string password) {
+        (void)host;
+        (void)port;
+        (void)username;
+        (void)password;
+        return false;
+    }
+    // Where relaying is: Idle (never asked), Allocating, Ready (relayed_address()), Failed.
+    enum class RelayState : std::uint8_t { Idle, Allocating, Ready, Failed };
+    [[nodiscard]] virtual RelayState relay_state() const { return RelayState::Idle; }
+    [[nodiscard]] virtual Address relayed_address() const { return {}; }
+    // A joiner's: whether its lobby goes through the relay.
+    [[nodiscard]] virtual bool relayed() const { return false; }
 
     // A host's: who the member is beyond this lobby, what bans and moderators are kept by (sm64coopdx's get_id_str:
     // the direct transport's is the member's IP address). Empty when unknown.

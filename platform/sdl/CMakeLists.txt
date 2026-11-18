@@ -221,6 +221,8 @@ add_library(galaxy_render_vk STATIC
     ${rt}/net/link.cpp
     ${rt}/net/direct_transport.cpp
     ${rt}/net/stun.cpp
+    ${rt}/net/turn.cpp
+    ${rt}/net/digest.cpp
     ${rt}/net/json.cpp
     ${rt}/net/web.cpp
     ${rt}/net/web_win.cpp

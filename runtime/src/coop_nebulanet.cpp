@@ -231,6 +231,11 @@ void NebulaNetLink::host(std::string server, NebulaNetRoom room) {
                             NebulaNetEvent event;
                             event.kind = NebulaNetEvent::Kind::Joiner;
                             event.candidates = valid_candidates(message->strings("candidates"));
+                            const net::json::Value* relay = message->find("relay");
+                            event.relay = relay != nullptr && relay->kind == net::json::Value::Kind::Bool &&
+                                          relay->boolean;
+                            event.via = message->text("via");
+                            if (event.via.size() > 64u) event.via.clear();
                             if (!event.candidates.empty()) shared->push(std::move(event));
                         } else if (type == "joiner_failed") {
                             NebulaNetEvent event;
@@ -327,6 +332,60 @@ void NebulaNetLink::join(std::string server, std::string code, std::vector<std::
     }).detach();
 }
 
+void NebulaNetLink::relay(std::string server, std::string code, std::string password) {
+    stop();
+    shared_ = std::make_shared<Shared>();
+    std::thread([shared = shared_, web = web_, server = std::move(server), code = std::move(code),
+                 password = std::move(password)] {
+        NebulaNetEvent event;
+        event.kind = NebulaNetEvent::Kind::Relays;
+        if (!web) {
+            event.text = "NEBULANET ISN'T AVAILABLE ON THIS SYSTEM";
+            shared->push(std::move(event));
+            return;
+        }
+        const std::string body = "{\"code\":" + net::json::quote(code) + ",\"password\":" + net::json::quote(password) +
+                                 ",\"protocol\":" + std::to_string(kNebulaNetProtocol) + "}";
+        const net::WebAnswer answer = web->post(server_url(server, "/v1/relay"), body);
+        if (shared->stopped.load()) return;
+        const std::optional<net::json::Value> json = net::json::parse(answer.body);
+        const net::json::Value* turn = json ? json->find("turn") : nullptr;
+        if (answer.status == 200 && turn != nullptr && turn->kind == net::json::Value::Kind::Array) {
+            for (const net::json::Value& item : turn->array) {
+                if (item.kind != net::json::Value::Kind::Object) continue;
+                NebulaNetRelay relay;
+                relay.host = item.text("host");
+                const long long port = item.integer("port", 0);
+                relay.username = item.text("username");
+                relay.password = item.text("password");
+                if (relay.host.empty() || port <= 0 || port > 65535 || relay.username.empty()) continue;
+                relay.port = static_cast<std::uint16_t>(port);
+                if (event.relays.size() < 4u) event.relays.push_back(std::move(relay));
+            }
+        }
+        if (event.relays.empty()) {
+            event.text = answer.status == 0     ? "NEBULANET COULD NOT BE REACHED"
+                         : answer.status == 503 ? "NEBULANET HAS NO RELAY FREE"
+                         : answer.status == 404 ? "THIS NEBULANET HAS NO RELAYS"
+                         : answer.status == 429 ? "NEBULANET IS BUSY"
+                                                : "NEBULANET ANSWERED " + std::to_string(answer.status);
+        }
+        shared->push(std::move(event));
+    }).detach();
+}
+
+void NebulaNetLink::tell_relay(std::shared_ptr<net::Web> web, std::string server, std::string code,
+                               std::string password, std::string address) {
+    if (!web || code.empty() || address.empty()) return;
+    std::thread([web = std::move(web), server = std::move(server), code = std::move(code),
+                 password = std::move(password), address = std::move(address)] {
+        const std::string body = "{\"code\":" + net::json::quote(code) + ",\"password\":" + net::json::quote(password) +
+                                 ",\"protocol\":" + std::to_string(kNebulaNetProtocol) +
+                                 ",\"relay\":" + net::json::quote(address) + "}";
+        (void)web->post(server_url(server, "/v1/relay"), body);
+    }).detach();
+}
+
 void NebulaNetLink::list(std::string server, std::string password) {
     stop();
     shared_ = std::make_shared<Shared>();
@@ -361,11 +420,12 @@ void NebulaNetLink::list(std::string server, std::string password) {
 }
 
 void NebulaNetLink::report(std::shared_ptr<net::Web> web, std::string server, std::string code, bool ok,
-                           std::vector<std::string> candidates) {
+                           std::vector<std::string> candidates, bool relayed) {
     if (!web || code.empty()) return;
     std::thread([web = std::move(web), server = std::move(server), code = std::move(code), ok,
-                 candidates = std::move(candidates)] {
+                 candidates = std::move(candidates), relayed] {
         std::string body = "{\"code\":" + net::json::quote(code) + ",\"ok\":" + (ok ? "true" : "false");
+        if (relayed) body += ",\"relayed\":true";
         if (!candidates.empty()) body += ",\"candidates\":" + candidates_json(candidates);
         body += "}";
         (void)web->post(server_url(server, "/v1/report"), body);

@@ -47,6 +47,9 @@ constexpr auto kJoinRequestTimeout = std::chrono::seconds(15);
 constexpr auto kJoinTimeout = std::chrono::seconds(25);
 // How long a join by room code tries the host's addresses (punching through takes a few seconds on most routers).
 constexpr auto kNatJoinTimeout = std::chrono::milliseconds(18000);
+// A join by room code that hears nothing back this long asks NebulaNet for a TURN relay (most routers that let a
+// punch through at all do it within a second or two). The join then gets DirectTransport::kRelayJoinFor more.
+constexpr auto kRelayAfter = std::chrono::seconds(5);
 // A refused joiner stays this long so the refusal reaches it before the host removes it.
 constexpr auto kRefuseLinger = std::chrono::seconds(1);
 constexpr auto kTick = std::chrono::milliseconds(2);
@@ -220,7 +223,12 @@ struct Session::State {
     std::shared_ptr<net::Web> web;
     bool web_set = false;
     std::unique_ptr<NebulaNetLink> nebulanet;
-    enum class Nat : std::uint8_t { None, HostDiscovering, HostListed, JoinDiscovering, JoinAsking };
+    // A joiner's after the answer: JoinDirect (punching through; a relay is asked for at relay_at), RelayAsking
+    // (NebulaNet), RelayAllocating (the TURN server), RelayTold (the host knows the relayed address).
+    enum class Nat : std::uint8_t {
+        None, HostDiscovering, HostListed, JoinDiscovering, JoinAsking, JoinDirect, RelayAsking, RelayAllocating,
+        RelayTold,
+    };
     Nat nat = Nat::None;
     std::string room_code;
     std::size_t listed_players = 0u;
@@ -235,6 +243,10 @@ struct Session::State {
     std::string report_code;
     std::string report_server;
     std::vector<std::string> report_candidates;
+    // A joiner's relay: when to ask for one, the TURN servers not tried yet, and whether one was tried at all.
+    Clock::time_point relay_at{};
+    std::vector<NebulaNetRelay> relays_left;
+    bool relay_tried = false;
     // The name this player asked for (cleaned), which the room may have numbered: set_name only acts when it changes.
     std::string wanted_name;
 
@@ -275,8 +287,10 @@ struct Session::State {
     // Tells NebulaNet how a join by code went, once: the host reached (ok), or not.
     void report_join(bool ok) {
         if (report_code.empty()) return;
+        const bool relayed = ok && transport->relayed();
+        if (relayed) std::fprintf(stderr, "[coop] joined through the relay\n");
         NebulaNetLink::report(the_web(), std::move(report_server), std::move(report_code), ok,
-                              ok ? std::vector<std::string>{} : std::move(report_candidates));
+                              ok ? std::vector<std::string>{} : std::move(report_candidates), relayed);
         report_code.clear();
         report_server.clear();
         report_candidates.clear();
@@ -287,6 +301,8 @@ struct Session::State {
         report_code.clear();
         nebulanet.reset();
         nat = Nat::None;
+        relays_left.clear();
+        relay_tried = false;
         room_code.clear();
         if (transport->in_lobby() || state != SessionState::Idle) transport->lobby_leave();
         state = SessionState::Idle;
@@ -856,6 +872,9 @@ struct Session::State {
         if (error == net::NetError::LobbyNotFound && state == SessionState::Connecting) {
             why = report_code.empty()
                       ? "NO ANSWER FROM THE HOST. CHECK THE ADDRESS AND PORT, AND THAT THE HOST FORWARDED THAT UDP PORT"
+                  : relay_tried
+                      ? "NO ANSWER FROM THE HOST, EVEN THROUGH A RELAY. CHECK THE HOST IS STILL IN THE ROOM AND TRY "
+                        "AGAIN, OR THE HOST CAN FORWARD ITS UDP PORT FOR YOU TO JOIN BY ADDRESS"
                       : "NO ANSWER FROM THE HOST: YOUR ROUTERS DID NOT LET YOU REACH EACH OTHER. TRY AGAIN, OR THE HOST "
                         "CAN FORWARD ITS UDP PORT FOR YOU TO JOIN BY ADDRESS";
         }
@@ -941,11 +960,19 @@ struct Session::State {
                 } else if (news.kind == NebulaNetEvent::Kind::Joiner) {
                     std::string theirs;
                     for (const std::string& text : news.candidates) theirs += (theirs.empty() ? "" : ", ") + text;
-                    std::fprintf(stderr, "[coop] a player is joining by the room code from %s: punching through\n",
-                                 theirs.c_str());
+                    if (news.relay) {
+                        // A joiner that couldn't punch through, on a TURN relay: this host sends toward the relay,
+                        // which its router lets back in like any answer. Bans go by the joiner's own address.
+                        std::fprintf(stderr, "[coop] a player is joining through a relay at %s (from %s)\n",
+                                     theirs.c_str(), news.via.empty() ? "an unknown address" : news.via.c_str());
+                    } else {
+                        std::fprintf(stderr, "[coop] a player is joining by the room code from %s: punching through\n",
+                                     theirs.c_str());
+                    }
                     for (const std::string& text : news.candidates) {
                         net::Address address;
-                        if (parse_candidate(text, address)) transport->punch(address);
+                        if (!parse_candidate(text, address)) continue;
+                        transport->punch(address, news.relay ? news.via : std::string());
                     }
                 } else if (news.kind == NebulaNetEvent::Kind::Failed) {
                     event(SessionEvent::Kind::NebulaNetLost, {}, news.text);
@@ -1017,17 +1044,100 @@ struct Session::State {
                 lobby.timeout = kNatJoinTimeout;
                 report_code = join_config.code;
                 report_server = join_config.nebulanet;
-                nebulanet.reset();
-                nat = Nat::None;
+                nat = Nat::JoinDirect;
                 join_started = Clock::now();
                 reach_started = join_started;
                 reach_limit = kNatJoinTimeout;
+                relay_at = join_started + kRelayAfter;
+                relay_tried = false;
                 (void)transport->lobby_join(lobby);  // a failure ends the join through on_error
                 return;
             }
             return;
+        case Nat::JoinDirect:
+        case Nat::RelayAsking:
+        case Nat::RelayAllocating:
+        case Nat::RelayTold: tick_relay(); return;
         case Nat::None: return;
         }
+    }
+
+    // A joiner by room code after NebulaNet's answer: punching through, and when that hears nothing, a TURN relay
+    // (galaxy/net/turn.h). The transport's join goes on all along; this only adds the relay to it.
+    void tick_relay() {
+        if (transport->in_lobby() || state != SessionState::Connecting) {
+            nebulanet.reset();
+            nat = Nat::None;
+            return;
+        }
+        switch (nat) {
+        case Nat::JoinDirect:
+            if (Clock::now() < relay_at) return;
+            std::fprintf(stderr, "[coop] no answer from the host's addresses yet: asking NebulaNet for a relay\n");
+            nebulanet->relay(join_config.nebulanet, join_config.code, join_config.password);
+            nat = Nat::RelayAsking;
+            return;
+        case Nat::RelayAsking:
+            for (NebulaNetEvent& news : nebulanet->take_events()) {
+                if (news.kind != NebulaNetEvent::Kind::Relays) continue;
+                if (news.relays.empty()) {
+                    // Punching through goes on until the join's time is up.
+                    std::fprintf(stderr, "[coop] no relay: %s\n", news.text.c_str());
+                    nebulanet.reset();
+                    nat = Nat::None;
+                    return;
+                }
+                relays_left = std::move(news.relays);
+                try_next_relay();
+                return;
+            }
+            return;
+        case Nat::RelayAllocating:
+            switch (transport->relay_state()) {
+            case net::Transport::RelayState::Ready: {
+                const std::string address = candidate_text(transport->relayed_address());
+                std::fprintf(stderr, "[coop] relaying through %s: telling the host\n", address.c_str());
+                NebulaNetLink::tell_relay(the_web(), join_config.nebulanet, join_config.code, join_config.password,
+                                          address);
+                nat = Nat::RelayTold;
+                return;
+            }
+            case net::Transport::RelayState::Failed:
+            case net::Transport::RelayState::Idle:
+                try_next_relay();
+                return;
+            case net::Transport::RelayState::Allocating: return;
+            }
+            return;
+        default: return;
+        }
+    }
+
+    // The next TURN server NebulaNet handed out; none left: punching through goes on alone.
+    void try_next_relay() {
+        while (!relays_left.empty()) {
+            const NebulaNetRelay relay = relays_left.front();
+            relays_left.erase(relays_left.begin());
+            if (!transport->relay_through(relay.host, relay.port, relay.username, relay.password)) {
+                std::fprintf(stderr, "[coop] the relay %s:%u could not be used\n", relay.host.c_str(),
+                             static_cast<unsigned>(relay.port));
+                continue;
+            }
+            relay_tried = true;
+            // The transport tries at least kRelayJoinFor more: the join's limits (and its seconds on screen) follow.
+            const Clock::time_point until = Clock::now() + net::DirectTransport::kRelayJoinFor;
+            const Clock::time_point was = reach_started + reach_limit;
+            if (until > was) {
+                const auto more = std::chrono::duration_cast<std::chrono::milliseconds>(until - was);
+                reach_limit += more;
+                join_started += more;
+            }
+            nat = Nat::RelayAllocating;
+            return;
+        }
+        std::fprintf(stderr, "[coop] no relay could be used: punching through goes on\n");
+        nebulanet.reset();
+        nat = Nat::None;
     }
 
     void tick() {
@@ -1419,7 +1529,8 @@ JoinWait Session::join_wait() const {
     if (join_step() != JoinStep::Reaching || state_->reach_limit.count() <= 0) return {};
     const auto waited =
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - state_->reach_started);
-    return {std::min(waited, state_->reach_limit), state_->reach_limit};
+    const bool relaying = state_->nat == State::Nat::RelayAllocating || state_->nat == State::Nat::RelayTold;
+    return {std::min(waited, state_->reach_limit), state_->reach_limit, relaying};
 }
 
 DownloadProgress Session::download_progress() const {

@@ -3189,9 +3189,12 @@ bool poll_coop_join() {
         const auto limit = std::chrono::duration_cast<std::chrono::seconds>(wait.limit).count();
         std::string detail;
         if (limit > 0 && waited >= 3) {
-            detail = "NO ANSWER YET: TRYING FOR " + std::to_string(waited) + " OF " + std::to_string(limit) + " SECONDS";
+            detail = (wait.relaying ? "TRYING FOR " : "NO ANSWER YET: TRYING FOR ") + std::to_string(waited) + " OF " +
+                     std::to_string(limit) + " SECONDS";
         }
-        gCoopMenu.set_join_status("CONNECTING TO THE HOST...", std::move(detail), 10u);
+        // A join that heard nothing back tries a relay too (NebulaNet's TURN servers).
+        gCoopMenu.set_join_status(wait.relaying ? "CONNECTING THROUGH A RELAY..." : "CONNECTING TO THE HOST...",
+                                  std::move(detail), wait.relaying ? 20u : 10u);
         break;
     }
     case Step::Asking: gCoopMenu.set_join_status("WAITING FOR THE HOST TO LET YOU IN...", {}, 30u); break;
