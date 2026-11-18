@@ -425,7 +425,9 @@ if(ANDROID)
         ${rt}/dolphin_pack.cpp
         ${rt}/asset_store.cpp
         ${rt}/atomic_file.cpp)
-    target_include_directories(nebula_mods PRIVATE "${nebula_root}/runtime/include" "${nebula_root}/native/include")
+    # The generated folder: mods.cpp includes the built-in mods' nebula_builtin_mods.inc, written above for main.
+    target_include_directories(nebula_mods PRIVATE "${nebula_root}/runtime/include" "${nebula_root}/native/include"
+        "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_link_libraries(nebula_mods PRIVATE nebula_archive log dl)
     target_link_options(nebula_mods PRIVATE "-Wl,--gc-sections")
 endif()
