@@ -421,6 +421,10 @@ jobs:
           clone KhronosGroup/glslang "$GLSLANG_TAG" glslang-src
           pin KhronosGroup/SPIRV-Tools "$SPIRV_TOOLS_COMMIT" glslang-src/External/spirv-tools
           pin KhronosGroup/SPIRV-Headers "$SPIRV_HEADERS_COMMIT" glslang-src/External/spirv-tools/external/spirv-headers
+          # arm64's driver loader (platform/sdl/CMakeLists.txt NEBULA_ADRENOTOOLS_DIR), at tools/fetch_build_deps.sh's
+          # revisions: libadrenotools with liblinkernsbypass in its lib/linkernsbypass.
+          pin bylaws/libadrenotools 8fae8ce254dfc1344527e05301e43f37dea2df80 libadrenotools-8fae8ce
+          pin bylaws/liblinkernsbypass aa3975893d83ef1bc84c321ec60c65fbf1287887 libadrenotools-8fae8ce/lib/linkernsbypass
       - if: needs.host.result == 'success'
         uses: actions/download-artifact@v8
         with:
