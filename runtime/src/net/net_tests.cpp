@@ -280,6 +280,20 @@ void test_transport_nat() {
                stun.asked >= 1,
            "and learns it from the server's answer");
 
+    // While the lobby is open it asks again (keeping its router's mapping), and follows a mapping that moved.
+    host.set_test_stun_refresh(50ms);
+    const int asked_once = stun.asked;
+    const std::uint8_t moved_ip[4] = {198u, 51u, 100u, 8u};
+    stun.reported = make_address(moved_ip, 61001u);
+    const Clock::time_point refreshing = Clock::now() + 3s;
+    while (Clock::now() < refreshing && host.public_address() != stun.reported) {
+        stun.serve();
+        host.update(1ms);
+    }
+    expect(stun.asked > asked_once && host.public_address() == stun.reported &&
+               host.discovery() == DirectTransport::Discovery::Found && !host.discovering(),
+           "a host asks its STUN server again while it waits, and takes the router's new address");
+
     // No server there: it gives up.
     UdpSocket silent;
     expect(silent.open(0u, false), "a silent port opens");
@@ -1207,6 +1221,13 @@ public:
                                             message->text("name"), message->text("mode"), everyone};
                 ++server_.opened;
                 push(std::string(R"({"t":"room","code":"K7QX2M","public":)") + (everyone ? "true" : "false") + "}");
+            } else if (message && message->text("t") == "update" && message->find("candidates") != nullptr) {
+                // The host's router moved its public address: joiners from now on get the new one.
+                const std::lock_guard<std::mutex> lock(server_.lock_);
+                for (auto& [code, room] : server_.rooms_) {
+                    if (room.host == this) room.candidates = message->strings("candidates");
+                }
+                ++server_.moved;
             }
             return true;
         }
@@ -1286,7 +1307,14 @@ public:
         if (url.find("/v1/host") == std::string::npos) return nullptr;
         return std::make_unique<Socket>(*this);
     }
+    // What a joiner of `code` would be given as the host's addresses.
+    std::vector<std::string> candidates(const std::string& code) {
+        const std::lock_guard<std::mutex> lock(lock_);
+        const auto room = rooms_.find(code);
+        return room == rooms_.end() ? std::vector<std::string>{} : room->second.candidates;
+    }
     std::atomic<int> opened{0};
+    std::atomic<int> moved{0};
     std::atomic<int> reported_ok{0};
     std::atomic<int> reported_failed{0};
     // Keeps public rooms off the public list, as NebulaNet does past its limit for one address.
@@ -1509,6 +1537,55 @@ void test_session_nebulanet() {
     server.join();
 }
 
+// A host waiting for its friends keeps asking the STUN server (the router's mapping stays open), and when the router
+// moves its public address anyway, NebulaNet hears the new one: joiners aren't sent to a port that's gone.
+void test_session_nebulanet_moved() {
+    using namespace galaxy::coop;
+    using Kind = SessionEvent::Kind;
+    FakeStun stun;
+    expect(stun.socket.open(0u, false), "a STUN server opens");
+    const std::uint8_t first_ip[4] = {198u, 51u, 100u, 7u};
+    stun.reported = galaxy::net::make_address(first_ip, 61000u);
+    auto nebulanet = std::make_shared<FakeNebulaNet>();
+
+    auto transport = std::make_unique<galaxy::net::DirectTransport>();
+    transport->set_test_stun_refresh(100ms);
+    Session host_session(std::move(transport));
+    host_session.set_web(nebulanet);
+    HostConfig host;
+    host.port = 0u;
+    host.room.max_players = 3u;
+    host.game_version = "test 1";
+    host.name = "HOSTY";
+    host.save = [] { return RoomSave{}; };
+    host.nebulanet = "https://nebulanet.test/";
+    host.stun = "127.0.0.1";
+    host.stun_port = stun.socket.local_port();
+    expect(host_session.host(host), "a room opens on NebulaNet");
+    std::vector<SessionEvent> events;
+    expect(wait_for([&] {
+               stun.serve();
+               for (auto& e : host_session.take_events()) events.push_back(e);
+               return has_event(events, Kind::RoomCode);
+           }),
+           "and gets a room code");
+    const std::vector<std::string> listed = nebulanet->candidates("K7QX2M");
+    expect(!listed.empty() && listed.front() == "198.51.100.7:61000", "listed with its public address");
+
+    const int asked = stun.asked;
+    const std::uint8_t moved_ip[4] = {198u, 51u, 100u, 8u};
+    stun.reported = galaxy::net::make_address(moved_ip, 62000u);
+    expect(wait_for([&] {
+               stun.serve();
+               const auto now = nebulanet->candidates("K7QX2M");
+               return !now.empty() && now.front() == "198.51.100.8:62000";
+           }),
+           "the router moves it: NebulaNet is told the new address");
+    expect(stun.asked > asked && nebulanet->moved.load() >= 1 && nebulanet->opened.load() == 1,
+           "by an update on the same connection, after asking the STUN server again");
+    host_session.leave();
+}
+
 int main() {
     test_bytes();
     test_link_perfect_line();
@@ -1526,6 +1603,7 @@ int main() {
     test_web_parts();
     test_nebulanet_public();
     test_session_nebulanet();
+    test_session_nebulanet_moved();
     if (s_failures == 0) std::printf("net tests passed\n");
     return s_failures == 0 ? 0 : 1;
 }

@@ -221,6 +221,7 @@ void DirectTransport::close_now() {
     join_addresses_.clear();
     punches_.clear();
     discovery_ = Discovery::Idle;
+    stun_server_ = Address{};
     public_address_ = Address{};
     socket_.close();
     state_ = State::Closed;
@@ -349,6 +350,7 @@ bool DirectTransport::discover_public_address(std::string_view server, std::uint
     if (state_ == State::Closed || !socket_.is_open()) return false;
     Address address;
     if (!resolve(server, port, address)) {
+        stun_server_ = Address{};
         discovery_ = Discovery::Failed;
         return false;
     }
@@ -363,6 +365,18 @@ bool DirectTransport::discover_public_address(std::string_view server, std::uint
 }
 
 void DirectTransport::update_discovery(Clock::time_point now) {
+    if (discovery_ == Discovery::Found || discovery_ == Discovery::Failed) {
+        // A host's lobby: asking again keeps its router's mapping open while it waits for joiners (kStunRefreshEvery),
+        // and finds the new one if the router moved it. A new transaction each time, so a late answer to an old one
+        // can't be taken for it.
+        if (!host_ || state_ != State::Lobby || !stun_server_.valid()) return;
+        if (now - discovery_last_ask_ < stun_refresh_every_) return;
+        discovery_last_ask_ = now;
+        for (auto& byte : stun_id_) byte = static_cast<std::uint8_t>(random_());
+        if (loss_ > 0.0 && std::uniform_real_distribution<double>(0.0, 1.0)(random_) < loss_) return;
+        (void)socket_.send_to(stun_server_, stun::binding_request(stun_id_));
+        return;
+    }
     if (discovery_ != Discovery::Asking) return;
     if (now - discovery_started_ > kDiscoveryTimeout) {
         discovery_ = Discovery::Failed;
@@ -398,7 +412,8 @@ void DirectTransport::update_punches(Clock::time_point now) {
 
 void DirectTransport::receive_datagram(std::span<const std::uint8_t> datagram, const Address& from,
                                        Clock::time_point now) {
-    if (discovery_ == Discovery::Asking && stun::is_stun(datagram)) {
+    if (discovery_ != Discovery::Idle && stun::is_stun(datagram)) {
+        // The first answer, or a host's later one (update_discovery): the address the router has for this socket now.
         Address mapped;
         if (from == stun_server_ && stun::parse_binding_response(datagram, stun_id_, mapped)) {
             public_address_ = mapped;

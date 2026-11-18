@@ -27,6 +27,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -176,6 +177,13 @@ enum class JoinStep : std::uint8_t {
     FindingRoom,      // asking NebulaNet where the room of its code is
 };
 
+// While a joiner reaches the host (JoinStep::Reaching): how long it has tried, and how long it tries before it gives
+// up with JoinFailed. Room codes try longer than addresses: punching through two routers takes a few seconds.
+struct JoinWait {
+    std::chrono::milliseconds waited{0};
+    std::chrono::milliseconds limit{0};
+};
+
 // A joiner's download of the room's mods.
 struct DownloadProgress {
     bool active = false;
@@ -251,6 +259,8 @@ public:
     [[nodiscard]] std::optional<RoomSave> take_room_save();
     // While a joiner connects: what it waits for.
     [[nodiscard]] JoinStep join_step() const;
+    // While a joiner reaches the host: for how long, out of how long (zeros at any other step).
+    [[nodiscard]] JoinWait join_wait() const;
     // While a joiner downloads the room's mods: how far.
     [[nodiscard]] DownloadProgress download_progress() const;
     // Once, after ModsReady: the room's mods, in its order, each with its folder here.

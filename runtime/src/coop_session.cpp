@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <map>
 #include <utility>
@@ -223,6 +224,12 @@ struct Session::State {
     Nat nat = Nat::None;
     std::string room_code;
     std::size_t listed_players = 0u;
+    // The public address a host's room was listed with: when its router moves it (the transport asks the STUN server
+    // again as the room waits), NebulaNet is told the new one, so joiners aren't sent to a port that's gone.
+    net::Address listed_outside;
+    // A joiner reaching the host's lobby: since when, and for how long it tries (join_wait).
+    Clock::time_point reach_started{};
+    std::chrono::milliseconds reach_limit{0};
     // A joiner's join by code, until it's told NebulaNet how it went (CoopNet's PEER_FAILED): the code, the server and
     // this player's addresses.
     std::string report_code;
@@ -845,6 +852,13 @@ struct Session::State {
         // say so, as the host closing the room says it.
         if (error == net::NetError::PeerFailed && state == SessionState::Joined) why = "the host stopped answering";
         for (char& c : why) c = static_cast<char>(c >= 'a' && c <= 'z' ? c - 'a' + 'A' : c);
+        // Nothing came back from any of the host's addresses: say what that usually means, and what to try.
+        if (error == net::NetError::LobbyNotFound && state == SessionState::Connecting) {
+            why = report_code.empty()
+                      ? "NO ANSWER FROM THE HOST. CHECK THE ADDRESS AND PORT, AND THAT THE HOST FORWARDED THAT UDP PORT"
+                      : "NO ANSWER FROM THE HOST: YOUR ROUTERS DID NOT LET YOU REACH EACH OTHER. TRY AGAIN, OR THE HOST "
+                        "CAN FORWARD ITS UDP PORT FOR YOU TO JOIN BY ADDRESS";
+        }
         if (state == SessionState::Connecting) {
             report_join(false);
             end(SessionEvent::Kind::JoinFailed, std::move(why));
@@ -902,11 +916,18 @@ struct Session::State {
             listing.max = room.max_players;
             listing.candidates = own_candidates();
             listed_players = players.size();
+            listed_outside = transport->public_address();
             if (listing.candidates.empty()) {
                 event(SessionEvent::Kind::NebulaNetLost, {}, "NEBULANET FOUND NO NETWORK: FRIENDS CAN JOIN BY ADDRESS");
                 nebulanet.reset();
                 nat = Nat::None;
                 return;
+            }
+            {
+                std::string mine;
+                for (const std::string& text : listing.candidates) mine += (mine.empty() ? "" : ", ") + text;
+                std::fprintf(stderr, "[coop] the room's addresses for NebulaNet: %s%s\n", mine.c_str(),
+                             listed_outside.valid() ? "" : " (the STUN server did not answer)");
             }
             nebulanet->host(host_config.nebulanet, std::move(listing));
             nat = Nat::HostListed;
@@ -918,6 +939,10 @@ struct Session::State {
                     room_code = news.text;
                     event(SessionEvent::Kind::RoomCode, {}, news.text);
                 } else if (news.kind == NebulaNetEvent::Kind::Joiner) {
+                    std::string theirs;
+                    for (const std::string& text : news.candidates) theirs += (theirs.empty() ? "" : ", ") + text;
+                    std::fprintf(stderr, "[coop] a player is joining by the room code from %s: punching through\n",
+                                 theirs.c_str());
                     for (const std::string& text : news.candidates) {
                         net::Address address;
                         if (parse_candidate(text, address)) transport->punch(address);
@@ -926,10 +951,20 @@ struct Session::State {
                     event(SessionEvent::Kind::NebulaNetLost, {}, news.text);
                 }
                 // JoinerFailed: a joiner couldn't get through; its own game says so, and the host keeps going.
+                if (news.kind == NebulaNetEvent::Kind::JoinerFailed) {
+                    std::fprintf(stderr, "[coop] a player joining by the room code could not reach this room\n");
+                }
             }
             if (players.size() != listed_players) {
                 listed_players = players.size();
                 nebulanet->set_players(static_cast<unsigned>(listed_players));
+            }
+            if (const net::Address outside = transport->public_address(); outside.valid() && outside != listed_outside) {
+                std::fprintf(stderr, "[coop] the router moved this room's public address: %s, was %s\n",
+                             candidate_text(outside).c_str(),
+                             listed_outside.valid() ? candidate_text(listed_outside).c_str() : "none");
+                listed_outside = outside;
+                nebulanet->set_candidates(own_candidates());
             }
             return;
         case Nat::JoinDiscovering: {
@@ -939,6 +974,11 @@ struct Session::State {
                 end(SessionEvent::Kind::JoinFailed, "NO NETWORK TO REACH NEBULANET");
                 return;
             }
+            // For the log: a join that never gets an answer is easier to tell apart with the addresses it used.
+            std::string mine;
+            for (const std::string& text : candidates) mine += (mine.empty() ? "" : ", ") + text;
+            std::fprintf(stderr, "[coop] this player's addresses for NebulaNet: %s%s\n", mine.c_str(),
+                         transport->public_address().valid() ? "" : " (the STUN server did not answer)");
             report_candidates = candidates;
             nebulanet->join(join_config.nebulanet, join_config.code, std::move(candidates), join_config.password);
             nat = Nat::JoinAsking;
@@ -968,6 +1008,11 @@ struct Session::State {
                         lobby.alternates.push_back({address.host_text(), address.port()});
                     }
                 }
+                {
+                    std::string theirs;
+                    for (const std::string& text : news.room.candidates) theirs += (theirs.empty() ? "" : ", ") + text;
+                    std::fprintf(stderr, "[coop] the host's addresses: %s\n", theirs.c_str());
+                }
                 lobby.password = join_config.password;
                 lobby.timeout = kNatJoinTimeout;
                 report_code = join_config.code;
@@ -975,6 +1020,8 @@ struct Session::State {
                 nebulanet.reset();
                 nat = Nat::None;
                 join_started = Clock::now();
+                reach_started = join_started;
+                reach_limit = kNatJoinTimeout;
                 (void)transport->lobby_join(lobby);  // a failure ends the join through on_error
                 return;
             }
@@ -1136,6 +1183,8 @@ bool Session::join(JoinConfig config) {
         }
         net::JoinConfig lobby{state_->join_config.address, state_->join_config.port, state_->join_config.password, {},
                               {}};
+        state_->reach_started = state_->join_started;
+        state_->reach_limit = std::chrono::duration_cast<std::chrono::milliseconds>(net::DirectTransport::kJoinTimeout);
         if (!state_->transport->lobby_join(lobby)) {
             // on_error already told why (JoinFailed).
             state_->state = SessionState::Idle;
@@ -1363,6 +1412,14 @@ JoinStep Session::join_step() const {
     }
     if (state_->download && !state_->download->needed.empty()) return JoinStep::DownloadingMods;
     return state_->join_asked ? JoinStep::Asking : JoinStep::Reaching;
+}
+
+JoinWait Session::join_wait() const {
+    const std::lock_guard<std::recursive_mutex> lock(lock_);
+    if (join_step() != JoinStep::Reaching || state_->reach_limit.count() <= 0) return {};
+    const auto waited =
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - state_->reach_started);
+    return {std::min(waited, state_->reach_limit), state_->reach_limit};
 }
 
 DownloadProgress Session::download_progress() const {

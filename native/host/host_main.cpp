@@ -3182,7 +3182,18 @@ bool poll_coop_join() {
     using Step = galaxy::coop::JoinStep;
     switch (gCoopSession.join_step()) {
     case Step::FindingRoom: gCoopMenu.set_join_status("FINDING THE ROOM ON NEBULANET...", {}, 5u); break;
-    case Step::Reaching: gCoopMenu.set_join_status("CONNECTING TO THE HOST...", {}, 10u); break;
+    case Step::Reaching: {
+        // Its seconds, so a join the routers keep apart doesn't look frozen: it gives up with a reason at the limit.
+        const galaxy::coop::JoinWait wait = gCoopSession.join_wait();
+        const auto waited = std::chrono::duration_cast<std::chrono::seconds>(wait.waited).count();
+        const auto limit = std::chrono::duration_cast<std::chrono::seconds>(wait.limit).count();
+        std::string detail;
+        if (limit > 0 && waited >= 3) {
+            detail = "NO ANSWER YET: TRYING FOR " + std::to_string(waited) + " OF " + std::to_string(limit) + " SECONDS";
+        }
+        gCoopMenu.set_join_status("CONNECTING TO THE HOST...", std::move(detail), 10u);
+        break;
+    }
     case Step::Asking: gCoopMenu.set_join_status("WAITING FOR THE HOST TO LET YOU IN...", {}, 30u); break;
     case Step::DownloadingMods: {
         const galaxy::coop::DownloadProgress progress = gCoopSession.download_progress();
