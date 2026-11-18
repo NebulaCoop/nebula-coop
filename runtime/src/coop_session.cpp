@@ -828,6 +828,14 @@ struct Session::State {
                 joined.stage = known->stage;
                 joined.scenario = known->scenario;
                 joined.stars = known->stars;
+                // This player's own character and colours are what it last set: the host's echo of an older switch
+                // can still be on its way after a newer one, and the next switch starts from what this player has.
+                if (joined.local) {
+                    joined.character = known->character;
+                    joined.character_id = known->character_id;
+                    joined.has_palette = known->has_palette;
+                    joined.palette = known->palette;
+                }
                 const bool made_moderator = joined.local && joined.moderator && !known->moderator;
                 *known = joined;
                 if (made_moderator) event(SessionEvent::Kind::Moderator);
