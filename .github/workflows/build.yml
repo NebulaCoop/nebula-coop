@@ -377,6 +377,8 @@ jobs:
       always() && needs.changes.outputs.android == 'true' &&
       !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: windows-2025
+    env:
+      LLVM_VERSION: '22.1.6'
     steps:
       - uses: actions/Checkout@v7
       # The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake).
@@ -385,6 +387,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,x86_64-linux-android
+      - name: LLVM
+        # The game module's row generator runs on this machine and needs libclang 21 or later
+        # (tools/lumacore/instrument.py); the NDK has none and the runner's is 20. The Game module job's LLVM: the APK
+        # step names it in LLVM_ROOT, which native/CMakeLists.txt looks in first.
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o llvm.tar.xz \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/clang+llvm-$LLVM_VERSION-x86_64-pc-windows-msvc.tar.xz"
+          mkdir llvm
+          tar -xJf llvm.tar.xz -C llvm --strip-components=1
+          rm llvm.tar.xz
+          llvm/bin/clang --version
       - name: Android SDK
         run: |
           $sdkmanager = Join-Path $env:ANDROID_HOME 'cmdline-tools\latest\bin\sdkmanager.bat'
@@ -406,6 +421,10 @@ jobs:
           clone KhronosGroup/glslang "$GLSLANG_TAG" glslang-src
           pin KhronosGroup/SPIRV-Tools "$SPIRV_TOOLS_COMMIT" glslang-src/External/spirv-tools
           pin KhronosGroup/SPIRV-Headers "$SPIRV_HEADERS_COMMIT" glslang-src/External/spirv-tools/external/spirv-headers
+          # arm64's driver loader (platform/sdl/CMakeLists.txt NEBULA_ADRENOTOOLS_DIR), at tools/fetch_build_deps.sh's
+          # revisions: libadrenotools with liblinkernsbypass in its lib/linkernsbypass.
+          pin bylaws/libadrenotools 8fae8ce254dfc1344527e05301e43f37dea2df80 libadrenotools-8fae8ce
+          pin bylaws/liblinkernsbypass aa3975893d83ef1bc84c321ec60c65fbf1287887 libadrenotools-8fae8ce/lib/linkernsbypass
       - if: needs.host.result == 'success'
         uses: actions/download-artifact@v8
         with:
@@ -437,6 +456,7 @@ jobs:
         # Debug-signed: no -Signing.
         run: |
           $env:JAVA_HOME = $env:JAVA_HOME_17_X64
+          $env:LLVM_ROOT = Join-Path $env:RUNNER_TEMP 'llvm'
           .\platform\android\build_apk.ps1 -Deps "$PWD\deps" -Work "$PWD\build\android" -HostTools "$PWD\build\spirv-tools"
       - name: Logs
         if: failure()
