@@ -449,6 +449,12 @@ void Karikari::exePreCling() {
         return;
     }
 
+    // Nebula co-op: a cling no KarikariDirector place came with (none to go to) lets go instead.
+    if (mClingPosition == nullptr) {
+        setNerve(GET_NERVE(Karikari, HostTypeNrvRelease));
+        return;
+    }
+
     Vec3f toClingPos;
     f32 t = getNerveStep() / static_cast< f32 >(::sPreClingTime);
     mClingPosition->copyTrans(&toClingPos);
@@ -479,6 +485,12 @@ void Karikari::exeCling() {
     }
 
     if (tryPointerAttacked()) {
+        return;
+    }
+
+    // Nebula co-op: as in exePreCling.
+    if (mClingPosition == nullptr) {
+        setNerve(GET_NERVE(Karikari, HostTypeNrvRelease));
         return;
     }
 
@@ -965,7 +977,7 @@ void Karikari::tryTurnToDirection(const Vec3f& rDir, f32 turnRatio) {
 }
 
 void Karikari::calcAndSetBaseMtx() {
-    if (isNerve(GET_NERVE(Karikari, HostTypeNrvCling))) {
+    if (isNerve(GET_NERVE(Karikari, HostTypeNrvCling)) && mClingPosition != nullptr) {
         MR::setBaseTRMtx(this, mClingPosition->mMtx);
         return;
     }
