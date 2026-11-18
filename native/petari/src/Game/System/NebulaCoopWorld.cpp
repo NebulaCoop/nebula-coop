@@ -893,6 +893,29 @@ namespace {
         return reinterpret_cast< MtxPtr >(&MR::getModel(pActor)->mBaseTransformMtx);
     }
 
+    // Nerves that hold a game's own player, which only that game's code may set: a Karikari clings after
+    // KarikariDirector gives it a place on that game's player (its mClingPosition), so another game's copy put in one
+    // reads no place (a crash at smg_game_plain.dll+0x2a7af1 in v1.0.4), or the place it last had on this game's
+    // player. And one clinging to this game's player stays on until this game's code takes it off (unregistering it),
+    // or the director would count it holding the player still.
+    const u32 cHoldingNerves[] = {
+        NebulaNerves::hash("Karikari::HostTypeNrvPreCling"),
+        NebulaNerves::hash("Karikari::HostTypeNrvCling"),
+    };
+
+    bool isHoldingNerve(const Nerve* pNerve) {
+        if (pNerve == nullptr) {
+            return false;
+        }
+        const u32 id = pNerve->nebulaId();
+        for (u32 i = 0; i < sizeof(cHoldingNerves) / sizeof(cHoldingNerves[0]); i++) {
+            if (cHoldingNerves[i] == id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool isKnownClass(const Motion& rMotion, u32 nerveClass) {
         for (u8 i = 0; i < rMotion.mClassNum; i++) {
             if (rMotion.mClasses[i] == nerveClass) {
@@ -1051,6 +1074,10 @@ namespace {
         }
         const Nerve* pNerve = NebulaNerves::find(rState.nerve);
         if (pNerve == nullptr || !isKnownClass(rMotion, pNerve->nebulaClass())) {
+            return;
+        }
+        // Not one that holds a player (it is on the owner's player there), nor away from one that holds this game's.
+        if (isHoldingNerve(pNerve) || isHoldingNerve(pCurrent)) {
             return;
         }
         pActor->setNerve(pNerve);
