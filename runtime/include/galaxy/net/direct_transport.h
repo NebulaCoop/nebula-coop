@@ -32,6 +32,11 @@ public:
     // How long a STUN server has to answer, and how long a host punches toward one joiner.
     static constexpr std::chrono::seconds kDiscoveryTimeout{3};
     static constexpr std::chrono::seconds kPunchFor{20};
+    // How often a host asks its STUN server again while its lobby is open. A router forgets a quiet UDP mapping
+    // after a minute or two (some after 30 seconds), and a host waiting alone for its friends sends nothing: the
+    // public address NebulaNet gives joiners would be a port that's gone. Asking keeps the mapping, and says when
+    // it moved anyway (public_address changes).
+    static constexpr std::chrono::seconds kStunRefreshEvery{15};
 
     // Where asking a STUN server is.
     enum class Discovery : std::uint8_t { Idle, Asking, Found, Failed };
@@ -60,6 +65,8 @@ public:
 
     // Asks the STUN server at `server` (galaxy/net/stun.h), from the lobby's socket, which public address the
     // internet sees it at; update() goes on asking until it answers (public_address) or kDiscoveryTimeout passes.
+    // A host then asks again every kStunRefreshEvery for as long as its lobby is open (even after a failure), and
+    // public_address follows the answers.
     // False when there is no socket (no lobby being made or joined) or the server's name doesn't resolve. Blocks
     // while the name is looked up.
     bool discover_public_address(std::string_view server, std::uint16_t port = stun::kDefaultPort) override;
@@ -76,6 +83,8 @@ public:
 
     // Tests: drop this share (0 to 1) of the datagrams sent, at random.
     void set_test_loss(double share) noexcept { loss_ = share; }
+    // Tests: ask the STUN server again this often instead of kStunRefreshEvery.
+    void set_test_stun_refresh(std::chrono::milliseconds every) noexcept { stun_refresh_every_ = every; }
 
 private:
     enum class State { Closed, Preparing, Joining, Lobby };
@@ -123,6 +132,7 @@ private:
     Address public_address_;
     Clock::time_point discovery_started_{};
     Clock::time_point discovery_last_ask_{};
+    std::chrono::milliseconds stun_refresh_every_{kStunRefreshEvery};
     // A host's punches: toward whom, until when, and the last one sent.
     struct Punch {
         Address to;

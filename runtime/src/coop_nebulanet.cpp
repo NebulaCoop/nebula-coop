@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 namespace galaxy::coop {
@@ -107,6 +108,9 @@ struct NebulaNetLink::Shared {
     std::atomic<bool> stopped{false};
     std::atomic<unsigned> players{1u};
     std::shared_ptr<net::WebSocket> socket;  // a host's, while connected (stop() closes it)
+    // A host's addresses as set_candidates last gave them, and whether NebulaNet still has to hear them (under lock).
+    std::vector<std::string> candidates;
+    bool candidates_changed = false;
 
     void push(NebulaNetEvent event) {
         const std::lock_guard<std::mutex> guard(lock);
@@ -149,10 +153,18 @@ void NebulaNetLink::set_players(unsigned players) {
     if (shared_) shared_->players.store(std::max(players, 1u));
 }
 
+void NebulaNetLink::set_candidates(std::vector<std::string> candidates) {
+    if (!shared_ || candidates.empty()) return;
+    const std::lock_guard<std::mutex> guard(shared_->lock);
+    shared_->candidates = std::move(candidates);
+    shared_->candidates_changed = true;
+}
+
 void NebulaNetLink::host(std::string server, NebulaNetRoom room) {
     stop();
     shared_ = std::make_shared<Shared>();
     shared_->players.store(std::max(room.players, 1u));
+    shared_->candidates = room.candidates;
     std::thread([shared = shared_, web = web_, server = std::move(server), room = std::move(room)] {
         if (!web) {
             shared->fail("NEBULANET ISN'T AVAILABLE ON THIS SYSTEM");
@@ -172,6 +184,13 @@ void NebulaNetLink::host(std::string server, NebulaNetRoom room) {
                 }
                 if (shared->stopped.load()) socket->close();
                 unsigned players = shared->players.load();
+                // The addresses as they are now: a room listed again after a dropped connection gives the new ones.
+                std::vector<std::string> candidates;
+                {
+                    const std::lock_guard<std::mutex> guard(shared->lock);
+                    candidates = shared->candidates;
+                    shared->candidates_changed = false;
+                }
                 const std::string open =
                     "{\"t\":\"open\",\"protocol\":" + std::to_string(kNebulaNetProtocol) +
                     ",\"game\":\"Nebula\",\"version\":" + net::json::quote(room.version) +
@@ -180,7 +199,7 @@ void NebulaNetLink::host(std::string server, NebulaNetRoom room) {
                     ",\"password\":" + net::json::quote(room.password) +
                     ",\"public\":" + (room.public_room ? "true" : "false") + ",\"players\":" + std::to_string(players) +
                     ",\"max\":" + std::to_string(room.max) +
-                    ",\"candidates\":" + candidates_json(room.candidates) + "}";
+                    ",\"candidates\":" + candidates_json(candidates) + "}";
                 (void)socket->send(open);
                 auto last_sent = std::chrono::steady_clock::now();
                 while (!shared->stopped.load() && !socket->closed()) {
@@ -226,6 +245,17 @@ void NebulaNetLink::host(std::string server, NebulaNetRoom room) {
                     }
                     const auto now = std::chrono::steady_clock::now();
                     const unsigned now_players = shared->players.load();
+                    std::optional<std::vector<std::string>> moved;
+                    if (listed) {
+                        const std::lock_guard<std::mutex> guard(shared->lock);
+                        if (shared->candidates_changed) moved = shared->candidates;
+                        shared->candidates_changed = false;
+                    }
+                    if (moved) {
+                        // A NebulaNet from before this ignores it (joiners then get the room's first addresses).
+                        (void)socket->send("{\"t\":\"update\",\"candidates\":" + candidates_json(*moved) + "}");
+                        last_sent = now;
+                    }
                     if (listed && now_players != players) {
                         players = now_players;
                         (void)socket->send("{\"t\":\"update\",\"players\":" + std::to_string(players) + "}");

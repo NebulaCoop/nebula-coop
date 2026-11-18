@@ -79,6 +79,9 @@ public:
     void host(std::string server, NebulaNetRoom room);
     // A host's: the room's player count changed.
     void set_players(unsigned players);
+    // A host's: its addresses changed (its router moved its public port): joiners from now on get these, and so does
+    // the room when it's listed again after a dropped connection.
+    void set_candidates(std::vector<std::string> candidates);
     // Asks `server` for the room `code`, telling it this joiner's addresses and the password it was given.
     void join(std::string server, std::string code, std::vector<std::string> candidates, std::string password = {});
     // Asks `server` for its rooms of Nebula: the public ones, or with `password` the ones that have it.

@@ -56,6 +56,12 @@ introduces players, as sm64coopdx's CoopNet does, so nobody has to forward a por
   `galaxy/coop_nebulanet.h`. The Host page's NETWORK picks NebulaNet (the default) or Direct, as sm64coopdx's CoopNet or
   direct connection; the room's code shows in the host's chat and on the Online tab, and the Join page takes a code or
   an address. `coop_network=direct` and `coop_nebulanet=<url>` (another NebulaNet, to test one's own) are its settings.
+  A host waiting for its friends asks the STUN server again every 15 seconds (`DirectTransport::kStunRefreshEvery`):
+  a quiet room would otherwise lose its router's mapping after a minute or two and joiners would be sent to a port
+  that's gone. If the router moves it anyway, the host sends NebulaNet the new addresses (`update` with `candidates`).
+  A joiner by code tries the host for 18 seconds; the joining screen counts them, and a host that never answers ends
+  the join with what that usually means (the two routers, or the host's forwarded port). Both sides log the addresses
+  they used (`[coop] ... addresses`).
 - **NebulaNet as CoopNet.** NebulaNet offers what CoopNet offers sm64coopdx, for Nebula's star of players: a room has
   a name (the Host page's ROOM NAME, `coop_room_name`, else the host's name), a mode (CO-OP, or PVP with friendly
   fire), a description (its mods) and the room's password. The Host page's LOBBY (`coop_public`) makes the room public,
