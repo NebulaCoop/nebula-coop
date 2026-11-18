@@ -39,6 +39,8 @@ constexpr LONGLONG kQuietSecondsToLower = 10;
 // seconds in a row, is a stalled stream (issue #145).
 constexpr double kSlowDrain = 0.75;
 constexpr int kSlowSeconds = 2;
+// Stalled streams reopened in one run, at most (a plain stream too: the reopen is the stream's own reset).
+constexpr int kMostReopens = 3;
 
 void set_mmcss() {
     using SetFn = HANDLE(WINAPI*)(LPCWSTR, LPDWORD);
@@ -311,13 +313,27 @@ private:
         // steady buzz that came and went (issue #145): the logs showed this thread waking 100 times a second as it should, with
         // the buffer full, while the engine took a fifth of the sound, the same in two games at once. A short-period
         // (low-latency) stream on an engine running a longer period would do this: each pass taking one short period of ours.
-        // A stalled low-latency stream is reopened as a plain one for the rest of the run. Seconds it ran dry don't count:
-        // that is this thread's lateness, not the engine's.
+        // A stalled stream is reopened (as a plain one for the rest of the run), a few times a run at most. Seconds it ran dry
+        // don't count: that is this thread's lateness, not the engine's.
         std::uint64_t written = fill_frames_;
         LARGE_INTEGER drain_start = last_wake;
         std::uint64_t drain_taken = 0u;
         UINT32 drain_least_padding = fill_frames_;
+        UINT32 drain_most_padding = 0u;
+        std::uint32_t drain_wakes = 0u;
         int slow_seconds = 0;
+        // The device's own clock (IAudioClock), to tell a stream the engine stopped taking from an endpoint that slowed.
+        ComPtr<IAudioClock> clock;
+        UINT64 clock_frequency = 0u;
+        if (FAILED(client_->GetService(__uuidof(IAudioClock), reinterpret_cast<void**>(clock.GetAddressOf()))) ||
+            FAILED(clock->GetFrequency(&clock_frequency)) || clock_frequency == 0u) {
+            clock.Reset();
+        }
+        const auto clock_position = [&clock]() -> UINT64 {
+            UINT64 position = 0u;
+            return clock != nullptr && SUCCEEDED(clock->GetPosition(&position, nullptr)) ? position : 0u;
+        };
+        UINT64 drain_clock = clock_position();
         for (;;) {
             const DWORD woke = WaitForMultipleObjects(2, waits, FALSE, 500);
             if (woke == WAIT_OBJECT_0 + 1u) {
@@ -340,23 +356,41 @@ private:
             last_wake = wake;
             const std::uint64_t taken = written - std::min<std::uint64_t>(padding, written);
             drain_least_padding = std::min(drain_least_padding, padding);
+            drain_most_padding = std::max(drain_most_padding, padding);
+            ++drain_wakes;
             if (wake.QuadPart - drain_start.QuadPart >= frequency.QuadPart) {
-                const double expected = static_cast<double>(wake.QuadPart - drain_start.QuadPart) *
-                                        rate_.load(std::memory_order_relaxed) / static_cast<double>(frequency.QuadPart);
+                const double seconds = static_cast<double>(wake.QuadPart - drain_start.QuadPart) / static_cast<double>(frequency.QuadPart);
+                const double expected = seconds * rate_.load(std::memory_order_relaxed);
                 const double share = static_cast<double>(taken - drain_taken) / expected;
-                slow_seconds = share < kSlowDrain && drain_least_padding > 0u ? slow_seconds + 1 : 0;
-                if (slow_seconds == kSlowSeconds) {
-                    std::cout << "[audio] the engine took " << static_cast<int>(share * 100.0) << "% of a second's sound, "
-                              << kSlowSeconds << " s running, padding " << padding << " of " << buffer_frames_ << ": "
-                              << (low_latency_ ? "reopened as a plain stream" : "already a plain stream") << std::endl;
-                    if (low_latency_) {
-                        plain_only_ = true;
-                        return;
-                    }
+                const UINT64 clock_now = clock_position();
+                // The device clock's seconds in this one (1 is real time; 0 with no clock).
+                const double clock_share = clock_frequency != 0u && clock_now >= drain_clock
+                                               ? static_cast<double>(clock_now - drain_clock) / static_cast<double>(clock_frequency) / seconds
+                                               : 0.0;
+                const bool slow = share < kSlowDrain && drain_least_padding > 0u;
+                slow_seconds = slow ? slow_seconds + 1 : 0;
+                // Each slow second of a stall is told (the first 10), with what tells its cause apart: the wakes (this
+                // thread kept to the period), the padding (the buffer stayed full), the device clock (the endpoint itself
+                // slowed: every program's sound, not the game's alone) and the fill.
+                if (slow && slow_seconds <= 10) {
+                    std::cout << "[audio] slow: the engine took " << static_cast<int>(share * 100.0) << "% of a second's sound, device clock "
+                              << static_cast<int>(clock_share * 100.0) << "%, " << drain_wakes << " wakes, padding " << drain_least_padding
+                              << "-" << drain_most_padding << " of " << buffer_frames_ << ", fill " << fill_frames_ << ", "
+                              << (low_latency_ ? "low-latency" : "plain") << " stream" << std::endl;
+                }
+                if (slow_seconds == kSlowSeconds && reopens_ < kMostReopens) {
+                    ++reopens_;
+                    std::cout << "[audio] the stream stalled: reopened " << (low_latency_ ? "as a plain stream" : "afresh") << " ("
+                              << reopens_ << " of " << kMostReopens << ")" << std::endl;
+                    plain_only_ = true;
+                    return;
                 }
                 drain_start = wake;
                 drain_taken = taken;
                 drain_least_padding = padding;
+                drain_most_padding = padding;
+                drain_wakes = 0u;
+                drain_clock = clock_now;
             }
             if (padding >= fill_frames_) {
                 continue;
@@ -453,6 +487,7 @@ private:
     // The stream opened: low-latency (IAudioClient3, its least period) or plain; plain only once a low-latency one stalled.
     bool low_latency_{};
     bool plain_only_{};
+    int reopens_{};
     UINT32 least_frames_{};
     UINT32 standard_frames_{};
 };
