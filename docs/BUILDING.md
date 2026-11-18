@@ -74,9 +74,17 @@ sh native/tests/run_tests.sh
 The Build workflow runs only what a change can affect: a change under `installer/` compiles Setup (`installer/native`)
 and not the game builds, and any other change to the code runs the game builds and their tests and not
 the installer's. `installer/assets/`, `runtime/include/galaxy/store_version.inc` and `build.yml` itself run both;
-documentation, `tools/`, `nebulanet/` and the other workflows run neither. The **Build result** check reports either
-way, so it is the one to require before merging. It covers the Windows build (host, game module, disc import tool) and
-Setup's compile; the Linux, Android and macOS builds run and show their own checks but don't block a merge.
+documentation, `tools/`, the `nebulanet` and `web` submodules and the other workflows run neither. The **Build result**
+check reports either way, so it is the one to require before merging. It covers the Windows build (host, game module,
+disc import tool) and Setup's compile; the Linux, Android and macOS builds run and show their own checks but don't block
+a merge.
+
+A push doesn't cancel a build that is still going for an earlier push to the same branch or pull request unless it
+changes what that build is building, part by part (the game builds, Setup, Android). An installer build keeps going
+when the next push changes only the game, and the next push's run takes the earlier run's installer result instead of
+building it again (its **Earlier build** job). A push that changes nothing built, such as a submodule bump or
+documentation, cancels nothing and waits for the earlier run's result. If that earlier run is re-run after a failure,
+re-run the later one too.
 
 ## Setup
 
