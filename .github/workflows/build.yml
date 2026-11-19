@@ -440,7 +440,12 @@ jobs:
       - name: Start sccache
         run: sccache --start-server
       - name: Build
-        run: .\native\build.ps1 -Petari native\petari -Build build\game -Llvm (Join-Path $env:RUNNER_TEMP 'llvm\bin')
+        # The x86-64-v3 module only (-NoBaseline): the test build carries no other, and the x86-64-v2 one is the same
+        # source compiled again (row generator included), which doubled this job. The release builds both. Compiles go
+        # through sccache, as the host jobs' do; the row generator's copies are made each run either way.
+        run: >-
+          .\native\build.ps1 -Petari native\petari -Build build\game -Llvm (Join-Path $env:RUNNER_TEMP 'llvm\bin')
+          -NoBaseline -UseSccache
       - uses: actions/upload-artifact@v7
         with:
           name: windows-game-module
