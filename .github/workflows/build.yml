@@ -34,6 +34,10 @@ env:
   GLSLANG_TAG: 16.6.0
   SPIRV_TOOLS_COMMIT: ef96ed763b43b59b33b31b362f09a02b729fa1c9
   SPIRV_HEADERS_COMMIT: 496543121ce6419f23d6fa5d7194ba66c36212d2
+  # The DirectX Shader Compiler the Windows test build carries in dxc\ (a mod's shaders are built with it on the
+  # player's PC; without it a start with mods turns them off): the release release.yml and Setup ship.
+  DXC_URL: https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip
+  DXC_SHA256: ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1
 
 jobs:
   # Sorts the changed files into the parts they affect:
@@ -323,6 +327,8 @@ jobs:
       - uses: mozilla-actions/sccache-action@v0.0.11
       - name: Start sccache
         run: sccache --start-server
+      # The program (packs the disc) and the library the game loads beside it (nebula_import.dll: a start with mods
+      # checks and cooks them with it, and turns every mod off when it is missing).
       - name: Build
         run: cargo build --release --locked -p nebula-import
       - name: Test
@@ -330,7 +336,9 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: windows-import
-          path: target/release/nebula-import.exe
+          path: |
+            target/release/nebula-import.exe
+            target/release/nebula_import.dll
           retention-days: 1
           if-no-files-found: error
 
@@ -519,6 +527,18 @@ jobs:
           merge-multiple: true
       - name: Stage
         run: cp LICENSE THIRD-PARTY-NOTICES.md docs/TEST_BUILDS.md dist/
+      # dxc\ beside the game, as Setup installs it (installer/build-native-setup.ps1): the Direct3D 12 program's start
+      # check wants dxc.exe, dxcompiler.dll and dxil.dll there whenever a mod is on.
+      - name: DirectX Shader Compiler
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/dxc.zip" "$DXC_URL"
+          echo "$DXC_SHA256  $RUNNER_TEMP/dxc.zip" | sha256sum -c -
+          # The zip names its folders with backslashes: unzip turns them into folders and says so with status 1.
+          unzip -q "$RUNNER_TEMP/dxc.zip" -d "$RUNNER_TEMP/dxc" || test $? -eq 1
+          mkdir -p dist/dxc
+          for name in bin/x64/dxc.exe bin/x64/dxcompiler.dll bin/x64/dxil.dll LICENSE-MS.txt LICENCE-MIT.txt LICENSE-LLVM.txt; do
+            cp "$RUNNER_TEMP/dxc/$name" dist/dxc/
+          done
       - uses: actions/upload-artifact@v7
         with:
           name: nebula-windows-x64
@@ -615,14 +635,15 @@ jobs:
           cmake --build build/game --target smg_game
       - name: Drop unused row generator outputs
         run: tools/ci/prune_luma_cache.sh "$RUNNER_TEMP/luma-cache" "${{ steps.started.outputs.at }}"
+      # The program and the library the game loads with mods on (libnebula_import.so; without it every mod is off).
       - name: Disc import tool
-        run: cargo build --release --locked -p nebula-import --bin nebula-import
+        run: cargo build --release --locked -p nebula-import
       - name: Stage
-        # The program finds libSDL3 and the game module beside it.
+        # The program finds libSDL3, the game module and the importer's library beside it.
         run: |
           mkdir -p dist
           cp build/host/nebula dist/Nebula
-          cp -L build/host/libSDL3.so.0 build/game/libsmg_game.so target/release/nebula-import dist/
+          cp -L build/host/libSDL3.so.0 build/game/libsmg_game.so target/release/nebula-import target/release/libnebula_import.so dist/
           patchelf --set-rpath '$ORIGIN' dist/Nebula
           cp LICENSE THIRD-PARTY-NOTICES.md docs/TEST_BUILDS.md dist/
           # Artifacts drop file modes: a tar keeps the programs executable.

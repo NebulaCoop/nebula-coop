@@ -13,10 +13,14 @@ artifact under **Artifacts**. You need to be signed in to GitHub.
 
 | Artifact | Contents |
 |---|---|
-| `nebula-windows-x64` | `Nebula.exe` (Direct3D 12), `NebulaVk.exe` (Vulkan), `smg_game.dll`, `nebula-import.exe` |
-| `nebula-linux-x64` | `Nebula` (Vulkan, SDL3), `libsmg_game.so`, `libSDL3.so.0`, `nebula-import` |
+| `nebula-windows-x64` | `Nebula.exe` (Direct3D 12), `NebulaVk.exe` (Vulkan), `smg_game.dll`, `nebula-import.exe`, `nebula_import.dll`, `dxc\` |
+| `nebula-linux-x64` | `Nebula` (Vulkan, SDL3), `libsmg_game.so`, `libSDL3.so.0`, `nebula-import`, `libnebula_import.so` |
 | `nebula-android` | `Nebula.apk` (arm64; for an x86_64 emulator, build it with `platform/android/build_apk.ps1 -Abis x86_64`) |
 | `nebula-macos-arm64` | `Nebula-macOS.zip`: `Nebula.app` (Metal, Apple silicon only), ad-hoc signed |
+
+Keep the folder's files together: with a mod on, the game needs `nebula_import.dll` (`libnebula_import.so` on Linux)
+beside it, and the Direct3D 12 program also `dxc\`. When one is missing every mod is off for that start, and the mod log
+says which part was missing.
 
 ## Windows and Linux
 
