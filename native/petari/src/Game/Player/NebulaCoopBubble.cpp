@@ -3,6 +3,7 @@
 #include "Game/Player/MarioActor.hpp"
 #include "Game/Player/MarioDamage.hpp"
 #include "Game/Player/NebulaRemotePlayer.hpp"
+#include "Game/LiveActor/Spine.hpp"
 #include "Game/Util/ActorSensorUtil.hpp"
 #include "Game/Util/CameraUtil.hpp"
 #include "Game/Util/EffectUtil.hpp"
@@ -51,12 +52,20 @@ namespace {
     const u16 cInvincibleFrames = 180;
     // Warp pipes deep: where the player came out of each (the deepest last).
     const s32 cAreaDepth = 8;
+    // A deferred miss: its death animation played this long at least (its first frames may still report the animation
+    // before it as ended), and at most (an animation that loops never ends): the vanilla miss starts its MISS at 45
+    // frames and its wipe at 100.
+    const s32 cDeathMinFrames = 30;
+    const s32 cDeathMaxFrames = 120;
 
     NebulaBubble* sLocal = nullptr;
     bool sBubbled = false;
     // The bubble ended in a miss: the miss states, entered again for it, keep it.
     bool sGiveUp = false;
     bool sGameOverDemo = false;
+    // A miss playing its death animation before the bubble, for this many frames so far.
+    bool sDeferred = false;
+    s32 sDeferredFrames = 0;
     s32 sPopWait = 0;
     s32 sAlone = 0;
     Vec3f sVelocity(0.0f, 0.0f, 0.0f);
@@ -280,6 +289,8 @@ void NebulaCoopBubble::forgetAll() {
     sBubbled = false;
     sGiveUp = false;
     sGameOverDemo = false;
+    sDeferred = false;
+    sDeferredFrames = 0;
     sPopWait = 0;
     sAlone = 0;
     sVelocity.zero();
@@ -299,8 +310,8 @@ NebulaBubble* NebulaCoopBubble::createModel() {
 }
 
 namespace {
-// The miss as a bubble, when another player can let this one out: true when it is one.
-bool startBubble(MarioActor* pActor) {
+// Whether the miss can be a bubble: another player here can let this one out.
+bool canBubble(MarioActor* pActor) {
     // A race lost (forceKill's 1, 2 and 5) isn't a death; a game over isn't bubbled (sm64coopdx bubbles with lives
     // left only), nor a miss the scene already plays.
     if (sLocal == nullptr || sBubbled || sGiveUp || sGameOverDemo || !isBubbleOn()) {
@@ -313,9 +324,16 @@ bool startBubble(MarioActor* pActor) {
     if (NebulaRemotePlayer::isLocalRacing()) {
         return false;
     }
-    if (findRescuer(getCenter(pActor)) == nullptr) {
+    return findRescuer(getCenter(pActor)) != nullptr;
+}
+
+// The miss as a bubble, when another player can let this one out: true when it is one.
+bool startBubble(MarioActor* pActor) {
+    if (!canBubble(pActor)) {
         return false;
     }
+    sDeferred = false;
+    sDeferredFrames = 0;
 
     // A life, as sm64coopdx's bubble takes one.
     MR::decPlayerLeft();
@@ -323,6 +341,13 @@ bool startBubble(MarioActor* pActor) {
     if (pActor->mPressTimer != 0) {
         pActor->mPressTimer = 0;
         MR::endStarPointerMode(pActor);
+    }
+    // What the death animation left on him goes: its effects (sand, fire, the black hole's), and a black hole's
+    // shrinking.
+    MR::forceDeleteEffectAll(pActor);
+    if (pActor->mMario->mMovementStates.scaleBody) {
+        pActor->mMario->mMovementStates.scaleBody = false;
+        pActor->mScale.set(1.0f, 1.0f, 1.0f);
     }
     pActor->mAnimationFrozen = false;
     pActor->mForceKilled = false;
@@ -360,6 +385,43 @@ bool NebulaCoopBubble::tryStart(MarioActor* pActor) {
     // warp takes a player out of the level. The instance starts fresh only once everyone in it missed or left.
     NebulaCoopWorld::noticeMiss();
     return false;
+}
+
+bool NebulaCoopBubble::isMissDeferred(MarioActor* pActor) {
+    // An extra player's miss is its own (MarioActor::respawnExtra).
+    if (pActor->isExtraPlayer()) {
+        return false;
+    }
+    if (!MR::isFirstStep(pActor) || sDeferred) {
+        return sDeferred;
+    }
+    if (canBubble(pActor)) {
+        sDeferred = true;
+        sDeferredFrames = 0;
+        nebula_log("[coop] down: a bubble after the death animation\n");
+        return true;
+    }
+    NebulaCoopWorld::noticeMiss();
+    return false;
+}
+
+void NebulaCoopBubble::updateDeferredMiss(MarioActor* pActor, bool animationDone) {
+    if (!sDeferred) {
+        return;
+    }
+    sDeferredFrames++;
+    if (sDeferredFrames < cDeathMinFrames || (!animationDone && sDeferredFrames < cDeathMaxFrames)) {
+        return;
+    }
+    if (startBubble(pActor)) {
+        return;
+    }
+    // Nobody to fly to any more (or the room turned the bubble off): the miss after all, its state from its start.
+    sDeferred = false;
+    sDeferredFrames = 0;
+    sGiveUp = true;
+    nebula_log("[coop] nobody to fly to after the death animation: the miss\n");
+    pActor->setNerve(pActor->mSpine->getCurrentNerve());
 }
 
 void NebulaCoopBubble::updateLocal(MarioActor* pActor) {

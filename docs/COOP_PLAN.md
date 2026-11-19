@@ -576,6 +576,11 @@ the Online tab (Bubble on Death, `coop_bubble_death`, on by default), sent with 
   black hole, drowning...) while another player is alive in the same instance *and the same part of it* loses a life
   and floats in a bubble instead. With no life left it's the game over, as in sm64coopdx; a race lost or the timer
   running out is never a bubble.
+- **After the death animation.** As sm64coopdx's `common_death_handler`, the bubble comes once the death plays out:
+  Mario falls down (or burns, sinks in the sand, is pulled into the black hole) where he died, with the death's voice,
+  but without the miss's music, MISS, wipe or camera. The bubble starts when that animation ends (at least half a
+  second, at most two; a black hole's after one second, when its miss would start). Falling into the abyss bubbles at
+  once, as falling out of a level does in sm64coopdx. Nobody to fly to by then: the miss plays from its start.
 - **The same part.** A galaxy is one scene, so sm64coopdx's areas are the warp pipes here: each player's part is where
   the stage starts, or the pipe they last came out of; going back down that pipe returns them to the part before
   (a stack, `NebulaCoopPlayer::area`, a hash of the pipe's placed position, the same in every game). A player down a
