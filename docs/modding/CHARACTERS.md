@@ -91,10 +91,12 @@ A player's colours work like sm64coopdx's palettes: eight parts, each a colour. 
 | 6 | `cap` | |
 | 7 | `emblem` | the letter on the cap |
 
-A player picks theirs on Options' PLAYER page, under COLOURS: SET gives a whole set (OWN for their character's own, any
-character's, or a few more: FIRE MARIO, WARIO, TOAD and others), and a row per part steps through named colours.
-ADVANCED COLOURS gives any colour, as sm64coopdx's palette editor: PART picks a part (its colour shown as `#RRGGBB`),
-and RED, GREEN and BLUE slide its channels from 0 to 255 in fives. Each
+A player picks theirs on Options' PLAYER page, under COLOURS: SET gives a whole set (CUSTOM, their own edit; OWN for
+their character's own, the default; then any character's, or a few more: FIRE MARIO, WARIO, TOAD and others), and a
+row per part steps through named colours, moving ADVANCED COLOURS to that part. ADVANCED COLOURS gives any colour, as
+sm64coopdx's palette editor: PART picks a part (its colour shown as `#RRGGBB`), and RED, GREEN and BLUE slide its
+channels from 0 to 255 in fives. Any change to a part's colour starts from what is worn and makes it CUSTOM, kept in
+the settings (`coop_custom_palette`) so SET's CUSTOM brings it back after trying a set. Each
 player's colours travel with their character, so everyone in a room sees them.
 
 The game's player models carry their colours in their textures, so a palette is drawn by recoloured copies of those
