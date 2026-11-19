@@ -43,8 +43,15 @@ namespace NebulaCoopBubble {
     NebulaBubble* createModel();
 
     // MarioActor's miss states, on their first step: true when the miss became a bubble (MarioActor's NebulaBubble
-    // state then).
+    // state then). The miss by falling into the abyss bubbles at once, as sm64coopdx's falling out of a level.
     bool tryStart(MarioActor* pActor);
+    // The other miss states, each frame (deciding on their first step): true when the miss is to become a bubble once
+    // its death animation has played (sm64coopdx's common_death_handler bubbles at a frame of the death animation). The
+    // state then plays that animation without the miss's own event, camera and music, and calls updateDeferredMiss.
+    bool isMissDeferred(MarioActor* pActor);
+    // Each frame of a deferred miss: once `animationDone` (or after a while, for an animation that never ends), the
+    // bubble; with nobody left to fly to by then, the miss after all (the state entered again, from its start).
+    void updateDeferredMiss(MarioActor* pActor, bool animationDone);
     // MarioActor's NebulaBubble state, each frame: flying, then burst near another player or the miss.
     void updateLocal(MarioActor* pActor);
     bool isLocalBubbled();

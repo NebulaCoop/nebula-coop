@@ -163,8 +163,21 @@ void MarioActor::forceKill(u32 type) {
 }
 
 void MarioActor::exeGameOver() {
-    // Online co-op: with another player alive here, the miss becomes a bubble (sm64coopdx's bubble on death).
-    if (MR::isFirstStep(this) && NebulaCoopBubble::tryStart(this)) {
+    // Online co-op: with another player alive here, the miss becomes a bubble (sm64coopdx's bubble on death) once its
+    // death animation has played, as the miss's event starts it, without its music, wipe and camera.
+    if (NebulaCoopBubble::isMissDeferred(this)) {
+        if (MR::isFirstStep(this)) {
+            changeGameOverAnimation();
+            MR::startSoundPlayerJ("声最終ダメージ");
+            MR::startSoundPlayerJ("最後の一撃");
+        }
+        mVelocity.zero();
+        calcHeadPos();
+        updateRealMtx();
+        mTakeCandidate = nullptr;
+        NebulaMtxIdentity(mMarioAnim->mHomingMtx);
+        damageDropThrowMemoSensor();
+        NebulaCoopBubble::updateDeferredMiss(this, mMario->isAnimationTerminate(nullptr));
         return;
     }
     if (respawnExtra()) {
@@ -254,8 +267,18 @@ void MarioActor::exeGameOverAbyss() {
 }
 
 void MarioActor::exeGameOverFire() {
-    // Online co-op: with another player alive here, the miss becomes a bubble (sm64coopdx's bubble on death).
-    if (MR::isFirstStep(this) && NebulaCoopBubble::tryStart(this)) {
+    // Online co-op: with another player alive here, the miss becomes a bubble (sm64coopdx's bubble on death) once its
+    // death animation has played, as the miss's event starts it, without its music, wipe and camera.
+    if (NebulaCoopBubble::isMissDeferred(this)) {
+        if (MR::isFirstStep(this)) {
+            changeGameOverAnimation();
+            MR::startSoundPlayerJ("声最終ダメージ");
+            MR::startSoundPlayerJ("最後の一撃");
+        }
+        mVelocity.zero();
+        calcHeadPos();
+        updateRealMtx();
+        NebulaCoopBubble::updateDeferredMiss(this, mMario->isAnimationTerminate(nullptr));
         return;
     }
     if (respawnExtra()) {
@@ -289,11 +312,10 @@ void MarioActor::exeGameOverFire() {
 }
 
 void MarioActor::exeGameOverSink() {
-    // Online co-op: with another player alive here, the miss becomes a bubble (sm64coopdx's bubble on death).
-    if (MR::isFirstStep(this) && NebulaCoopBubble::tryStart(this)) {
-        return;
-    }
-    if (respawnExtra()) {
+    // Online co-op: with another player alive here, the miss becomes a bubble (sm64coopdx's bubble on death) once he
+    // has sunk (sm64coopdx's act_quicksand_death), without the miss's music and camera.
+    const bool bubbleDeferred = NebulaCoopBubble::isMissDeferred(this);
+    if (!bubbleDeferred && respawnExtra()) {
         return;
     }
 
@@ -306,19 +328,23 @@ void MarioActor::exeGameOverSink() {
     }
 
     if (MR::isFirstStep(this)) {
-        MR::setCubeBgmChangeInvalid();
-        MR::clearBgmQueue();
+        if (!bubbleDeferred) {
+            MR::setCubeBgmChangeInvalid();
+            MR::clearBgmQueue();
+        }
         changeGameOverAnimation();
 
-        if (MR::getPlayerLeft() == 0) {
-            MR::startPlayerEvent("ゲームオーバー");
-            MR::startGlobalEventCameraNoTarget("昇天カメラ");
-        } else {
-            MR::startPlayerEvent("マリオダウン");
-            MR::startGlobalEventCameraNoTarget("奈落カメラ");
-        }
+        if (!bubbleDeferred) {
+            if (MR::getPlayerLeft() == 0) {
+                MR::startPlayerEvent("ゲームオーバー");
+                MR::startGlobalEventCameraNoTarget("昇天カメラ");
+            } else {
+                MR::startPlayerEvent("マリオダウン");
+                MR::startGlobalEventCameraNoTarget("奈落カメラ");
+            }
 
-        MR::startStarPointerModeDemoMarioDeath(this);
+            MR::startStarPointerModeDemoMarioDeath(this);
+        }
 
         if (mMario->mFloorCode == 25 || mMario->mFloorCode == 17) {
             playEffect("砂埋まり体");
@@ -344,11 +370,22 @@ void MarioActor::exeGameOverSink() {
             playSound("声砂沈み死亡", -1);
         }
     }
+
+    if (bubbleDeferred) {
+        NebulaCoopBubble::updateDeferredMiss(this, mMario->isAnimationTerminate(nullptr));
+    }
 }
 
 void MarioActor::exeGameOverNonStop() {
-    // Online co-op: with another player alive here, the miss becomes a bubble (sm64coopdx's bubble on death).
-    if (MR::isFirstStep(this) && NebulaCoopBubble::tryStart(this)) {
+    // Online co-op: with another player alive here, the miss becomes a bubble (sm64coopdx's bubble on death) once its
+    // death animation has played, as the miss's event starts it, without its music, wipe and camera.
+    if (NebulaCoopBubble::isMissDeferred(this)) {
+        if (MR::isFirstStep(this)) {
+            changeGameOverAnimation();
+            MR::startSoundPlayerJ("声最終ダメージ");
+            MR::startSoundPlayerJ("最後の一撃");
+        }
+        NebulaCoopBubble::updateDeferredMiss(this, mMario->isAnimationTerminate(nullptr));
         return;
     }
     if (respawnExtra()) {

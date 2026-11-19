@@ -41,20 +41,21 @@ void MarioActor::initBlackHoleOut() {
 }
 
 void MarioActor::exeGameOverBlackHole2() {
-    // Online co-op: with another player alive here, the miss becomes a bubble (sm64coopdx's bubble on death).
-    if (MR::isFirstStep(this) && NebulaCoopBubble::tryStart(this)) {
-        return;
-    }
-    if (respawnExtra()) {
+    // Online co-op: with another player alive here, the miss becomes a bubble (sm64coopdx's bubble on death) once the
+    // black hole has pulled him in a while (when the miss's event would start), without its music and camera.
+    const bool bubbleDeferred = NebulaCoopBubble::isMissDeferred(this);
+    if (!bubbleDeferred && respawnExtra()) {
         return;
     }
 
     if (MR::isFirstStep(this)) {
-        MR::setCubeBgmChangeInvalid();
-        MR::clearBgmQueue();
+        if (!bubbleDeferred) {
+            MR::setCubeBgmChangeInvalid();
+            MR::clearBgmQueue();
 
-        if (!(mBlackHole->tryStartDemoCamera()) && !mMario->getMovementStates().mode2D) {
-            MR::startBlackHoleCamera("ブラックホール", mBlackHolePosition, mPosition);
+            if (!(mBlackHole->tryStartDemoCamera()) && !mMario->getMovementStates().mode2D) {
+                MR::startBlackHoleCamera("ブラックホール", mBlackHolePosition, mPosition);
+            }
         }
 
         mBindOn = false;
@@ -67,11 +68,13 @@ void MarioActor::exeGameOverBlackHole2() {
 
         mMario->mMovementStates.scaleBody = true;
 
-        MR::startStarPointerModeDemoMarioDeath(this);
-        MR::deactivateDefaultGameLayout();
+        if (!bubbleDeferred) {
+            MR::startStarPointerModeDemoMarioDeath(this);
+            MR::deactivateDefaultGameLayout();
+        }
     }
 
-    if (getNerveStep() == 60) {
+    if (getNerveStep() == 60 && !bubbleDeferred) {
         if (!MR::getPlayerLeft()) {
             MR::startPlayerEvent("ゲームオーバー");
         } else {
@@ -129,4 +132,8 @@ void MarioActor::exeGameOverBlackHole2() {
     mPosition = mBlackHolePosition + mPosRelativeToBlackHole;
 
     mVelocity.zero();
+
+    if (bubbleDeferred) {
+        NebulaCoopBubble::updateDeferredMiss(this, getNerveStep() >= 60);
+    }
 }
