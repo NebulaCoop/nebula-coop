@@ -15,7 +15,7 @@ artifact under **Artifacts**. You need to be signed in to GitHub.
 |---|---|
 | `nebula-windows-x64` | `Nebula.exe` (Direct3D 12), `NebulaVk.exe` (Vulkan), `smg_game.dll`, `nebula-import.exe` |
 | `nebula-linux-x64` | `Nebula` (Vulkan, SDL3), `libsmg_game.so`, `libSDL3.so.0`, `nebula-import` |
-| `nebula-android` | `Nebula.apk` (arm64 and x86_64) |
+| `nebula-android` | `Nebula.apk` (arm64; for an x86_64 emulator, build it with `platform/android/build_apk.ps1 -Abis x86_64`) |
 | `nebula-macos-arm64` | `Nebula-macOS.zip`: `Nebula.app` (Metal, Apple silicon only), ad-hoc signed |
 
 ## Windows and Linux

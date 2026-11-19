@@ -28,17 +28,23 @@ friend (on the line of its opening brace), so the rows' offsetof and & are the c
 The arguments of SOURCE's own compile command are read from --commands, where the build lists OUTPUT (or --entry).
 --root: the folder the names of file-local functions are relative to.
 
+NEBULA_LUMA_CACHE (environment): a folder where each unit's outputs are kept, with the content of every file its parse
+read. A later run with the same tools, libclang, command and paths takes them from there when none of those files has
+changed, instead of parsing again (a clean build's step, such as CI's). Unset: nothing is kept or read.
+
 --check-libclang: loads the libclang the row generator would use with COMPILER (beside it, or --libclang) and checks
 it has every call the generator makes; prints its path and version, or exits 1 with what was found and what is
 needed. The game module's configure runs it once, before any file.
 """
 import bisect
 import ctypes
+import hashlib
 import json
 import os
 import pathlib
 import re
 import shlex
+import shutil
 import sys
 from ctypes import POINTER, Structure, byref, c_char_p, c_int, c_uint, c_void_p
 
@@ -1884,6 +1890,86 @@ def write_depfile(path, output, included):
     write_if_changed(path, (escape(output) + ': ' + ' \\\n  '.join(names) + '\n').encode())
 
 
+# What instrument.py writes beside OUTPUT (Unit.write), all kept by the cache.
+OUTPUT_SUFFIXES = ('', '.numbers', '.types', '.rows', '.functions', '.places', '.left', '.globals')
+
+
+def file_digest(path):
+    try:
+        with open(path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+class UnitCache:
+    """One unit's entry in NEBULA_LUMA_CACHE: the outputs of a run, and the digest of every file its parse read (the
+    files the depfile names). The entry's name is the digest of what else decides the outputs: the row generator's own
+    sources, the libclang, the parse's arguments and folder, and the source, output and root paths. An entry is used
+    only when each of its files still has the digest it had: the same test Ninja makes with the depfile's times.
+    A restored entry's manifest gets the current time, so a cache kept between runs can drop what no run used."""
+
+    @staticmethod
+    def open(source, output, root, args, directory, libclang):
+        folder = os.environ.get('NEBULA_LUMA_CACHE')
+        if not folder:
+            return None
+        tools = pathlib.Path(__file__).resolve().parent
+        tool = hashlib.sha256()
+        for path in sorted(tools.glob('*.py')):
+            tool.update(path.name.encode() + b'\0' + path.read_bytes() + b'\0')
+        try:
+            library = [os.path.abspath(libclang), os.path.getsize(libclang)]
+        except OSError:
+            return None
+        key = hashlib.sha256(json.dumps(['1', tool.hexdigest(), library, list(args), os.path.abspath(directory), root,
+                                         source, output, os.name]).encode('utf-8')).hexdigest()
+        return UnitCache(pathlib.Path(folder) / key[:2] / key, output)
+
+    def __init__(self, entry, output):
+        self.entry = entry
+        self.output = output
+
+    def restore(self, depfile):
+        try:
+            manifest = json.loads((self.entry / 'manifest.json').read_text(encoding='utf-8'))
+            for path, digest in manifest['files'].items():
+                if file_digest(path) != digest:
+                    return False
+            kept = [(self.output + suffix, (self.entry / ('out' + suffix)).read_bytes()) for suffix in OUTPUT_SUFFIXES]
+        except (OSError, ValueError, KeyError):
+            return False
+        for path, data in kept:
+            write_if_changed(path, data)
+        if depfile:
+            write_depfile(depfile, self.output, manifest['included'])
+        try:
+            os.utime(self.entry / 'manifest.json')
+        except OSError:
+            pass
+        return True
+
+    def store(self, included):
+        files = {}
+        for name in included:
+            if name and name not in files:
+                digest = file_digest(name)
+                if digest is None:
+                    return
+                files[name] = digest
+        temp = self.entry.with_name(self.entry.name + f'.{os.getpid()}.tmp')
+        try:
+            temp.mkdir(parents=True, exist_ok=True)
+            for suffix in OUTPUT_SUFFIXES:
+                (temp / ('out' + suffix)).write_bytes(pathlib.Path(self.output + suffix).read_bytes())
+            (temp / 'manifest.json').write_text(json.dumps({'files': files, 'included': included}), encoding='utf-8')
+            if self.entry.exists():
+                shutil.rmtree(self.entry, ignore_errors=True)
+            os.replace(temp, self.entry)
+        except OSError:
+            shutil.rmtree(temp, ignore_errors=True)
+
+
 def command_for(commands, output):
     wanted = os.path.normcase(os.path.abspath(output))
     for entry in json.loads(pathlib.Path(commands).read_text(encoding='utf-8')):
@@ -1960,10 +2046,14 @@ def main():
     resource_dir = own_resource_dir(libclang, args[0])
     if resource_dir is not None and '-resource-dir' not in args:
         args = args[:1] + ['-resource-dir', resource_dir] + args[1:]
+    os.chdir(directory)
+    # The files a parse read are named as it named them: relative ones from this folder.
+    cache = UnitCache.open(source, output, root, args, directory, libclang)
+    if cache and cache.restore(options.get('--depfile')):
+        return
     import gen_types  # the type rows' reader; it imports this module (see the end of this file)
     gen_types.set_target(args)
     api = gen_types.Api(libclang)
-    os.chdir(directory)
     index = api.createIndex(0, 0)
     tu = c_void_p()
     encoded = (c_char_p * len(args))(*[a.encode() for a in args])
@@ -1987,14 +2077,17 @@ def main():
     unit.function_facts(types)
     unit.places(types)
     unit.write(output)
-    if '--depfile' in options:
+    if '--depfile' in options or cache:
         included = []
 
         def note(file, _stack, _depth, _data):
             included.append(unit.string(api.fileName(file)))
 
         api.inclusions(tu, INCLUSION(note), None)
-        write_depfile(options['--depfile'], output, included)
+        if '--depfile' in options:
+            write_depfile(options['--depfile'], output, included)
+        if cache:
+            cache.store(included)
 
 
 if __name__ == '__main__':
