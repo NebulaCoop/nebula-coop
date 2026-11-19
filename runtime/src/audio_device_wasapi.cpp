@@ -32,7 +32,7 @@ using Microsoft::WRL::ComPtr;
 // The buffer when the system offers no low-latency stream.
 constexpr REFERENCE_TIME kBufferDuration = 400000;  // 40 ms
 // The fill starts at one engine period, the least there is. A wake or a render that took too long of it raises the fill a
-// period at a time, up to this many; ten quiet seconds lower it a period.
+// period at a time, up to this many (or the buffer); ten quiet seconds lower it a period, never under the first one.
 constexpr std::uint32_t kMostFillPeriods = 4u;
 constexpr LONGLONG kQuietSecondsToLower = 10;
 // A stream the engine drains slower than real time while it never ran dry: under this share of a second's frames, this many
@@ -309,12 +309,10 @@ private:
         LARGE_INTEGER last_wake{};
         QueryPerformanceCounter(&last_wake);
         LARGE_INTEGER last_trouble = last_wake;
-        // What the engine has taken (given less what it still holds), against the clock, a second at a time. Players heard a
-        // steady buzz that came and went (issue #145): the logs showed this thread waking 100 times a second as it should, with
-        // the buffer full, while the engine took a fifth of the sound, the same in two games at once. A short-period
-        // (low-latency) stream on an engine running a longer period would do this: each pass taking one short period of ours.
-        // A stalled stream is reopened (as a plain one for the rest of the run), a few times a run at most. Seconds it ran dry
-        // don't count: that is this thread's lateness, not the engine's.
+        // What the engine has taken (given less what it still holds), against the clock, a second at a time. A stream the
+        // engine stops taking from while the buffer stays full is reopened (as a plain one for the rest of the run), a few times
+        // a run at most. Seconds it ran dry don't count: that is this thread's fill, not the engine's (the buzz of issue #145
+        // was a fill under one period, above).
         std::uint64_t written = fill_frames_;
         LARGE_INTEGER drain_start = last_wake;
         std::uint64_t drain_taken = 0u;
@@ -350,7 +348,12 @@ private:
                 raise_fill();
                 last_trouble = wake;
             } else if (fill_frames_ > period_frames_ && wake.QuadPart - last_trouble.QuadPart > frequency.QuadPart * kQuietSecondsToLower) {
-                fill_frames_ -= period_frames_;
+                // Never under one period: the engine takes a whole period each pass, so a smaller fill leaves the rest of
+                // every pass empty. That was the buzz (issue #145): a 1056-frame buffer with a 480-frame period was raised
+                // to 1056 (the buffer, not a whole number of periods), lowered to 576 and then to 96, and the engine played
+                // 96 frames of sound and a gap 100 times a second until a hitch raised the fill again.
+                fill_frames_ = std::max(fill_frames_ - period_frames_, period_frames_);
+                std::cout << "[audio] fill lowered to " << fill_frames_ << " frames\n";
                 last_trouble = wake;
             }
             last_wake = wake;
