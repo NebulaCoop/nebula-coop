@@ -310,6 +310,12 @@ std::vector<RemotePlayer> RemotePlayers::sample(const std::string& stage, int sc
         // The instance as now: a player still drawn from where they were before moving here waits for the new one.
         if (snapshot.stage != stage || snapshot.scenario != scenario) continue;
         RemotePlayer remote;
+        remote.latest_flags = latest.snapshot.flags;
+        if (latest.snapshot.platform == 0u || latest.snapshot.platform != snapshot.platform) {
+            for (std::size_t i = 0; i < 3u; ++i) {
+                remote.latest_offset[i] = latest.snapshot.position[i] - snapshot.position[i];
+            }
+        }
         remote.id = id;
         remote.index = player.index;
         remote.name = player.name;

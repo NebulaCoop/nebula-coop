@@ -9,6 +9,7 @@ class NebulaPaletteSkin;
 class XanimePlayer;
 class XanimeGroupInfo;
 class Clip;
+class NebulaPullStarLight;
 
 // Online co-op (docs/COOP_PLAN.md "Remote players"): another player in this instance, drawn as their Mario or Luigi
 // where their snapshots put them, playing the animation they play. It has no physics or state of its own; its model is
@@ -56,6 +57,10 @@ public:
     // NEBULA_COOP_PLAYER_RACING.
     static void noteLocalRacing();
     static bool isLocalRacing();
+    // A Pull Star (GCapture) holds the local Mario in its bubble: noted by it each frame it does; GameScene sends it as
+    // NEBULA_COOP_PLAYER_PULL_STAR, and the copies show the bubble round the others it holds.
+    static void noteLocalPullStar();
+    static bool isLocalPullStar();
 
     virtual void init(const TableIter& rIter);
     virtual void control();
@@ -88,6 +93,10 @@ public:
     const char* getAnimationEffectName() const;
     // MarioActor::updateLightList's tint for this copy: its light's ambient colour, a white material.
     void updateLightTint();
+    // What the local Mario's code shows that no animation plays (NEBULA_COOP_PLAYER_SPIN_RING, SPIN_TICO,
+    // PULL_STAR), as the snapshot's flags turn on and off: the spin's ring, the Luma coming back after it and a Pull
+    // Star's bubble. All of it gone with `flags` 0.
+    void updateFlagEffects(u32 flags);
 
     /* 0x90 */ bool mIsLuigi;
     u32 mNumber;  // the player shown (NebulaCoopRemotePlayer::number), 0 for none
@@ -104,6 +113,8 @@ public:
     Vec3f mFront;
     Vec3f mUp;
     u32 mRewindMs;    // NebulaCoopRemotePlayer::rewind_ms
+    u32 mAttackFlags; // NebulaCoopRemotePlayer::attack_flags: their attacks, as their newest snapshot has them
+    Vec3f mAttackOffset; // and where (NebulaCoopRemotePlayer::attack_offset), from where the copy stands
     s32 mShownFrames; // frames since this copy began showing its player
     s32 mStompTimer;  // frames until their landing on the local Mario's head may squash him again
     bool mSolid;      // its sensor is on
@@ -116,4 +127,10 @@ public:
     s32 mCharacter;
     // The player's colours on its model (NebulaPalette), as the session last told them.
     NebulaPaletteSkin* mPaletteSkin;
+    // updateFlagEffects': the flags it last showed, the Luma that comes back after a spin (MarioActor's SpinTico), and
+    // the Pull Star's bubble round them with the frames it has held them.
+    u32 mEffectFlags;
+    LiveActor* mSpinTico;
+    NebulaPullStarLight* mPullStarLight;
+    s32 mPullStarFrames;
 };

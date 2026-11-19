@@ -739,6 +739,7 @@ public:
     TornadoMario* mTornadoMario;
     u8 mTornadoEnd;  // the tornado ends (updateTornado)
     LiveActor* mSpinTico;  // the spin's Tico
+    bool mSpinRingOn;  // スピンリング played and not stopped since (online co-op sends it: NEBULA_COOP_PLAYER_SPIN_RING)
     MarioSearchLight* mSearchLight;
     u32 mSearchLightTimer;
     JetTurtleShadow* mTurtleShadow;  // the shell's shadow model

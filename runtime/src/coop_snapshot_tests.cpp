@@ -157,6 +157,8 @@ void test_remote_players() {
                seen[0].index == 1u,
            "a player in the same instance is drawn");
     expect(!seen.empty() && near(seen[0].snapshot.position[0], 15.0f), "100 ms in the past, between two snapshots");
+    expect(!seen.empty() && near(seen[0].latest_offset[0], 5.0f) && near(seen[0].latest_offset[1], 0.0f),
+           "and how far their newest snapshot has them from there, for their attacks");
     expect(players.sample("EggStarGalaxy", 2, start + 250ms).empty(), "not on another star");
     expect(players.sample("AstroGalaxy", 1, start + 250ms).empty(), "nor in another galaxy");
     send(2u, 99.0f, 260ms);
@@ -180,6 +182,17 @@ void test_remote_players() {
     expect(players.sample("AstroGalaxy", 1, start + 1700ms).size() == 1u, "a player who left is gone");
     players.clear();
     expect(players.sample("AstroGalaxy", 1, start + 1700ms).empty(), "and all of them with the room");
+    // A spin in their newest snapshot counts at once, though they're drawn as they were before it.
+    const std::uint32_t kSpin = 1u << 2;  // NEBULA_COOP_PLAYER_SPIN
+    PlayerSnapshot still = at(1u, 0.0f);
+    PlayerSnapshot spin = at(2u, 0.0f);
+    spin.flags |= kSpin;
+    players.receive(5u, 1u, "LUIGI", galaxy::CoopCharacter::Luigi, galaxy::coop::encode_snapshot(still), start);
+    players.receive(5u, 1u, "LUIGI", galaxy::CoopCharacter::Luigi, galaxy::coop::encode_snapshot(spin), start + 33ms);
+    seen = players.sample("EggStarGalaxy", 1, start + 40ms);
+    expect(seen.size() == 1u && (seen[0].snapshot.flags & kSpin) == 0u &&
+               (seen[0].latest_flags & kSpin) != 0u,
+           "their newest flags, ahead of the ones drawn");
 }
 
 bool wait_for(const std::function<bool()>& done, std::chrono::milliseconds limit = 10000ms) {

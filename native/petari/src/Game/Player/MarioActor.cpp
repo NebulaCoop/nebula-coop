@@ -107,6 +107,7 @@ MarioActor::MarioActor(const char* pName, bool extra) : LiveActor(pName), mFlash
     mSpinTicoTimer = 0;
     mSpinStarTimer = 0;
     mSpinStarEndTimer = 0;
+    mSpinRingOn = false;
     mThrowVecTimer = 0;
     mPlayerModeTimer = 0;
     mMorphTimer = 0;
@@ -1077,7 +1078,9 @@ void MarioActor::updatePunching() {
         }
 
         if (canSpinring && !mMario->isSwimming() && !mPunchHitTimer && selectAction("スピン回復エフェクト") == true) {
-            playEffect("スピンリング");
+            if (playEffect("スピンリング") != nullptr) {
+                mSpinRingOn = true;
+            }
         }
 
         bool canPunch = isInPunchTimerRange();
@@ -1200,6 +1203,7 @@ void MarioActor::updateSwingTimer() {
             if (--mSpinIntervalTimer == 0x18) {
                 selectAction("スピン回復エフェクト");
                 stopEffectForce("スピンリング");
+                mSpinRingOn = false;
             }
 
             if (mSpinIntervalTimer == 0xd) {

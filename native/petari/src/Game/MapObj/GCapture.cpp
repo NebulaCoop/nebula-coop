@@ -28,6 +28,7 @@
 
 #include "Game/System/NebulaInput.hpp"
 #include "Game/System/LumaCore.hpp"
+#include "Game/Player/NebulaRemotePlayer.hpp"
 
 namespace {
     const s32 sTargetKeepSteps = NebulaFrameClock::stepsOfMilliseconds(500);
@@ -119,6 +120,11 @@ void GCapture::control() {
 
     if (mTarget != nullptr) {
         mTargetKeepTime++;
+    }
+
+    // Online co-op: the others' copies of this player show the bubble while it holds them (NEBULA_COOP_PLAYER_PULL_STAR).
+    if (mBindActor != nullptr && canCancelBind()) {
+        NebulaRemotePlayer::noteLocalPullStar();
     }
 
     if (mBindActor != nullptr) {

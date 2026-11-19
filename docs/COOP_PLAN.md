@@ -302,8 +302,13 @@ packets. It has no physics or state machine of its own. It collides with the loc
   `MarioActor`'s is his), the same tint over its materials (the light's ambient colour, a white material) and
   the stage's fog on its materials, so it looks as the local Mario does standing there.
 - **Effects.** A copy plays Mario's spin effects (the spin light; the ice, fire and Bee spins) on its own joints as
-  its spin animation starts and ends, as `MarioAnimator`'s callbacks play them on him. Only those are registered on a
-  copy, not all of Mario's.
+  its spin animation starts and ends, as `MarioAnimator`'s callbacks play them on him, and those that go with a bck of
+  his (the Zzz while he sleeps). Only those are registered on a copy, not all of Mario's.
+- **What no animation plays.** Three things Mario's code (or a Pull Star's) shows go as snapshot flags, which add
+  nothing to its size: the spin's sparkle ring while it recovers (`NEBULA_COOP_PLAYER_SPIN_RING`), the Luma flying
+  back as the spin comes back (`SPIN_TICO`, `MarioActor`'s SpinTico model on the copy's base) and a Pull Star's bubble
+  (`PULL_STAR`: GCapture's LightGrow, then its Light half a second on, LightBreak as it lets go). The Pull Star in the
+  other player's game holds them; this game's own holds nobody, so without the flag it showed nothing.
 - **Not yet:** the power-up forms (Bee, Boo, Fire...: the copy is the plain model), the upper-body animations
   (holding a shell), sounds and the other effects. The copies share the model with a local player of the same character, so a
   form's colours on the local player can show on them.
@@ -553,8 +558,13 @@ The rules carried over, with SMG's equivalents (`NebulaRemotePlayer`, game API 4
   ground pound throws at 1.9 and its landing reaches 1.3 times as far round.
 - **Who decides.** As sm64coopdx: the victim's game. Each snapshot says whether its player spins or ground pounds; the
   victim's game checks that against where its own Mario was when the attacker saw him (`rewind_ms`: the round trip
-  between the two and both ways' drawing delay, sm64coopdx's `lag_compensation_get_local_state`) and moves only its
+  between the two and the attacker's drawing delay, sm64coopdx's `lag_compensation_get_local_state`) and moves only its
   own Mario. No message is sent for a hit, so collisions add nothing to a room's traffic.
+- **As soon as it arrives.** The attack is judged on the attacker's newest snapshot (`attack_flags`, and
+  `attack_offset` from where their copy stands), not on the copy, which is drawn 100 ms behind so it moves smoothly.
+  sm64coopdx judges a hit on the newest state it has, so a spin next to a player reaches them half a round trip after
+  it began. Judged on the copy, it came 100 ms later than that, and felt late. The copy's own spin still shows 100 ms
+  after the hit.
 - Not yet: a Fire Mario's fireballs and other thrown things, which other players' games don't draw.
 
 ## Bubble on death

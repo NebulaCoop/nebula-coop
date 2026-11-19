@@ -28,6 +28,8 @@
 #include "Game/Player/MarioHolder.hpp"
 #include "Game/Player/MarioModelTint.hpp"
 #include "Game/Player/NebulaCoopBubble.hpp"
+#include "Game/Player/MarioParts.hpp"
+#include "Game/System/NebulaFrameClock.hpp"
 #include "Game/Scene/SceneFunction.hpp"
 #include "Game/Scene/SceneObjHolder.hpp"
 #include "Game/Util/ActorSensorUtil.hpp"
@@ -35,6 +37,7 @@
 #include "Game/Util/DemoUtil.hpp"
 #include "Game/Util/EffectUtil.hpp"
 #include "Game/Util/EventUtil.hpp"
+#include "Game/Util/JointUtil.hpp"
 #include "Game/Util/LightUtil.hpp"
 #include "Game/Util/LiveActorUtil.hpp"
 #include "Game/Util/MathUtil.hpp"
@@ -70,6 +73,13 @@ namespace {
     // Races: noted by the racing actors as they run (sRacingNoted), and taken once a frame (sLocalRacing).
     bool sRacingNoted = false;
     bool sLocalRacing = false;
+    // A Pull Star holding the local Mario: noted and taken as the races are.
+    bool sPullStarNoted = false;
+    bool sLocalPullStar = false;
+    // GCapture's frames from holding the player (its LightGrow) to its bubble (Light).
+    const s32 cPullStarLightAfter = NebulaFrameClock::stepsOfMilliseconds(500);
+    // The Luma coming back after a spin (MarioActor::updateFairyStar): its light.
+    const f32 cSpinTicoLight = 0.001f;
     // How opaque another player is while either of you races (the see-through Mario's colour 2 alpha).
     const u8 cGhostAlpha = 0x60;
     // sm64coopdx keeps players from touching in their first 60 frames in an area: here the scene's and each copy's.
@@ -159,6 +169,13 @@ namespace {
     const f32 cFrameSnap = 6.0f;
     const f32 cFrameEase = 0.25f;
 
+    // An effect this actor has, stopped at once (one it lacks has no emitter to stop: forceDeleteEffect crashed).
+    void stopEffectNow(LiveActor* pActor, const char* pName) {
+        if (MR::isExistEffectKeeper(pActor) && MR::isRegisteredEffect(pActor, pName)) {
+            MR::forceDeleteEffect(pActor, pName);
+        }
+    }
+
     // The local Mario `ms` ago (at 60 frames a second), as far back as is kept.
     const Sample& rewound(u32 ms) {
         s32 frames = static_cast< s32 >(ms * 60 / 1000);
@@ -172,6 +189,32 @@ namespace {
         return sHistory[index];
     }
 };  // namespace
+
+// A Pull Star's bubble round another player (GCapture's effects, "GCapture"): grown as it takes them, held round them,
+// burst as it lets them go. The Pull Star in their game holds them; this game's own doesn't, so it shows nothing.
+class NebulaPullStarLight : public LiveActor {
+public:
+    NebulaPullStarLight() : LiveActor("NebulaPullStarLight") {}
+
+    virtual void init(const TableIter& rIter) {
+        MR::connectToSceneMapObjDecorationMovement(this);
+        initEffectKeeper(0, "GCapture");
+        // At the player's feet, where GCapture puts its own (mEffectPos: the base of the player it holds).
+        MR::setEffectHostSRT(this, "LightGrow", &mPosition, nullptr, nullptr);
+        MR::setEffectHostSRT(this, "Light", &mPosition, nullptr, nullptr);
+        MR::setEffectHostSRT(this, "LightBreak", &mPosition, nullptr, nullptr);
+        MR::invalidateClipping(this);
+        makeActorAppeared();
+    }
+};
+
+void NebulaRemotePlayer::noteLocalPullStar() {
+    sPullStarNoted = true;
+}
+
+bool NebulaRemotePlayer::isLocalPullStar() {
+    return sLocalPullStar;
+}
 
 void NebulaRemotePlayer::noteLocalRacing() {
     sRacingNoted = true;
@@ -192,8 +235,9 @@ NebulaRemotePlayer::NebulaRemotePlayer(s32 character)
                 : character == NebulaCharacters::cLuigi ? "NebulaRemoteLuigi"
                                                         : "NebulaRemoteCharacter"),
       mIsLuigi(NebulaCharacters::isLuigi(character)), mNumber(0), mXanimePlayer(nullptr),
-      mLastFrame(0.0f), mFront(0.0f, 0.0f, 1.0f), mUp(0.0f, 1.0f, 0.0f), mRewindMs(0), mShownFrames(0),
-      mStompTimer(0), mSolid(false), mBubble(nullptr), mWantedInfo(nullptr) {
+      mLastFrame(0.0f), mFront(0.0f, 0.0f, 1.0f), mUp(0.0f, 1.0f, 0.0f), mRewindMs(0), mAttackFlags(0),
+      mAttackOffset(0.0f, 0.0f, 0.0f), mShownFrames(0), mStompTimer(0), mSolid(false), mBubble(nullptr),
+      mWantedInfo(nullptr), mEffectFlags(0), mSpinTico(nullptr), mPullStarLight(nullptr), mPullStarFrames(0) {
     mName[0] = '\0';
     mGroup[0] = '\0';
     mWantedGroup[0] = '\0';
@@ -214,6 +258,8 @@ void NebulaRemotePlayer::forgetAll() {
     sHistoryNum = 0;
     sRacingNoted = false;
     sLocalRacing = false;
+    sPullStarNoted = false;
+    sLocalPullStar = false;
 }
 
 void NebulaRemotePlayer::addCopy(s32 character) {
@@ -324,6 +370,8 @@ void NebulaRemotePlayer::updateAll() {
     // Whether a race ran this frame (or the last, by the order things move in), taken even with nobody to show.
     sLocalRacing = sRacingNoted;
     sRacingNoted = false;
+    sLocalPullStar = sPullStarNoted;
+    sPullStarNoted = false;
     if (sCopyNum == 0) {
         return;
     }
@@ -457,7 +505,9 @@ void NebulaRemotePlayer::init(const TableIter& rIter) {
             if (pInfo->mParentName != nullptr) {
                 wanted = mEffectKeeper->isRegisteredEmitter(pInfo->mParentName);
             } else {
-                wanted = pInfo->mAnimName != nullptr || isAnimationEffect(pInfo->getName());
+                // (and the spin's ring as it recovers, which Mario's code plays: NEBULA_COOP_PLAYER_SPIN_RING)
+                wanted = pInfo->mAnimName != nullptr || isAnimationEffect(pInfo->getName()) ||
+                         strcmp(pInfo->getName(), "SpinRing") == 0;
             }
             if (wanted) {
                 MR::Effect::addAutoEffect(mEffectKeeper, this, pInfo);
@@ -465,6 +515,14 @@ void NebulaRemotePlayer::init(const TableIter& rIter) {
         }
     }
     MR::connectToScene(this, MR::MovementType_Player, MR::CalcAnimType_Player, MR::DrawBufferType_None, MR::DrawType_Player);
+
+    // The Luma that comes back after a spin, as MarioActor::initParts makes the local Mario's (on his base matrix), and
+    // a Pull Star's bubble.
+    mSpinTico = new MarioParts(this, "スピンチコ", "SpinTico", false, getBaseMtx(), nullptr);
+    mSpinTico->initWithoutIter();
+    mSpinTico->kill();
+    mPullStarLight = new NebulaPullStarLight();
+    mPullStarLight->initWithoutIter();
 
     // The body the local Mario bumps into, as the cosmic ghost's; off until the two may touch.
     initHitSensor(1);
@@ -482,6 +540,8 @@ void NebulaRemotePlayer::show(const NebulaCoopRemotePlayer& rRemote) {
     const bool isNew = mNumber != rRemote.number;
     mNumber = rRemote.number;
     mRewindMs = rRemote.rewind_ms;
+    mAttackFlags = rRemote.attack_flags;
+    mAttackOffset.set(rRemote.attack_offset[0], rRemote.attack_offset[1], rRemote.attack_offset[2]);
     if (isNew) {
         mShownFrames = 0;
         mStompTimer = 0;
@@ -508,14 +568,16 @@ void NebulaRemotePlayer::show(const NebulaCoopRemotePlayer& rRemote) {
     // they ride it here even when it isn't where it is in their game.
     NebulaCoopWorld::placeOnPlatform(mState, &mPosition, &mFront, &mUp);
     if (isNew) {
-        // Another player on this copy: their animation starts afresh.
+        // Another player on this copy: their animation starts afresh, and the last one's effects end.
         stopAnimationEffect();
         mGroup[0] = '\0';
         mLastFrame = 0.0f;
+        updateFlagEffects(0);
     }
     if (MR::isDead(this)) {
         appear();
     }
+    updateFlagEffects(mState.flags);
     // Their bubble, round their body's middle; bursting as they're let out.
     if (mBubble != nullptr) {
         if ((mState.flags & NEBULA_COOP_PLAYER_BUBBLED) != 0) {
@@ -536,8 +598,61 @@ void NebulaRemotePlayer::hide() {
     if (mBubble != nullptr) {
         mBubble->hide();
     }
+    updateFlagEffects(0);
     if (!MR::isDead(this)) {
         makeActorDead();
+    }
+}
+
+void NebulaRemotePlayer::updateFlagEffects(u32 flags) {
+    const u32 was = mEffectFlags;
+    mEffectFlags = flags;
+
+    // The spin's ring as it recovers (MarioActor::updatePunching plays it, updateSwingTimer stops it).
+    if ((flags & NEBULA_COOP_PLAYER_SPIN_RING) != 0 && (was & NEBULA_COOP_PLAYER_SPIN_RING) == 0) {
+        MR::tryEmitEffect(this, "SpinRing");
+    } else if ((flags & NEBULA_COOP_PLAYER_SPIN_RING) == 0 && (was & NEBULA_COOP_PLAYER_SPIN_RING) != 0) {
+        stopEffectNow(this, "SpinRing");
+    }
+
+    // The Luma coming back as the spin does (MarioActor::updateFairyStar): its flight, lit as it goes.
+    if (mSpinTico != nullptr) {
+        if ((flags & NEBULA_COOP_PLAYER_SPIN_TICO) != 0) {
+            if (MR::isDead(mSpinTico)) {
+                mSpinTico->appear();
+                mSpinTico->mRotation.set(0.0f, 0.0f, 0.0f);
+                MR::startBck(mSpinTico, "SpinTimer");
+            }
+            Vec3f position;
+            MR::copyJointPos(mSpinTico, "Center", &position);
+            MR::requestPointLight(mSpinTico, position, Color8(255, 225, 225, 255), cSpinTicoLight, 0);
+        } else if (!MR::isDead(mSpinTico)) {
+            mSpinTico->kill();
+        }
+    }
+
+    // A Pull Star's bubble (GCapture): grown as it takes them, round them half a second on, burst as it lets go.
+    if (mPullStarLight != nullptr) {
+        mPullStarLight->mPosition.set(mPosition);
+        if ((flags & NEBULA_COOP_PLAYER_PULL_STAR) != 0) {
+            if ((was & NEBULA_COOP_PLAYER_PULL_STAR) == 0) {
+                mPullStarFrames = 0;
+                MR::tryEmitEffect(mPullStarLight, "LightGrow");
+            }
+            if (mPullStarFrames == cPullStarLightAfter) {
+                MR::tryEmitEffect(mPullStarLight, "Light");
+            }
+            if (mPullStarFrames <= cPullStarLightAfter) {
+                mPullStarFrames++;
+            }
+        } else if ((was & NEBULA_COOP_PLAYER_PULL_STAR) != 0) {
+            stopEffectNow(mPullStarLight, "LightGrow");
+            stopEffectNow(mPullStarLight, "Light");
+            // Burst where they were let go; a copy that stopped showing them just loses it.
+            if (mNumber != 0) {
+                MR::tryEmitEffect(mPullStarLight, "LightBreak");
+            }
+        }
     }
 }
 
@@ -733,7 +848,12 @@ bool NebulaRemotePlayer::isGhosted() const {
 }
 
 void NebulaRemotePlayer::tryAttackLocal() {
-    const u32 flags = mState.flags;
+    // As their newest snapshot has them, not the copy a drawing delay behind it: a spin next to the local Mario reaches
+    // him half a round trip after it began, as in sm64coopdx, not 100 ms more.
+    const u32 flags = mAttackFlags;
+    if ((flags & (NEBULA_COOP_PLAYER_INTANGIBLE | NEBULA_COOP_PLAYER_DEAD)) != 0) {
+        return;
+    }
     const bool revamped = sRules.pvp == NEBULA_COOP_PVP_REVAMPED;
     // Their attack and how far it throws (sm64coopdx's scaler): a ground pound as its kick, a spin as its punch, which
     // revamped makes a stagger on the spot. A Rainbow Star's player throws whoever they touch.
@@ -765,7 +885,7 @@ void NebulaRemotePlayer::tryAttackLocal() {
     if (stagger && rPast.mSpinning) {
         return;
     }
-    const Vec3f center = mPosition + mUp * cBodyCenter;
+    const Vec3f center = mPosition + mAttackOffset + mUp * cBodyCenter;
     const Vec3f offset = rPast.mCenter - center;
     const f32 down = offset.dot(rPast.mGravity);
     const Vec3f across = offset - rPast.mGravity * down;
@@ -777,7 +897,7 @@ void NebulaRemotePlayer::tryAttackLocal() {
     // frame's, Galaxy's a 60 Hz one's); friendly fire costs health as an enemy's hit does. (normalizeOrZero is true
     // when the vector was zero: only then, standing inside them, is he thrown backwards from where he faces.)
     Vec3f away;
-    MR::vecKillElement(pMario->mPosition - mPosition, pMario->getGravityVec(), &away);
+    MR::vecKillElement(pMario->mPosition - (mPosition + mAttackOffset), pMario->getGravityVec(), &away);
     if (MR::normalizeOrZero(&away)) {
         away = -pMario->mMario->mFrontVec;
     }

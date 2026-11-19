@@ -8,6 +8,7 @@
 #include "Game/System/GameDataFunction.hpp"
 #include "Game/LiveActor/LiveActor.hpp"
 #include "Game/Util/LiveActorUtil.hpp"
+#include "Game/Util/EffectUtil.hpp"
 #include "Game/LiveActor/ClippingActorHolder.hpp"
 #include "Game/LiveActor/ClippingActorInfo.hpp"
 #include "Game/LiveActor/ClippingDirector.hpp"
@@ -380,6 +381,17 @@ namespace {
         }
         if (NebulaRemotePlayer::isLocalRacing()) {
             player.flags |= NEBULA_COOP_PLAYER_RACING;
+        }
+        // What the others' copies show that no animation plays: the spin's ring as it recovers (while it lasts), the
+        // Luma coming back after a spin, and a Pull Star's bubble.
+        if (pActor->mSpinRingOn && MR::isEffectValid(pActor, "スピンリング")) {
+            player.flags |= NEBULA_COOP_PLAYER_SPIN_RING;
+        }
+        if (pActor->mSpinTico != nullptr && !MR::isDead(pActor->mSpinTico)) {
+            player.flags |= NEBULA_COOP_PLAYER_SPIN_TICO;
+        }
+        if (NebulaRemotePlayer::isLocalPullStar()) {
+            player.flags |= NEBULA_COOP_PLAYER_PULL_STAR;
         }
         player.area = NebulaCoopBubble::getArea();
         NebulaCoopWorld::notePlatform(&player);

@@ -4109,13 +4109,16 @@ uint32_t svc_coop_remote(void*, NebulaCoopRemotePlayer* players, uint32_t capaci
             player.platform_front[j] = snapshot.platform_front[j];
             player.platform_up[j] = snapshot.platform_up[j];
         }
-        // Their snapshot came half a round trip ago and shows kSnapshotDelay late; what they saw of this player had
-        // come and shown as late. Two joiners reach each other through the host: each one's ping is to it.
+        // Their attacks as their newest snapshot has them (half a round trip ago), not kSnapshotDelay later as their
+        // copy shows them: what they saw of this player had come half a round trip and shown kSnapshotDelay late.
+        // Two joiners reach each other through the host: each one's ping is to it.
+        to.attack_flags = from.latest_flags;
+        for (std::size_t j = 0; j < 3u; ++j) to.attack_offset[j] = from.latest_offset[j];
         const auto them = std::find_if(room.begin(), room.end(),
                                        [&](const galaxy::coop::SessionPlayer& in) { return in.id == from.id; });
         const bool both_joiners = !gCoopSession.is_host() && them != room.end() && !them->host;
         const unsigned round_trip = them != room.end() ? them->ping_ms * (both_joiners ? 2u : 1u) : 0u;
-        to.rewind_ms = round_trip + 2u * static_cast<unsigned>(galaxy::coop::kSnapshotDelay.count());
+        to.rewind_ms = round_trip + static_cast<unsigned>(galaxy::coop::kSnapshotDelay.count());
     }
     return static_cast<uint32_t>(remote.size());
 }

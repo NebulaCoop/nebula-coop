@@ -448,6 +448,10 @@ enum {
     NEBULA_COOP_PLAYER_RACING = 1u << 7,         /* in a race of their own (a cosmic racer, a Boo, the penguins,
                                                     the surfing rays, the swim through the rings): see-through to
                                                     everyone, and no player touches them until it ends */
+    /* What their copies show that no animation of theirs plays: */
+    NEBULA_COOP_PLAYER_SPIN_RING = 1u << 8,      /* the spin's sparkle ring while it recovers (スピンリング) */
+    NEBULA_COOP_PLAYER_SPIN_TICO = 1u << 9,      /* the Luma flying back to them as the spin comes back (SpinTico) */
+    NEBULA_COOP_PLAYER_PULL_STAR = 1u << 10,     /* held by a Pull Star, in its bubble (GCapture's Light) */
 };
 
 /* Another player in the same instance (the stage and the scenario) as the local one, for its copy to draw
@@ -459,8 +463,12 @@ typedef struct NebulaCoopRemotePlayer {
                                 session last told it (a moment behind the flag as they switch: a character whose base
                                 isn't the flag's is shown as the flag's) */
     uint32_t rewind_ms;      /* how long ago the local player was where this player saw them as they did what
-                                `player` shows: the round trip between the two and both ways' drawing delay
-                                (sm64coopdx's lag compensation) */
+                                `attack_flags` shows: the round trip between the two and the drawing delay of this
+                                player's copy of them (sm64coopdx's lag compensation) */
+    uint32_t attack_flags;   /* NEBULA_COOP_PLAYER_*, as their newest snapshot has them: their attacks count as soon as
+                                they arrive, not a drawing delay later (sm64coopdx judges a hit on the newest state) */
+    float attack_offset[3];  /* where their newest snapshot has them, from where `player` does (0 while they stand on
+                                the same platform in both) */
 } NebulaCoopRemotePlayer;
 
 /* The room's rules for players (coop_rules, docs/COOP_PLAN.md "Player collisions" and "Bubble on death"): the room's
