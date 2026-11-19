@@ -20,7 +20,7 @@ artifact under **Artifacts**. You need to be signed in to GitHub.
 
 Keep the folder's files together: with a mod on, the game needs `nebula_import.dll` (`libnebula_import.so` on Linux)
 beside it, and the Direct3D 12 program also `dxc\`. When one is missing every mod is off for that start, and the mod log
-says which part was missing. Copying the test build over an installed Nebula's version folder replaces those files too.
+says which part was missing.
 
 ## Windows and Linux
 
