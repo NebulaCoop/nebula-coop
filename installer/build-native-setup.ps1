@@ -93,11 +93,11 @@ BEGIN
   BEGIN
     BLOCK "040904b0"
     BEGIN
-      VALUE "CompanyName", "keepvaibin"
+      VALUE "CompanyName", "keepvaibin | Mackery"
       VALUE "FileDescription", "$Description"
       VALUE "FileVersion", "$Version"
       VALUE "InternalName", "$Name"
-      VALUE "LegalCopyright", "Copyright 2026 keepvaibin"
+      VALUE "LegalCopyright", "Copyright 2026 keepvaibin, Mackery"
       VALUE "OriginalFilename", "$OriginalName"
       VALUE "ProductName", "NebulaCoop"
       VALUE "ProductVersion", "$Version"

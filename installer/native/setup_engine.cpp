@@ -970,7 +970,7 @@ std::vector<wstring> Register(const InstallLayout& layout, const wstring& versio
         Key uninstall(kUninstallKey);
         uninstall.Set(L"DisplayName", paths::kProductName);
         uninstall.Set(L"DisplayVersion", version);
-        uninstall.Set(L"Publisher", L"keepvaibin");
+        uninstall.Set(L"Publisher", L"keepvaibin | Mackery");
         uninstall.Set(L"InstallLocation", layout.root);
         uninstall.Set(L"DisplayIcon", PathCombine(layout.VersionDir(version), L"Nebula.exe"));
         uninstall.Set(L"UninstallString", L"\"" + layout.SetupCopy() + L"\" --uninstall");
