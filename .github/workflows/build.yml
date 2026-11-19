@@ -41,8 +41,9 @@ jobs:
   #   android:   the Android test build: shared code and platform/android. A change to platform/android alone
   #              builds Android only;
   #   installer: Nebula Setup and the install root's Nebula.exe (installer/native), compiled.
-  # Documentation, the other workflows, the NebulaNet and website submodules and tools/ affect none. A file both use
-  # (the icon the host and Setup are both built with, the store version Setup writes) and this workflow itself run all.
+  # Documentation, the other workflows, the NebulaNet and website submodules and the tools no build runs affect none. A
+  # file both use (the icon the host and Setup are both built with, the store version Setup writes) and this workflow
+  # itself run all.
   # Run workflow builds everything.
   #
   # A part that changed is then left to an earlier run of the branch that is still going, when nothing in it changed
@@ -86,6 +87,13 @@ jobs:
                 platform/android/*) android=true ;;
                 # The lumalink submodule's commit carries the built-in mods the host embeds.
                 lumalink) game=true; android=true ;;
+                # The tools the builds run (the row generator, the shader compilers, the text packer and the
+                # rest the CMake files and build scripts name) are the game's; the one Setup's compile runs is its.
+                tools/lumacore/* | tools/dev/* | tools/ci/* | tools/package_text.py | tools/check_platform_items.py | \
+                tools/compile_metallib.py | tools/programs_msl.cpp | tools/utility_msl.cpp | tools/msl_check.mm | \
+                tools/narrow_float_audit.py)
+                  game=true; android=true ;;
+                tools/enter_msvc_environment.ps1) installer=true ;;
                 # A submodule's new commit shows as its path alone: nebulanet and web are never built here.
                 *.md | docs/* | LICENSE | .github/* | nebulanet | nebulanet/* | web | web/* | tools/*) ;;
                 installer/assets/* | runtime/include/galaxy/store_version.inc)
@@ -115,7 +123,7 @@ jobs:
             # run's jobs, starting after its, would cancel them.
             newer=$(branch_runs | awk -v me="$GITHUB_RUN_NUMBER" '$2 > me && $3 != "completed" { print $1; exit }')
             if [ -n "$newer" ]; then
-              echo "Run $newer of this branch is newer and still going: it builds what this one would have."
+              echo "::notice::Run $newer of this branch is newer and still going: it builds this commit's changes too, compared with the same last good build. This run is cancelled."
               if gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/cancel" --silent; then
                 sleep 120
               fi
@@ -366,6 +374,21 @@ jobs:
             build/host/fidelityfx.built
             build/host/_deps
           key: host-deps-${{ matrix.vulkan }}-${{ hashFiles('cmake/**', 'third_party/archive/**') }}
+      # The compiled shader stages (tools/dev/compile_programs.py keeps each beside its blob, named by what decides it,
+      # and drops the ones no build uses): only the stages that changed are compiled again. The runner image names the
+      # Windows SDK's dxc, which compile_programs.py knows by its path only.
+      - name: Runner image
+        id: image
+        shell: bash
+        run: echo "version=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+      - name: Cache the compiled shader stages
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/host/generated/programs_dxil.bin.stages
+            build/host/generated/programs_spirv.bin.stages
+          key: host-programs-${{ matrix.vulkan }}-${{ steps.image.outputs.version }}-${{ hashFiles('runtime/src/render/**', 'runtime/include/**', 'tools/dev/**', 'cmake/vulkan_deps.cmake') }}
+          restore-keys: host-programs-${{ matrix.vulkan }}-${{ steps.image.outputs.version }}-
       - uses: mozilla-actions/sccache-action@v0.0.11
       - name: Start sccache
         run: sccache --start-server
@@ -436,11 +459,36 @@ jobs:
           path: |
             build/game/archive-deps
           key: game-archive-deps-${{ hashFiles('cmake/**', 'third_party/archive/**') }}
+      # The row generator's outputs (tools/lumacore/instrument.py, NEBULA_LUMA_CACHE): a unit none of whose files
+      # changed is taken from here instead of parsed again. Entries no build used are dropped before saving.
+      - name: Cache the row generator's outputs
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/luma-cache
+          key: game-luma-${{ hashFiles('tools/lumacore/*.py') }}-${{ github.sha }}
+          restore-keys: game-luma-${{ hashFiles('tools/lumacore/*.py') }}-
+      - name: Note the time
+        id: started
+        shell: bash
+        run: echo "at=$(date +%s)" >> "$GITHUB_OUTPUT"
       - uses: mozilla-actions/sccache-action@v0.0.11
       - name: Start sccache
         run: sccache --start-server
       - name: Build
-        run: .\native\build.ps1 -Petari native\petari -Build build\game -Llvm (Join-Path $env:RUNNER_TEMP 'llvm\bin')
+        env:
+          NEBULA_LUMA_CACHE: ${{ runner.temp }}/luma-cache
+        # The x86-64-v3 module only (-NoBaseline): the test build carries no other, and the x86-64-v2 one is the same
+        # source compiled again (row generator included), which doubled this job. The release builds both. Compiles go
+        # through sccache, as the host jobs' do, and the row generator takes each unchanged unit from its cache.
+        run: >-
+          .\native\build.ps1 -Petari native\petari -Build build\game -Llvm (Join-Path $env:RUNNER_TEMP 'llvm\bin')
+          -NoBaseline -UseSccache
+      - name: Drop unused row generator outputs
+        shell: bash
+        env:
+          CACHE: ${{ runner.temp }}/luma-cache
+          STARTED: ${{ steps.started.outputs.at }}
+        run: tools/ci/prune_luma_cache.sh "$CACHE" "$STARTED"
       - uses: actions/upload-artifact@v7
         with:
           name: windows-game-module
@@ -487,19 +535,29 @@ jobs:
       group: ${{ github.workflow }}-${{ github.ref }}-linux
       cancel-in-progress: true
     runs-on: ubuntu-24.04
+    env:
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/Checkout@v7
       # The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake).
       - name: Built-in mods
         run: git submodule update --init --depth 1 lumalink
       - name: System packages
-        # SDL3's video, audio and input back ends (X11, Wayland, ALSA, PulseAudio, PipeWire, udev).
+        # SDL3's video, audio and input back ends (X11, Wayland, ALSA, PulseAudio, PipeWire, udev), and the game
+        # module's row generator's libclang 22 (tools/lumacore/gen_types.py reads some member types differently with
+        # 21; Ubuntu 24.04 has 18), as the release's game build uses. One package list update for both. The manual
+        # page index is not rebuilt after each package (man-db's trigger): minutes on a runner, for pages nobody reads.
         run: |
+          sudo rm -f /var/lib/man-db/auto-update
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm-22.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang ninja-build patchelf \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev \
             libwayland-dev libxkbcommon-dev wayland-protocols libdecor-0-dev libegl-dev \
-            libasound2-dev libpulse-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev \
+            clang-22 libclang1-22 libclang-common-22-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Dependencies
@@ -515,29 +573,48 @@ jobs:
           clone KhronosGroup/glslang "$GLSLANG_TAG" glslang-src
           pin KhronosGroup/SPIRV-Tools "$SPIRV_TOOLS_COMMIT" glslang-src/External/spirv-tools
           pin KhronosGroup/SPIRV-Headers "$SPIRV_HEADERS_COMMIT" glslang-src/External/spirv-tools/external/spirv-headers
+      # As the Windows jobs: compiles through sccache, the compiled shader stages and the row generator's outputs kept
+      # between runs (see the Host and Game module jobs).
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Start sccache
+        run: sccache --start-server
+      - name: Cache the compiled shader stages
+        uses: actions/cache@v6
+        with:
+          path: build/host/generated/programs_spirv.bin.stages
+          key: linux-programs-${{ hashFiles('runtime/src/render/**', 'runtime/include/**', 'tools/dev/**', 'cmake/vulkan_deps.cmake') }}
+          restore-keys: linux-programs-
+      - name: Cache the row generator's outputs
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/luma-cache
+          key: linux-luma-${{ hashFiles('tools/lumacore/*.py') }}-${{ github.sha }}
+          restore-keys: linux-luma-${{ hashFiles('tools/lumacore/*.py') }}-
+      - name: Note the time
+        id: started
+        run: echo "at=$(date +%s)" >> "$GITHUB_OUTPUT"
       - name: Host
         env:
           CC: clang
           CXX: clang++
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
         run: |
           cmake -S platform/sdl -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release "-DNEBULA_DEPS=$PWD/deps"
           cmake --build build/host --target main
-      - name: LLVM 22
-        # The game module's row generator needs libclang 22, as the release's game build uses (tools/lumacore/gen_types.py reads some member types
-        # differently with 21); Ubuntu 24.04 has 18.
-        run: |
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm-22.list
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang-22 libclang1-22 libclang-common-22-dev
       - name: Game module
         env:
           CC: clang-22
           CXX: clang++-22
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
+          NEBULA_LUMA_CACHE: ${{ runner.temp }}/luma-cache
         run: |
           # apt.llvm.org names its libclang libclang-22.so.1, which the row generator does not find beside the compiler.
           cmake -S native -B build/game -G Ninja -DCMAKE_BUILD_TYPE=Release -DNEBULA_LIBCLANG=/usr/lib/llvm-22/lib/libclang-22.so.1
           cmake --build build/game --target smg_game
+      - name: Drop unused row generator outputs
+        run: tools/ci/prune_luma_cache.sh "$RUNNER_TEMP/luma-cache" "${{ steps.started.outputs.at }}"
       - name: Disc import tool
         run: cargo build --release --locked -p nebula-import --bin nebula-import
       - name: Stage
@@ -562,7 +639,7 @@ jobs:
   android-check:
     name: Android check
     needs: [changes, host, game]
-    if: always() && needs.changes.outputs.android == 'true' && needs.game.result == 'success'
+    if: ${{ !cancelled() && needs.changes.outputs.android == 'true' && needs.game.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -599,7 +676,7 @@ jobs:
     # does a newer run already building Android (Android check).
     needs: [changes, host, game, android-check]
     if: >-
-      always() && needs.changes.outputs.android == 'true' &&
+      !cancelled() && needs.changes.outputs.android == 'true' &&
       !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') &&
       needs.android-check.outputs.newer != 'true'
     concurrency:
@@ -608,6 +685,8 @@ jobs:
     runs-on: windows-2025
     env:
       LLVM_VERSION: '22.1.6'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/Checkout@v7
       # The built-in mods, packed in the lumalink submodule (cmake/nebula_builtin_mods.cmake).
@@ -615,7 +694,11 @@ jobs:
         run: git submodule update --init --depth 1 lumalink
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,x86_64-linux-android
+          targets: aarch64-linux-android
+      # The importer's crates, built where build_apk.ps1 puts them (CARGO_TARGET_DIR).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> build/android/cargo"
       - name: LLVM
         # The game module's row generator runs on this machine and needs libclang 21 or later
         # (tools/lumacore/instrument.py); the NDK has none and the runner's is 20. The Game module job's LLVM: the APK
@@ -681,12 +764,38 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "the shader tools did not build" }
           New-Item -ItemType Directory -Force build/spirv-tools | Out-Null
           Copy-Item build/host/galaxy_native_spirv.exe, build/host/galaxy_utility_spirv.exe build/spirv-tools
+      # As the Windows jobs: compiles through sccache, and the row generator's outputs kept between runs.
+      - name: Cache the row generator's outputs
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/luma-cache
+          key: android-luma-${{ hashFiles('tools/lumacore/*.py') }}-${{ github.sha }}
+          restore-keys: android-luma-${{ hashFiles('tools/lumacore/*.py') }}-
+      - name: Note the time
+        id: started
+        shell: bash
+        run: echo "at=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Start sccache
+        run: sccache --start-server
       - name: APK
-        # Debug-signed: no -Signing.
+        # Debug-signed: no -Signing. A test build, as the Windows one: arm64 only (the phones it is for; x86_64 is for
+        # emulators) and without ThinLTO (-Plain), which the release's APK keeps.
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
+          NEBULA_LUMA_CACHE: ${{ runner.temp }}/luma-cache
         run: |
           $env:JAVA_HOME = $env:JAVA_HOME_17_X64
           $env:LLVM_ROOT = Join-Path $env:RUNNER_TEMP 'llvm'
-          .\platform\android\build_apk.ps1 -Deps "$PWD\deps" -Work "$PWD\build\android" -HostTools "$PWD\build\spirv-tools"
+          .\platform\android\build_apk.ps1 -Deps "$PWD\deps" -Work "$PWD\build\android" -HostTools "$PWD\build\spirv-tools" `
+              -Abis arm64-v8a -Plain
+      - name: Drop unused row generator outputs
+        shell: bash
+        env:
+          CACHE: ${{ runner.temp }}/luma-cache
+          STARTED: ${{ steps.started.outputs.at }}
+        run: tools/ci/prune_luma_cache.sh "$CACHE" "$STARTED"
       - name: Logs
         if: failure()
         uses: actions/upload-artifact@v7
@@ -853,7 +962,9 @@ jobs:
   # block a merge: those ports aren't finished.
   result:
     name: Build result
-    if: always()
+    # Not always(): a run that was cancelled (by hand, or by its own Changes job for a newer run) ends at once, instead
+    # of waiting for a runner and then for its cancelled jobs. A run that is going reports here, skipped jobs included.
+    if: ${{ !cancelled() }}
     needs: [changes, earlier, import, host, game, windows, installer]
     runs-on: ubuntu-24.04
     permissions:
