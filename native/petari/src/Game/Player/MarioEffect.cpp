@@ -1277,6 +1277,7 @@ void MarioActor::stopSpinTicoEffect(bool force) {
     mSpinStarTimer = 0;
     mSpinStarEndTimer = 0;
     mSpinIntervalTimer = 0;
+    mSpinRingOn = false;
 
     if (force) {
         stopEffectForce("スピンリング");

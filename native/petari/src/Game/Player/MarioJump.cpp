@@ -96,6 +96,7 @@ void Mario::tryJump() {
 
     playEffect("共通跳躍");
     stopEffectForce("スピンリング");
+    mActor->mSpinRingOn = false;
 
     const bool isSquat = checkSquat(true);
     mMovementStates.squatLocked = true;

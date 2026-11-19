@@ -116,6 +116,11 @@ struct RemotePlayer {
     std::string name;
     CoopCharacter character = CoopCharacter::Mario;
     PlayerSnapshot snapshot;
+    // What their newest snapshot says, without the drawing delay, for their attacks (sm64coopdx judges a hit on the
+    // newest state it has of the attacker): its flags, and where it has them from where `snapshot` does (none while
+    // both stand on the same platform, which this game moves on itself).
+    std::uint32_t latest_flags = 0u;
+    std::array<float, 3> latest_offset{};
 };
 
 // The other players' snapshots as they come (on the session's thread), and as the game draws them (on its own).
