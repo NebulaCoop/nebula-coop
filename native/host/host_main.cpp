@@ -2491,14 +2491,17 @@ std::atomic<bool> gCoopLuigi{false};
 // And its id (coop_character_wanted): a mod's character on that base, else the base's own ("mario", "luigi").
 std::mutex gCoopCharacterLock;
 std::string gCoopCharacterId = "mario";
-// And the colours (coop_palette_wanted): Options', or none for the character's own.
+// And the colours (coop_palette_wanted): Options', or none for the character's own (CUSTOM keeps its colours written
+// out even when they are the character's own; worn, they are none, as OWN).
 std::optional<galaxy::CoopPalette> gCoopPalette;
 
 void set_coop_character_wanted(const galaxy::RuntimeCoopSettings& coop) {
     gCoopLuigi.store(coop.character == galaxy::CoopCharacter::Luigi, std::memory_order_relaxed);
+    std::optional<galaxy::CoopPalette> palette = galaxy::parse_coop_palette(coop.palette);
+    if (palette && *palette == galaxy::own_palette(coop)) palette.reset();
     const std::lock_guard<std::mutex> lock(gCoopCharacterLock);
     gCoopCharacterId = galaxy::coop_character_id(coop);
-    gCoopPalette = galaxy::parse_coop_palette(coop.palette);
+    gCoopPalette = palette;
 }
 
 // The room's chat (galaxy/coop_chat.h), over the session below (which goes first, its thread giving the chat lines),
@@ -3215,16 +3218,17 @@ bool poll_coop_join() {
 void keep_coop_settings() {
 #if defined(NEBULA_HOST_RENDERER)
     galaxy::RuntimeSettings settings = galaxy::get_runtime_settings();
-    // The player's name, character and colours are Options' (its PLAYER page): the menu takes them, never gives them
-    // back.
+    // The player's name, character and colours (CUSTOM's kept ones too) are Options' (its PLAYER page): the menu takes
+    // them, never gives them back.
     if (gCoopMenu.room().player_name != settings.coop.player_name ||
         gCoopMenu.room().character != settings.coop.character || gCoopMenu.room().character_id != settings.coop.character_id ||
-        gCoopMenu.room().palette != settings.coop.palette) {
+        gCoopMenu.room().palette != settings.coop.palette || gCoopMenu.room().custom_palette != settings.coop.custom_palette) {
         galaxy::RuntimeCoopSettings room = gCoopMenu.room();
         room.player_name = settings.coop.player_name;
         room.character = settings.coop.character;
         room.character_id = settings.coop.character_id;
         room.palette = settings.coop.palette;
+        room.custom_palette = settings.coop.custom_palette;
         gCoopMenu.set_room(room);
     }
     if (settings.coop == gCoopMenu.room()) return;

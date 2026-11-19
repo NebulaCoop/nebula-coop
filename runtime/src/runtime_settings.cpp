@@ -172,10 +172,12 @@ RuntimeSettings sanitize_settings(RuntimeSettings settings) {
     if (settings.coop.character > CoopCharacter::Luigi) {
         settings.coop.character = CoopCharacter::Mario;
     }
-    if (const auto palette = parse_coop_palette(settings.coop.palette)) {
-        settings.coop.palette = format_coop_palette(*palette);
-    } else {
-        settings.coop.palette.clear();
+    for (std::string* text : {&settings.coop.palette, &settings.coop.custom_palette}) {
+        if (const auto palette = parse_coop_palette(*text)) {
+            *text = format_coop_palette(*palette);
+        } else {
+            text->clear();
+        }
     }
     settings.coop.character_id = clean_character_id(settings.coop.character_id);
     if (settings.coop.character_id == "mario" || settings.coop.character_id == "luigi") settings.coop.character_id.clear();
@@ -325,6 +327,8 @@ void apply_kv(RuntimeSettings& settings, const char* key, const char* value) {
         }
     } else if (std::strcmp(key, "coop_palette") == 0) {
         settings.coop.palette = value;
+    } else if (std::strcmp(key, "coop_custom_palette") == 0) {
+        settings.coop.custom_palette = value;
     } else if (std::strcmp(key, "coop_character_id") == 0) {
         settings.coop.character_id = value;
     } else if (std::strcmp(key, "coop_join_address") == 0) {
@@ -743,6 +747,7 @@ bool save_runtime_settings_to_file() {
         }
         if (!settings.coop.player_name.empty()) contents << "coop_player_name=" << settings.coop.player_name << '\n';
         if (!settings.coop.palette.empty()) contents << "coop_palette=" << settings.coop.palette << '\n';
+        if (!settings.coop.custom_palette.empty()) contents << "coop_custom_palette=" << settings.coop.custom_palette << '\n';
         if (!settings.coop.room_name.empty()) contents << "coop_room_name=" << settings.coop.room_name << '\n';
         if (!settings.coop.password.empty()) contents << "coop_password=" << settings.coop.password << '\n';
         if (settings.coop.character != defaults.character) {

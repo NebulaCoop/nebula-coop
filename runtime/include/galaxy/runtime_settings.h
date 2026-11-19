@@ -104,6 +104,9 @@ struct RuntimeCoopSettings {
     // nebula_palette.hpp's order (pants, shirt, gloves, shoes, hair, skin, cap, emblem); empty for their character's
     // own (format_coop_palette, parse_coop_palette).
     std::string palette;
+    // The PLAYER page's CUSTOM colours, as `palette`: the last ones the player edited part by part, kept while they
+    // wear their own or a set so CUSTOM brings them back. Empty: none edited yet.
+    std::string custom_palette;
     std::string password;       // a host's: joining needs it; a joiner's: sent to the host. Empty: none
     std::string join_address;   // the Join page's last room code or address, "host[:port]" (empty: none yet)
     // The Host page's NETWORK: NebulaNet, where friends join by the room's code with no port forwarded

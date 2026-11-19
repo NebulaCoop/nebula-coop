@@ -625,7 +625,8 @@ int main() {
                "coop_player_interaction=Friendly_Fire\ncoop_knockback_strength=60\ncoop_pvp_mode=revamped\ncoop_cheats=1\n"
                "coop_bubble_death=0\ncoop_save_lives=0\ncoop_character=Luigi\ncoop_character_id=Waluigi\ncoop_join_address=192.168.1.20:7778\n"
                "coop_network=Direct\ncoop_nebulanet=http://127.0.0.1:8787\ncoop_public=1\n"
-               "coop_palette=#083084,DC0000,ffffff,6e3214,4a1400,ffaa84,00b400,c40000\n");
+               "coop_palette=#083084,DC0000,ffffff,6e3214,4a1400,ffaa84,00b400,c40000\n"
+               "coop_custom_palette=FF70B0,dc0000,ffffff,6e3214,4a1400,ffaa84,dc0000,c40000\n");
     galaxy::load_runtime_settings_from_file();
     const galaxy::RuntimeCoopSettings coop = galaxy::get_runtime_settings().coop;
     passed &= expect(static_cast<unsigned>(coop.port) == 9000u && coop.max_players == 8u &&
@@ -639,7 +640,8 @@ int main() {
                          galaxy::coop_character_id(coop) == "waluigi" && coop.join_address == "192.168.1.20:7778" &&
                          !coop.nebulanet && coop.nebulanet_server == "http://127.0.0.1:8787" &&
                          coop.public_room &&
-                         coop.palette == "083084,dc0000,ffffff,6e3214,4a1400,ffaa84,00b400,c40000",
+                         coop.palette == "083084,dc0000,ffffff,6e3214,4a1400,ffaa84,00b400,c40000" &&
+                         coop.custom_palette == "ff70b0,dc0000,ffffff,6e3214,4a1400,ffaa84,dc0000,c40000",
                      "co-op keys load; an out-of-range count and control characters are dropped");
     passed &= expect(galaxy::save_runtime_settings_to_file(), "co-op settings save");
     galaxy::load_runtime_settings_from_file();
@@ -652,7 +654,7 @@ int main() {
                      "default co-op settings write no coop_ keys");
     write_text(settings_path, "coop_player_interaction=sticky\ncoop_knockback_strength=256\ncoop_pvp_mode=new\n"
                               "coop_network=carrier pigeon\ncoop_nebulanet=ftp://example.com\ncoop_character_id=../mario\n"
-                              "coop_palette=ff0000,00ff00\n");
+                              "coop_palette=ff0000,00ff00\ncoop_custom_palette=red\n");
     galaxy::load_runtime_settings_from_file();
     passed &= expect(galaxy::get_runtime_settings().coop == galaxy::RuntimeCoopSettings{},
                      "unknown player interaction, knockback, PvP, network, server, character and colour values keep the defaults");

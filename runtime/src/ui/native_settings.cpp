@@ -5083,28 +5083,49 @@ std::vector<SettingsRow> player_page(const RuntimeSettings& runtime) {
                         "ONCE (IN A COMET, AT THE NEXT START), AND OTHER PLAYERS SEE YOU AS THEM"});
     }
 
-    // The colours worn (sm64coopdx's palettes): the character's own, a set of them, or each part's.
+    // The colours worn (sm64coopdx's palettes): CUSTOM (the player's own edit, kept in the settings), the character's
+    // own, or a set of them.
     {
         const CoopPalette own = own_palette(coop);
         const std::optional<CoopPalette> picked = parse_coop_palette(coop.palette);
+        const std::optional<CoopPalette> custom = parse_coop_palette(coop.custom_palette);
         const CoopPalette wearing = picked ? *picked : own;
         const std::vector<PalettePreset> presets = palette_presets();
-        std::size_t at = presets.size();
-        for (std::size_t i = 0; i < presets.size() && picked; ++i) {
-            if (presets[i].palette == *picked) at = i;
+        // Where SET is: CUSTOM 0, OWN 1, then the sets. Colours the player edited are CUSTOM even when they match a
+        // set; ones of no set are CUSTOM too (an edit from before CUSTOM was kept).
+        static constexpr unsigned kCustomAt = 0u, kOwnAt = 1u, kFirstPresetAt = 2u;
+        unsigned at = kCustomAt;
+        if (!picked) {
+            at = kOwnAt;
+        } else if (!custom || *custom != *picked) {
+            for (std::size_t i = 0; i < presets.size(); ++i) {
+                if (presets[i].palette == *picked) at = kFirstPresetAt + static_cast<unsigned>(i);
+            }
         }
         rows.push_back({"COLOURS", {}, nullptr, {}, true});
-        rows.push_back({"SET", !picked ? std::string("OWN") : at < presets.size() ? presets[at].name : std::string("CUSTOM"),
-                        [presets, at, own, has = picked.has_value()](RenderConfig&, int delta) {
-                            // OWN first, then the sets; from CUSTOM, as from OWN.
-                            const unsigned count = static_cast<unsigned>(presets.size()) + 1u;
-                            const unsigned from = has && at < presets.size() ? static_cast<unsigned>(at) + 1u : 0u;
-                            const unsigned next = ui::settings_step(from, count, delta);
-                            s_runtime_draft.coop.palette =
-                                next == 0u || presets[next - 1u].palette == own ? std::string() : format_coop_palette(presets[next - 1u].palette);
+        rows.push_back({"SET", at == kCustomAt ? std::string("CUSTOM") : at == kOwnAt ? std::string("OWN") : presets[at - kFirstPresetAt].name,
+                        [presets, at, own, wearing, custom](RenderConfig&, int delta) {
+                            // Leaving colours of no set keeps them as CUSTOM first, so stepping back finds them.
+                            if (at == kCustomAt) s_runtime_draft.coop.custom_palette = format_coop_palette(wearing);
+                            const unsigned next = ui::settings_step(at, static_cast<unsigned>(presets.size()) + kFirstPresetAt, delta);
+                            if (next == kCustomAt) {
+                                // None edited yet: CUSTOM starts as what is worn now. Written out even when it is the
+                                // character's own, so it stays CUSTOM.
+                                s_runtime_draft.coop.custom_palette = format_coop_palette(custom ? *custom : wearing);
+                                s_runtime_draft.coop.palette = s_runtime_draft.coop.custom_palette;
+                                return;
+                            }
+                            const CoopPalette chosen = next >= kFirstPresetAt ? presets[next - kFirstPresetAt].palette : own;
+                            s_runtime_draft.coop.palette = chosen == own ? std::string() : format_coop_palette(chosen);
                         },
-                        "THE COLOURS YOU WEAR: YOUR CHARACTER'S OWN, ANOTHER CHARACTER'S OR A SET OF THEM. OTHER PLAYERS SEE "
-                        "THEM TOO"});
+                        "THE COLOURS YOU WEAR: CUSTOM (YOUR OWN EDIT, KEPT FOR NEXT TIME), YOUR CHARACTER'S OWN, ANOTHER "
+                        "CHARACTER'S OR A SET. CHANGING ANY COLOUR BELOW MAKES IT CUSTOM. OTHER PLAYERS SEE THEM TOO"});
+        // An edit of any part's colour wears it as CUSTOM and keeps it for next time (written out even when it is the
+        // character's own, so SET stays on CUSTOM).
+        const auto wear_custom = [](const CoopPalette& changed) {
+            s_runtime_draft.coop.custom_palette = format_coop_palette(changed);
+            s_runtime_draft.coop.palette = s_runtime_draft.coop.custom_palette;
+        };
         // Each part, in the order they show on the player.
         struct PartRow {
             const char* label;
@@ -5120,7 +5141,8 @@ std::vector<SettingsRow> player_page(const RuntimeSettings& runtime) {
             return static_cast<std::uint32_t>(palette[part * 3]) << 16 | static_cast<std::uint32_t>(palette[part * 3 + 1]) << 8 |
                    palette[part * 3 + 2];
         };
-        for (const PartRow& row : kParts) {
+        for (std::size_t row_at = 0; row_at < std::size(kParts); ++row_at) {
+            const PartRow& row = kParts[row_at];
             const std::size_t part = row.part;
             const std::uint32_t now = rgb_of(wearing, part);
             std::string shown;
@@ -5135,7 +5157,7 @@ std::vector<SettingsRow> player_page(const RuntimeSettings& runtime) {
                 }
             }
             rows.push_back({row.label, shown,
-                            [part, own, wearing, colors, rgb_of](RenderConfig&, int delta) {
+                            [part, row_at, own, wearing, colors, rgb_of, wear_custom](RenderConfig&, int delta) {
                                 // The part's own colour first, then the named ones; one of neither steps from the
                                 // named colour nearest it.
                                 const std::uint32_t current = rgb_of(wearing, part);
@@ -5160,7 +5182,9 @@ std::vector<SettingsRow> player_page(const RuntimeSettings& runtime) {
                                 changed[part * 3] = static_cast<std::uint8_t>(rgb >> 16);
                                 changed[part * 3 + 1] = static_cast<std::uint8_t>(rgb >> 8);
                                 changed[part * 3 + 2] = static_cast<std::uint8_t>(rgb);
-                                s_runtime_draft.coop.palette = changed == own ? std::string() : format_coop_palette(changed);
+                                wear_custom(changed);
+                                // The ADVANCED COLOURS rows follow: this part, at its new red, green and blue.
+                                s_palette_edit_part = row_at;
                             },
                             "THIS PART'S COLOUR: YOUR CHARACTER'S OWN OR ANOTHER. OTHER PLAYERS SEE IT TOO"});
         }
@@ -5195,14 +5219,14 @@ std::vector<SettingsRow> player_page(const RuntimeSettings& runtime) {
         for (const ChannelRow& channel : kChannels) {
             const unsigned level = wearing[edit_part * 3u + channel.offset];
             SettingsRow row{channel.label, std::to_string(level),
-                            [edit_part, offset = channel.offset, own, wearing](RenderConfig&, int delta) {
+                            [edit_part, offset = channel.offset, wearing, wear_custom](RenderConfig&, int delta) {
                                 const unsigned current = wearing[edit_part * 3u + offset];
                                 unsigned step = current / kChannelStep;
                                 if (delta < 0 && current % kChannelStep != 0u) ++step;  // down from 132 is 130
                                 const int next = std::clamp(static_cast<int>(step) + delta, 0, static_cast<int>(kChannelSteps));
                                 CoopPalette changed = wearing;
                                 changed[edit_part * 3u + offset] = static_cast<std::uint8_t>(static_cast<unsigned>(next) * kChannelStep);
-                                s_runtime_draft.coop.palette = changed == own ? std::string() : format_coop_palette(changed);
+                                wear_custom(changed);
                             },
                             channel.help};
             row.slider_steps = static_cast<std::uint16_t>(kChannelSteps);
