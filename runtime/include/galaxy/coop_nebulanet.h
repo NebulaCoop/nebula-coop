@@ -1,9 +1,10 @@
 // NebulaNet's side of a room (docs/COOP_PLAN.md, "Hosting"; the server is the NebulaNet repository, sm64coopdx's
 // CoopNet made for Nebula): a host keeps a WebSocket open to it, gets a room code and hears of each joiner's
 // addresses; a joiner asks for a code (with the room's password) and gets the host's, and says afterwards whether it
-// got through. The session then punches through both routers with the direct transport. The Join page lists the
+// got through. The session then punches through both routers with the direct transport; when nothing gets through, the
+// joiner asks for a TURN relay (relay) and tells the host its address on it (tell_relay). The Join page lists the
 // rooms: the public ones (a host asks for its room to be one), or the ones that have the password typed (CoopNet's
-// public and private lobbies). NebulaNet never carries game traffic.
+// public and private lobbies). NebulaNet never carries game traffic (a relay is a TURN server's, not NebulaNet's).
 //
 // The web calls block, so each link runs on a thread of its own; the session takes what happened (take_events) on
 // its own thread. stop() returns at once: a call still running finishes on its own and is thrown away.
@@ -50,6 +51,14 @@ struct NebulaNetRoom {
     std::vector<std::string> candidates;  // the host's addresses (not a listed room's)
 };
 
+// A TURN server NebulaNet handed out, with the credentials it made for this join.
+struct NebulaNetRelay {
+    std::string host;
+    std::uint16_t port = 0u;
+    std::string username;
+    std::string password;
+};
+
 struct NebulaNetEvent {
     enum class Kind {
         RoomCode,  // a host's room is listed: text is its code (again after NebulaNet was lost and found)
@@ -57,6 +66,7 @@ struct NebulaNetEvent {
         Answer,    // a joiner's: the room it asked for (room)
         Rooms,     // a list's: the rooms (rooms), the fullest first; text: why there are none, when it failed
         JoinerFailed,  // a host's: a joiner couldn't get through (candidates: its addresses)
+        Relays,    // a joiner's: TURN servers to relay through (relays), or none: text says why
         Failed,    // text: why, in the menu's words. A host's link tries again by itself (or, when NebulaNet kept
                    // its public room off the public list, goes on as it is); a joiner's has ended
     };
@@ -65,6 +75,10 @@ struct NebulaNetEvent {
     std::vector<std::string> candidates;
     NebulaNetRoom room;
     std::vector<NebulaNetRoom> rooms;
+    std::vector<NebulaNetRelay> relays;
+    // A Joiner's: its candidate is a TURN relay's address, and `via` is the joiner's own address (what bans go by).
+    bool relay = false;
+    std::string via;
 };
 
 class NebulaNetLink {
@@ -84,11 +98,16 @@ public:
     void set_candidates(std::vector<std::string> candidates);
     // Asks `server` for the room `code`, telling it this joiner's addresses and the password it was given.
     void join(std::string server, std::string code, std::vector<std::string> candidates, std::string password = {});
+    // A joiner's whose hellos got no answer: asks `server` for TURN relays for the room `code` (an event Relays).
+    void relay(std::string server, std::string code, std::string password);
+    // Tells `server` this joiner's address on its relay, so the room's host punches toward it; a call of its own.
+    static void tell_relay(std::shared_ptr<net::Web> web, std::string server, std::string code, std::string password,
+                           std::string address);
     // Asks `server` for its rooms of Nebula: the public ones, or with `password` the ones that have it.
     void list(std::string server, std::string password = {});
     // Tells `server` how a join by `code` went (ok: the joiner got in); a call of its own, answered or not.
     static void report(std::shared_ptr<net::Web> web, std::string server, std::string code, bool ok,
-                       std::vector<std::string> candidates);
+                       std::vector<std::string> candidates, bool relayed = false);
     void stop();
     [[nodiscard]] std::vector<NebulaNetEvent> take_events();
 

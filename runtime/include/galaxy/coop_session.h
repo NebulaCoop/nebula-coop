@@ -179,9 +179,11 @@ enum class JoinStep : std::uint8_t {
 
 // While a joiner reaches the host (JoinStep::Reaching): how long it has tried, and how long it tries before it gives
 // up with JoinFailed. Room codes try longer than addresses: punching through two routers takes a few seconds.
+// A room code's join that hears nothing for a few seconds tries a TURN relay too (relaying), and gets longer for it.
 struct JoinWait {
     std::chrono::milliseconds waited{0};
     std::chrono::milliseconds limit{0};
+    bool relaying = false;
 };
 
 // A joiner's download of the room's mods.

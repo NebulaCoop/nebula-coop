@@ -71,9 +71,17 @@ introduces players, as sm64coopdx's CoopNet does, so nobody has to forward a por
   lists at most 4 public rooms per address; a room past that keeps its code and the host's chat says why. NebulaNet
   checks a join's password and protocol first, and a joiner tells it whether it got through (CoopNet's PEER_FAILED,
   the host always staying). The Host page's NEBULANET SERVER picks another NebulaNet.
-- **Relay fallback (next).** Where both routers are too strict for punching (carrier NAT, some campus networks),
-  the joiner goes through a TURN relay: NebulaNet already hands TURN servers out (`ice` in its answers, as CoopNet's
-  STUN_TURN); the game doesn't use them yet.
+- **Relay fallback.** Where the routers are too strict for punching (carrier NAT, mobile data, some campus
+  networks), a joiner by code that hears nothing back for 5 seconds asks NebulaNet for a TURN relay
+  (`POST /v1/relay`, as CoopNet's STUN_TURN but only for a join that needs one) while it keeps punching. It takes an
+  address on the relay (`galaxy/net/turn.h`: Allocate, CreatePermission for the host's IP, ChannelBind, Refresh,
+  long-term credentials) from the socket it plays on, and NebulaNet tells the host, which punches toward that address
+  as toward any joiner: the relay passes the punch on, the joiner's hellos go back on a channel (4 bytes a datagram),
+  and the lobby carries on through the relay. Only the joiner speaks TURN, so the host's router only ever sees the
+  host send first; the host knows a relayed joiner by the address NebulaNet saw it at (`via`), which bans go by. The
+  join gets at least 15 more seconds once it relays, and the joining screen says CONNECTING THROUGH A RELAY. The
+  relays are Cloudflare's TURN (free to 1,000 GB a month), which NebulaNet keeps inside a monthly budget; with none
+  set up, or the budget used, the join punches alone as before.
 - **Discord.** As sm64coopdx's Discord activity: in a room the status shows the party ("2 of 8") and, on NebulaNet,
   a Join button whose secret is `nebulanet:<code>:<password>` (sm64coopdx's `coopnet:<lobby>:<password>`). The host
   always offers it, a joiner only for a room without a password, and only on the default NebulaNet server. The party's
@@ -832,7 +840,8 @@ with its tests in `runtime/src/net/net_tests.cpp`:
   wrong password, another protocol, a peer that stopped answering). The direct transport admits members on the host's
   port and passes their messages on, so only the host's port needs forwarding, or none: it asks a STUN server for its
   public address (`galaxy/net/stun.h`), a host punches toward a joiner NebulaNet told it of, and a joiner tries every
-  address the host may have at once. A relay would be another way in, with nothing above the transport changing.
+  address the host may have at once. A joiner that can't punch through relays through a TURN server
+  (`relay_through`) on the same socket, with nothing above the transport changing but who asks NebulaNet for it.
 - **Session** (`galaxy/coop_session.h`): the room as the game sees it, on a thread of its own. A joiner asks to be let
   in with the game's version, its disc and mods, their name and character (a joiner with other mods gets the room's
   first: see [Mods](#mods-the-rooms-not-the-players)); the host answers with the player's number, the room's

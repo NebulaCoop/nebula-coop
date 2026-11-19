@@ -424,7 +424,8 @@ add_executable(nebula_native_host host/host_main.cpp ../runtime/src/host_extensi
     ../runtime/src/coop_session.cpp ../runtime/src/coop_snapshot.cpp ../runtime/src/coop_chat.cpp
     ../runtime/src/coop_commands.cpp ../runtime/src/coop_teleport.cpp ../runtime/src/coop_popups.cpp ../runtime/src/coop_world.cpp ../runtime/src/runtime_settings.cpp
     ../runtime/src/input_bindings.cpp ../runtime/src/net/udp.cpp ../runtime/src/net/link.cpp
-    ../runtime/src/net/direct_transport.cpp ../runtime/src/net/stun.cpp ../runtime/src/net/json.cpp
+    ../runtime/src/net/direct_transport.cpp ../runtime/src/net/stun.cpp ../runtime/src/net/turn.cpp
+    ../runtime/src/net/digest.cpp ../runtime/src/net/json.cpp
     ../runtime/src/net/web.cpp ../runtime/src/net/web_win.cpp ../runtime/src/net/web_curl.cpp
     ../runtime/src/coop_nebulanet.cpp
     # The start check asks whether the compiler of mods' programs is there (mod_start_check.cpp): the same answer as

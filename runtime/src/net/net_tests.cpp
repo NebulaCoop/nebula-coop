@@ -5,10 +5,12 @@
 #include "galaxy/coop_nebulanet.h"
 #include "galaxy/coop_session.h"
 #include "galaxy/net/bytes.h"
+#include "galaxy/net/digest.h"
 #include "galaxy/net/direct_transport.h"
 #include "galaxy/net/json.h"
 #include "galaxy/net/link.h"
 #include "galaxy/net/stun.h"
+#include "galaxy/net/turn.h"
 #include "galaxy/net/udp.h"
 #include "galaxy/net/web.h"
 
@@ -354,6 +356,327 @@ void test_transport_nat() {
                    "and is one member, not one per way it tried");
         }
     }
+}
+
+std::string hex(std::span<const std::uint8_t> bytes) {
+    static constexpr char kDigits[] = "0123456789abcdef";
+    std::string out;
+    for (const std::uint8_t byte : bytes) {
+        out += kDigits[byte >> 4];
+        out += kDigits[byte & 15u];
+    }
+    return out;
+}
+
+void test_digests() {
+    using namespace galaxy::net;
+    const auto span_of = [](std::string_view text) {
+        return std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
+    };
+    expect(hex(digest::md5(span_of(""))) == "d41d8cd98f00b204e9800998ecf8427e", "MD5 of nothing (RFC 1321)");
+    expect(hex(digest::md5(span_of("The quick brown fox jumps over the lazy dog"))) ==
+               "9e107d9d372bb6826bd81d3542a419d6",
+           "MD5 of a sentence");
+    expect(hex(digest::sha1(span_of("abc"))) == "a9993e364706816aba3e25717850c26c9cd0d89d", "SHA-1 of abc");
+    // RFC 2202, HMAC-SHA1 test case 2.
+    expect(hex(digest::hmac_sha1(span_of("Jefe"), span_of("what do ya want for nothing?"))) ==
+               "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79",
+           "HMAC-SHA1 (RFC 2202)");
+    // A key longer than a block is hashed first (RFC 2202 test case 6).
+    const std::vector<std::uint8_t> long_key(80u, std::uint8_t{0xaa});
+    expect(hex(digest::hmac_sha1(long_key, span_of("Test Using Larger Than Block-Size Key - Hash Key First"))) ==
+               "aa4ae5e15272d00e95705637ce8a3b55ed402112",
+           "HMAC-SHA1 with a long key");
+}
+
+// A TURN server on the loopback (RFC 8656's part a joiner uses): long-term credentials (401 with a realm and nonce,
+// then a stale nonce once), Allocate, CreatePermission, ChannelBind, Refresh, Send and Data indications and
+// ChannelData, with its relayed address on a second socket. It checks every request's MESSAGE-INTEGRITY.
+struct FakeTurn {
+    galaxy::net::UdpSocket control;
+    galaxy::net::UdpSocket relay;
+    std::string username = "relay-user";
+    std::string password = "relay-pass";
+    galaxy::net::Address client;
+    std::vector<std::array<std::uint8_t, 4>> permitted;
+    std::map<std::uint16_t, galaxy::net::Address> channels;
+    int allocations = 0;
+    int stale_nonces = 0;
+    int bad_integrity = 0;
+    int channel_data_in = 0;
+    int channel_data_out = 0;
+    int released = 0;
+
+    bool open() { return control.open(0u, false) && relay.open(0u, false); }
+
+    static std::uint16_t u16(std::span<const std::uint8_t> b, std::size_t at) {
+        return static_cast<std::uint16_t>((b[at] << 8) | b[at + 1]);
+    }
+    static void put16(std::vector<std::uint8_t>& out, std::uint16_t v) {
+        out.push_back(static_cast<std::uint8_t>(v >> 8));
+        out.push_back(static_cast<std::uint8_t>(v));
+    }
+    static void attr(std::vector<std::uint8_t>& out, std::uint16_t type, std::span<const std::uint8_t> value) {
+        put16(out, type);
+        put16(out, static_cast<std::uint16_t>(value.size()));
+        out.insert(out.end(), value.begin(), value.end());
+        while (out.size() % 4u != 0u) out.push_back(0u);
+    }
+    static std::vector<std::uint8_t> xaddr(const galaxy::net::Address& a) {
+        std::array<std::uint8_t, 16> ip{};
+        (void)a.ip_bytes(ip);
+        std::vector<std::uint8_t> out{0u, 1u};
+        put16(out, static_cast<std::uint16_t>(a.port() ^ 0x2112u));
+        const std::uint8_t mask[4] = {0x21u, 0x12u, 0xA4u, 0x42u};
+        for (std::size_t i = 0; i < 4u; ++i) out.push_back(static_cast<std::uint8_t>(ip[i] ^ mask[i]));
+        return out;
+    }
+    static galaxy::net::Address read_xaddr(std::span<const std::uint8_t> v) {
+        const std::uint8_t mask[4] = {0x21u, 0x12u, 0xA4u, 0x42u};
+        std::uint8_t ip[4];
+        for (std::size_t i = 0; i < 4u; ++i) ip[i] = static_cast<std::uint8_t>(v[4 + i] ^ mask[i]);
+        return galaxy::net::make_address(ip, static_cast<std::uint16_t>(u16(v, 2) ^ 0x2112u));
+    }
+    std::vector<std::uint8_t> message(std::uint16_t type, std::span<const std::uint8_t> id,
+                                      const std::vector<std::uint8_t>& body) {
+        std::vector<std::uint8_t> out;
+        put16(out, type);
+        put16(out, static_cast<std::uint16_t>(body.size()));
+        out.push_back(0x21u);
+        out.push_back(0x12u);
+        out.push_back(0xA4u);
+        out.push_back(0x42u);
+        out.insert(out.end(), id.begin(), id.end());
+        out.insert(out.end(), body.begin(), body.end());
+        return out;
+    }
+    void error(std::uint16_t method, std::span<const std::uint8_t> id, int code, std::string_view nonce) {
+        std::vector<std::uint8_t> body;
+        const std::uint8_t value[4] = {0u, 0u, static_cast<std::uint8_t>(code / 100),
+                                       static_cast<std::uint8_t>(code % 100)};
+        attr(body, 0x0009, value);
+        attr(body, 0x0014, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>("test"), 4u));
+        attr(body, 0x0015,
+             std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(nonce.data()), nonce.size()));
+        (void)control.send_to(client, message(static_cast<std::uint16_t>(method | 0x0110u), id, body));
+    }
+    bool permitted_ip(const galaxy::net::Address& a) const {
+        std::array<std::uint8_t, 16> ip{};
+        if (a.ip_bytes(ip) != 4u) return false;
+        return std::any_of(permitted.begin(), permitted.end(),
+                           [&](const auto& p) { return std::equal(p.begin(), p.end(), ip.begin()); });
+    }
+    galaxy::net::Address relayed() const {
+        galaxy::net::Address out;
+        (void)galaxy::net::resolve("127.0.0.1", relay.local_port(), out);
+        return out;
+    }
+
+    void serve() {
+        using galaxy::net::Address;
+        std::array<std::uint8_t, 2048> buffer{};
+        Address from;
+        std::ptrdiff_t size = 0;
+        while ((size = control.receive_from(buffer, from)) >= 0) {
+            client = from;
+            const std::span<const std::uint8_t> m(buffer.data(), static_cast<std::size_t>(size));
+            if (galaxy::net::turn::is_channel_data(m)) {
+                const auto it = channels.find(u16(m, 0));
+                if (it != channels.end()) {
+                    ++channel_data_in;
+                    (void)relay.send_to(it->second, m.subspan(4u, u16(m, 2)));
+                }
+                continue;
+            }
+            if (!galaxy::net::stun::is_stun(m)) continue;
+            const std::uint16_t type = u16(m, 0);
+            const auto id = m.subspan(8u, 12u);
+            std::string user, nonce;
+            Address peer;
+            std::span<const std::uint8_t> data;
+            std::size_t integrity_at = 0u;
+            std::uint16_t channel = 0u;
+            std::uint32_t lifetime = 600u;
+            for (std::size_t at = 20u; at + 4u <= m.size();) {
+                const std::uint16_t a = u16(m, at);
+                const std::size_t len = u16(m, at + 2);
+                const auto v = m.subspan(at + 4u, len);
+                if (a == 0x0006) user.assign(v.begin(), v.end());
+                if (a == 0x0015) nonce.assign(v.begin(), v.end());
+                if (a == 0x0012) peer = read_xaddr(v);
+                if (a == 0x0013) data = v;
+                if (a == 0x000C) channel = u16(v, 0);
+                if (a == 0x000D) {
+                    lifetime = (std::uint32_t{v[0]} << 24) | (std::uint32_t{v[1]} << 16) |
+                               (std::uint32_t{v[2]} << 8) | std::uint32_t{v[3]};
+                }
+                if (a == 0x0008) integrity_at = at;
+                at += 4u + ((len + 3u) & ~std::size_t{3});
+            }
+            if (type == 0x0016) {  // Send indication
+                if (permitted_ip(peer)) (void)relay.send_to(peer, data);
+                continue;
+            }
+            const std::uint16_t method = static_cast<std::uint16_t>(type & ~0x0110u);
+            if (integrity_at == 0u) {
+                error(method, id, 401, "n1");
+                continue;
+            }
+            const std::string material = user + ":test:" + password;
+            const auto key = galaxy::net::digest::md5(
+                std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(material.data()), material.size()));
+            // The HMAC covers the header with its length up to the integrity attribute's end.
+            std::vector<std::uint8_t> covered(m.begin(), m.begin() + static_cast<std::ptrdiff_t>(integrity_at));
+            const std::size_t length = integrity_at + 24u - 20u;
+            covered[2] = static_cast<std::uint8_t>(length >> 8);
+            covered[3] = static_cast<std::uint8_t>(length);
+            const auto expected = galaxy::net::digest::hmac_sha1(key, covered);
+            if (user != username || !std::equal(expected.begin(), expected.end(), m.begin() + integrity_at + 4)) {
+                ++bad_integrity;
+                error(method, id, 401, "n1");
+                continue;
+            }
+            // Once, a nonce gone stale: the client asks again with the new one.
+            if (stale_nonces == 0 || nonce != (stale_nonces == 0 ? "n1" : "n2")) {
+                ++stale_nonces;
+                error(method, id, 438, "n2");
+                continue;
+            }
+            std::vector<std::uint8_t> body;
+            if (method == 0x0003) {
+                ++allocations;
+                attr(body, 0x0016, xaddr(relayed()));
+                const std::uint8_t life[4] = {0u, 0u, 0x02u, 0x58u};
+                attr(body, 0x000D, life);
+            } else if (method == 0x0008 || method == 0x0009) {
+                std::array<std::uint8_t, 16> ip{};
+                (void)peer.ip_bytes(ip);
+                if (!permitted_ip(peer)) permitted.push_back({ip[0], ip[1], ip[2], ip[3]});
+                if (method == 0x0009) channels[channel] = peer;
+            } else if (method == 0x0004 && lifetime == 0u) {
+                ++released;
+            }
+            (void)control.send_to(client, message(static_cast<std::uint16_t>(method | 0x0100u), id, body));
+        }
+        while ((size = relay.receive_from(buffer, from)) >= 0) {
+            if (!permitted_ip(from) || !client.valid()) continue;
+            const std::span<const std::uint8_t> d(buffer.data(), static_cast<std::size_t>(size));
+            std::uint16_t bound = 0u;
+            for (const auto& [number, address] : channels) {
+                if (address == from) bound = number;
+            }
+            if (bound != 0u) {
+                ++channel_data_out;
+                std::vector<std::uint8_t> out;
+                put16(out, bound);
+                put16(out, static_cast<std::uint16_t>(d.size()));
+                out.insert(out.end(), d.begin(), d.end());
+                (void)control.send_to(client, out);
+            } else {
+                std::vector<std::uint8_t> body;
+                attr(body, 0x0012, xaddr(from));
+                attr(body, 0x0013, d);
+                const std::uint8_t id[12] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+                (void)control.send_to(client, message(0x0017, id, body));
+            }
+        }
+    }
+};
+
+// A join whose hellos reach nothing (the host's router, say): the joiner relays through a TURN server, the host
+// punches toward the relayed address, and the lobby carries on through the relay.
+void test_transport_relay() {
+    using namespace galaxy::net;
+    turn::Client::allow_private_peers(true);
+    FakeTurn server;
+    expect(server.open(), "a TURN server opens");
+
+    expect(!turn::Client::permittable(Address{}), "no address is never permitted");
+    turn::Client::allow_private_peers(false);
+    Address loopback;
+    (void)resolve("127.0.0.1", 1u, loopback);
+    const std::uint8_t public_ip[4] = {198u, 51u, 100u, 7u};
+    const std::uint8_t cgnat_ip[4] = {100u, 72u, 1u, 2u};
+    expect(!turn::Client::permittable(loopback) && turn::Client::permittable(make_address(public_ip, 1u)) &&
+               !turn::Client::permittable(make_address(cgnat_ip, 1u)),
+           "only public addresses are permitted on a relay");
+    turn::Client::allow_private_peers(true);
+
+    DirectTransport host;
+    expect(host.lobby_create(LobbyConfig{}), "the host opens a lobby");
+    UdpSocket nobody;
+    expect(nobody.open(0u, false), "an address that never answers opens");
+    DirectTransport joiner;
+    expect(!joiner.relay_through("127.0.0.1", server.control.local_port(), server.username, server.password),
+           "no relay before a join");
+    JoinConfig join{"127.0.0.1", nobody.local_port(), ""};
+    join.alternates.push_back({"127.0.0.1", 1u});  // the host's public address as NebulaNet gave it: its IP counts
+    join.timeout = 3s;
+    expect(joiner.lobby_join(join), "a join that reaches nothing starts");
+    expect(joiner.relay_through("127.0.0.1", server.control.local_port(), server.username, server.password) &&
+               joiner.relay_state() == Transport::RelayState::Allocating,
+           "and relays through a TURN server");
+    const auto serve = [&](std::vector<DirectTransport*> transports, const std::function<bool()>& done,
+                           std::chrono::milliseconds limit) {
+        const Clock::time_point until = Clock::now() + limit;
+        while (Clock::now() < until) {
+            server.serve();
+            for (auto* transport : transports) transport->update(1ms);
+            if (done()) return true;
+        }
+        return false;
+    };
+    expect(serve({&host, &joiner}, [&] { return joiner.relay_state() == Transport::RelayState::Ready; }, 5s) &&
+               joiner.relayed_address() == server.relayed(),
+           "which gives it an address");
+    expect(server.allocations == 1 && server.stale_nonces == 1 && server.bad_integrity == 0,
+           "after asking with its credentials (and again for a stale nonce), every request's integrity right");
+
+    // NebulaNet tells the host the relayed address (and who is behind it); the host punches it, and the joiner gets
+    // in through the relay. Past the join's own 3 seconds: a relay stretches them.
+    host.punch(joiner.relayed_address(), "203.0.113.77");
+    expect(serve({&host, &joiner}, [&] { return joiner.in_lobby(); }, 8s), "the joiner gets in through the relay");
+    expect(joiner.relayed() && joiner.owner() == host.self() && host.members().size() == 2u,
+           "and its lobby goes through it");
+    expect(server.permitted_ip(loopback), "the host's IP was let send through it");
+    expect(host.peer_identity(joiner.self()) == "203.0.113.77",
+           "the host knows the joiner by its own address, not the relay's");
+
+    std::vector<std::string> at_host, at_joiner;
+    host.set_callbacks({nullptr, nullptr, nullptr,
+                        [&](PeerId, Channel, std::span<const std::uint8_t> data) {
+                            at_host.emplace_back(data.begin(), data.end());
+                        },
+                        nullptr});
+    joiner.set_callbacks({nullptr, nullptr, nullptr,
+                          [&](PeerId, Channel, std::span<const std::uint8_t> data) {
+                              at_joiner.emplace_back(data.begin(), data.end());
+                          },
+                          nullptr});
+    const std::vector<std::uint8_t> hello = bytes_of("through the relay");
+    expect(joiner.send_to(host.self(), Channel::Ordered, hello) &&
+               host.send_to(joiner.self(), Channel::Reliable, hello),
+           "both send");
+    expect(serve({&host, &joiner}, [&] { return !at_host.empty() && !at_joiner.empty(); }, 3s) &&
+               at_host[0] == "through the relay" && at_joiner[0] == "through the relay",
+           "and both hear the other through the relay");
+    expect(server.channel_data_in > 0 && server.channel_data_out > 0, "on a channel, 4 bytes a datagram");
+
+    // Leaving gives the relay's address back.
+    joiner.lobby_leave();
+    expect(serve({&host}, [&] { return server.released == 1 && host.members().size() == 1u; }, 3s),
+           "a joiner that leaves gives the relayed address back, and the host sees it go");
+
+    // Wrong credentials: the relay fails, the join goes on alone.
+    DirectTransport refused;
+    expect(refused.lobby_join(join), "another join starts");
+    expect(refused.relay_through("127.0.0.1", server.control.local_port(), server.username, "wrong"),
+           "and relays with the wrong password");
+    expect(serve({&refused}, [&] { return refused.relay_state() == Transport::RelayState::Failed; }, 5s) &&
+               refused.joining(),
+           "which the relay refuses, and the join goes on");
+    refused.lobby_leave();
+    turn::Client::allow_private_peers(false);
 }
 
 void test_transport_lobby() {
@@ -1286,8 +1609,28 @@ public:
             if (request && request->text("code") == "K7QX2M") {
                 const galaxy::net::json::Value* ok = request->find("ok");
                 (ok != nullptr && ok->boolean ? reported_ok : reported_failed).fetch_add(1);
+                const galaxy::net::json::Value* relayed = request->find("relayed");
+                if (relayed != nullptr && relayed->boolean) reported_relayed.fetch_add(1);
             }
             return {200, R"({"ok":true})"};
+        }
+        if (url.ends_with("/v1/relay")) {
+            const auto room = request ? rooms_.find(request->text("code")) : rooms_.end();
+            if (room == rooms_.end()) return {404, R"({"error":"not_found"})"};
+            if (!room->second.password.empty() && request->text("password") != room->second.password) {
+                return {403, R"({"error":"wrong_password"})"};
+            }
+            if (request->find("relay") != nullptr) {
+                ++relays_told;
+                room->second.host->push(R"({"t":"joiner","candidates":[)" +
+                                        galaxy::net::json::quote(request->text("relay")) +
+                                        R"(],"relay":true,"via":"203.0.113.77"})");
+                return {200, R"({"ok":true})"};
+            }
+            ++relays_asked;
+            if (turn_port == 0u) return {503, R"({"error":"no_relay"})"};
+            return {200, R"({"turn":[{"host":"127.0.0.1","port":)" + std::to_string(turn_port) +
+                             R"(,"username":"relay-user","password":"relay-pass"}]})"};
         }
         const auto room = request ? rooms_.find(request->text("code")) : rooms_.end();
         if (!url.ends_with("/v1/join") || room == rooms_.end()) return {404, R"({"error":"not_found"})"};
@@ -1299,7 +1642,8 @@ public:
         for (std::size_t i = 0; i < mine.size(); ++i) joiner += (i ? "," : "") + galaxy::net::json::quote(mine[i]);
         room->second.host->push(joiner + "]}");
         std::string answer = R"({"name":"HOSTY","version":"test 1","players":1,"max":3,"candidates":[)";
-        const auto& theirs = room->second.candidates;
+        // A host behind a router that lets nothing in: joiners get addresses that never answer.
+        const auto& theirs = unreachable_host.empty() ? room->second.candidates : unreachable_host;
         for (std::size_t i = 0; i < theirs.size(); ++i) answer += (i ? "," : "") + galaxy::net::json::quote(theirs[i]);
         return {200, answer + "]}"};
     }
@@ -1319,6 +1663,12 @@ public:
     std::atomic<int> reported_failed{0};
     // Keeps public rooms off the public list, as NebulaNet does past its limit for one address.
     std::atomic<bool> refuse_public{false};
+    // Relays: the TURN server handed out (0: none, 503 no_relay), asked for and told; joins reported relayed.
+    std::uint16_t turn_port = 0u;
+    std::vector<std::string> unreachable_host;
+    std::atomic<int> relays_asked{0};
+    std::atomic<int> relays_told{0};
+    std::atomic<int> reported_relayed{0};
 
 private:
     struct Room {
@@ -1586,8 +1936,114 @@ void test_session_nebulanet_moved() {
     host_session.leave();
 }
 
+// A host whose router lets no joiner in: a join by its code hears nothing for a few seconds, asks NebulaNet for a
+// relay, and gets in through it; the host punched toward the relay because NebulaNet told it to.
+void test_session_nebulanet_relay() {
+    using namespace galaxy::coop;
+    using Kind = SessionEvent::Kind;
+    galaxy::net::turn::Client::allow_private_peers(true);
+    FakeStun stun;
+    expect(stun.socket.open(0u, false), "a STUN server opens");
+    FakeTurn turn;
+    expect(turn.open(), "a TURN server opens");
+    std::atomic<bool> serving{true};
+    std::mutex turn_lock;
+    std::thread server([&] {
+        while (serving.load()) {
+            stun.serve();
+            {
+                const std::lock_guard<std::mutex> lock(turn_lock);
+                turn.serve();
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+    });
+    auto nebulanet = std::make_shared<FakeNebulaNet>();
+    nebulanet->turn_port = turn.control.local_port();
+    galaxy::net::UdpSocket closed_door;
+    expect(closed_door.open(0u, false), "an address that never answers opens");
+    nebulanet->unreachable_host = {"127.0.0.1:" + std::to_string(closed_door.local_port())};
+
+    Session host_session;
+    host_session.set_web(nebulanet);
+    HostConfig host;
+    host.port = 0u;
+    host.room.max_players = 3u;
+    host.game_version = "test 1";
+    host.name = "HOSTY";
+    host.save = [] {
+        RoomSave save;
+        save.file = 1u;
+        return save;
+    };
+    host.nebulanet = "https://nebulanet.test/";
+    host.stun = "127.0.0.1";
+    host.stun_port = stun.socket.local_port();
+    expect(host_session.host(host), "a room opens on NebulaNet");
+    std::vector<SessionEvent> host_events;
+    expect(wait_for([&] {
+               for (auto& e : host_session.take_events()) host_events.push_back(e);
+               return has_event(host_events, Kind::RoomCode);
+           }),
+           "and gets a room code");
+
+    Session joiner;
+    joiner.set_web(nebulanet);
+    JoinConfig join{"", 0u, "", "test 1", "FAR AWAY"};
+    join.code = "K7QX2M";
+    join.nebulanet = host.nebulanet;
+    join.stun = host.stun;
+    join.stun_port = host.stun_port;
+    expect(joiner.join(join), "a join by the room's code starts");
+    std::vector<SessionEvent> joiner_events;
+    bool relaying = false;
+    expect(wait_for([&] {
+               relaying = relaying || joiner.join_wait().relaying;
+               for (auto& e : joiner.take_events()) joiner_events.push_back(e);
+               return has_event(joiner_events, Kind::Joined) || has_event(joiner_events, Kind::JoinFailed);
+           }, 30000ms) &&
+               has_event(joiner_events, Kind::Joined),
+           "and gets in through the relay when the host's addresses never answer");
+    expect(nebulanet->relays_asked.load() == 1 && nebulanet->relays_told.load() == 1,
+           "after asking NebulaNet for a relay and telling the host where it is");
+    expect(relaying, "the joining screen says it's going through a relay");
+    expect(wait_for([&] { return nebulanet->reported_relayed.load() == 1; }),
+           "and NebulaNet hears the join went through it");
+    expect(wait_for([&] { return host_session.players().size() == 2u; }), "the host has the joiner as a player");
+    joiner.leave();
+    host_session.leave();
+
+    // No relay to be had: the join still fails the usual way, in its time.
+    nebulanet->turn_port = 0u;
+    Session alone_host;
+    alone_host.set_web(nebulanet);
+    expect(alone_host.host(host), "another room opens");
+    std::vector<SessionEvent> alone_events;
+    expect(wait_for([&] {
+               for (auto& e : alone_host.take_events()) alone_events.push_back(e);
+               return has_event(alone_events, Kind::RoomCode);
+           }),
+           "and gets a room code");
+    Session stuck;
+    stuck.set_web(nebulanet);
+    expect(stuck.join(join), "a join with no relay to be had starts");
+    std::vector<SessionEvent> stuck_events;
+    expect(wait_for([&] {
+               for (auto& e : stuck.take_events()) stuck_events.push_back(e);
+               return has_event(stuck_events, Kind::JoinFailed) || has_event(stuck_events, Kind::Joined);
+           }, 30000ms) &&
+               has_event(stuck_events, Kind::JoinFailed) &&
+               stuck_events.back().text.find("YOUR ROUTERS DID NOT LET YOU REACH EACH OTHER") != std::string::npos,
+           "and fails as before when nothing gets through");
+    alone_host.leave();
+    serving.store(false);
+    server.join();
+    galaxy::net::turn::Client::allow_private_peers(false);
+}
+
 int main() {
     test_bytes();
+    test_digests();
     test_link_perfect_line();
     test_link_lossy_line();
     test_link_long_message();
@@ -1596,6 +2052,7 @@ int main() {
     test_stun();
     test_transport_lobby();
     test_transport_nat();
+    test_transport_relay();
     test_session();
     test_session_host_gone();
     test_coop_mods();
@@ -1604,6 +2061,7 @@ int main() {
     test_nebulanet_public();
     test_session_nebulanet();
     test_session_nebulanet_moved();
+    test_session_nebulanet_relay();
     if (s_failures == 0) std::printf("net tests passed\n");
     return s_failures == 0 ? 0 : 1;
 }
