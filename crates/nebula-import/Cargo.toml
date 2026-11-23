@@ -34,5 +34,5 @@ windows-sys.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 # The validator's test zip writer (tests/validate_c.rs shares luma-validate's tests/common).
-miniz_oxide = "0.8"
+miniz_oxide = "0.9"
 crc32fast = "1"
