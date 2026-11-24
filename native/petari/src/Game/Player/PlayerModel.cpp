@@ -139,7 +139,7 @@ void PlayerModel::drawIn(Material* pMaterial, u32 index) {
         const void* pSource = pImage;
         if (pSource == nullptr) {
             const u32 texture = draw.getMaterial()->getTextureIndex(0);
-            pSource = texture < mModelData->getTextureCount() ? mModelData->getTexture(texture)->image() : nullptr;
+            pSource = texture < mModelData->getTextureCount() ? mModelData->getTexture(texture)->mImage : nullptr;
         }
         if (const void* pCopy = mSkin->find(pSource)) {
             pImage = pCopy;

@@ -272,7 +272,7 @@ ShownTabs shown_tabs() {
     ShownTabs shown;
     // MODS only where the program has mod support (galaxy/mod_support.h); ONLINE (the old ADVANCED) always.
     for (const unsigned tab : kPages) {
-        if (tab == kModsTab && !::galaxy::mod_support()) continue;
+        if (tab == ui::kSettingsTabMods && !::galaxy::mod_support()) continue;
         shown.tabs[shown.count++] = tab;
     }
     return shown;
@@ -6887,7 +6887,6 @@ void open_saves_rows() {
 void route_dropped_files(std::vector<std::filesystem::path> files) {
     DroppedFiles sorted = sort_dropped_files(std::move(files));
     std::vector<std::filesystem::path>& mods = sorted.mods;
-    std::vector<std::filesystem::path>& miis = sorted.miis;
     // A program with no mod support takes no mod: its files and links are left (no MODS page to show them on).
     if (!::galaxy::mod_support()) mods.clear();
     const bool link = sorted.link && ::galaxy::mod_support();

@@ -19,8 +19,11 @@
 
 static_assert(static_cast< u32 >(LUMA_EVENTS_EVENT_STAGE_FRAME) == NEBULA_MOD_EVENT_STAGE_FRAME, "the kinds are the game's events");
 static_assert(static_cast< u32 >(LUMA_EVENTS_EVENT_PLAYER_ACTION) == NEBULA_MOD_EVENT_PLAYER_ACTION, "the kinds are the game's events");
-static_assert(NEBULA_MOD_EVENT_COUNT == 29, "LUMA_EVENTS_ALL names every event but FRAME");
-static_assert(LUMA_EVENTS_ALL == (((1u << NEBULA_MOD_EVENT_COUNT) - 1u) & ~1u), "LUMA_EVENTS_ALL names every event but FRAME");
+// The service's kinds are the game's own events, FRAME to PLAYER_ACTION. Online co-op's (NEBULA_MOD_EVENT_COOP_*, after
+// them) come through the coop service (luma_coop.h), which keeps their flags itself: this service never touches them.
+static const u32 kGameEventCount = NEBULA_MOD_EVENT_PLAYER_ACTION + 1u;
+static_assert(kGameEventCount == 29, "LUMA_EVENTS_ALL names every event but FRAME");
+static_assert(LUMA_EVENTS_ALL == (((1u << kGameEventCount) - 1u) & ~1u), "LUMA_EVENTS_ALL names every event but FRAME");
 static_assert(sizeof(((LumaEventsGame*)nullptr)->name) == LUMA_EVENTS_NAME_MOST, "the name's room is LUMA_EVENTS_NAME_MOST");
 
 namespace luma {
@@ -79,7 +82,7 @@ namespace luma {
                         any |= sWatches[i].kinds;
                     }
                 }
-                for (u32 event = 1; event < NEBULA_MOD_EVENT_COUNT; event++) {
+                for (u32 event = 1; event < kGameEventCount; event++) {
                     NebulaMods::setWatched(event, (any >> event & 1u) != 0);
                 }
             }
@@ -298,7 +301,7 @@ namespace luma {
         }  // namespace
 
         void raise(u32 event, s32 value, void* pActor, const char* pName) {
-            if (sKernel == nullptr || event >= NEBULA_MOD_EVENT_COUNT) {
+            if (sKernel == nullptr || event >= kGameEventCount) {
                 return;
             }
             const u32 flags = sKernel->game_thread() != 0 ? 0u : static_cast< u32 >(LUMA_EVENTS_OTHER_THREAD);
