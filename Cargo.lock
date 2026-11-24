@@ -564,7 +564,7 @@ dependencies = [
  "lewton",
  "luma-validate",
  "mikktspace",
- "miniz_oxide 0.8.9",
+ "miniz_oxide 0.9.1",
  "nod",
  "png",
  "serde_json",
