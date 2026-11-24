@@ -174,6 +174,16 @@ namespace {
         return nebula_host();
     }
 
+    // The host's heap, which a frame's list cannot do without: no memory stops the game, naming what it was for.
+    void* heapRealloc(void* pData, size_t bytes, const char* pWhat) {
+        void* const pNew = pData != nullptr || bytes == 0 ? host()->heap_realloc(host()->user, pData, bytes)
+                                                          : host()->heap_alloc(host()->user, bytes);
+        if (pNew == nullptr && bytes != 0) {
+            NEBULA_PANIC("out of memory: %llu bytes for %s", static_cast< unsigned long long >(bytes), pWhat);
+        }
+        return pNew;
+    }
+
     template < class T >
     struct Grown {
         T* mData;
@@ -202,7 +212,7 @@ namespace {
         }
 
         void reserve(u32 room) {
-            mData = static_cast< T* >(host()->heap_realloc(host()->user, mData, room * sizeof(T)));
+            mData = static_cast< T* >(heapRealloc(mData, static_cast< size_t >(room) * sizeof(T), "a frame's list"));
             mRoom = room;
         }
     };
@@ -218,6 +228,14 @@ namespace {
 
     const u32 cPageBytes = 1u << 20;
 
+    // The offset in the page of its next free byte aligned to `align` (a power of two): aligned by address, as a page is
+    // only as aligned as the host's heap.
+    u32 alignedOffset(const Page* pPage, u32 align) {
+        const uintptr_t start = reinterpret_cast< uintptr_t >(pPage);
+        const uintptr_t next = (start + pPage->mUsed + (align - 1)) & ~static_cast< uintptr_t >(align - 1);
+        return static_cast< u32 >(next - start);
+    }
+
     // A frame's list and everything it points to. The renderer holds on to two or three at a time; a list it let go is
     // written again, and when none is free there is one more.
     struct Store {
@@ -231,15 +249,8 @@ namespace {
         Grown< NebulaFrameLightSet > mLightSets;
         Grown< NebulaFrameLight > mLights;
         Grown< u32 > mLightFollow;
-        Grown< NebulaFrameLightOwner > mLightOwners;
-        Grown< NebulaFrameWorldLight > mWorldLights;
-        Grown< NebulaFrameShadowDrop > mShadowDrops;
-        Grown< NebulaFramePointLight > mPointLights;
-        Grown< NebulaFrameClipVolume > mClipVolumes;
-        u32 mClipRule;
         Grown< u32 > mCategories;  // pairs: the first item of a run of draws, and the category they are drawn as
         Grown< NebulaFrameConstants > mConstants;
-        Grown< NebulaScreenProbe > mProbes;
         Grown< u32 > mRingIndices;
         Grown< InstanceRow > mInstanceRows;
         Grown< NebulaCall > mNativeCalls;
@@ -254,7 +265,6 @@ namespace {
     Store* sCurrent;
     u32 sNumber;
     s32 sOpenDraw = -1;
-    bool sTracedOnly = false;  // Frame::tracedOnly: new draws open NEBULA_PASS_TRACED_DRAW passes
 
     bool sPixelLit;
 
@@ -278,17 +288,6 @@ namespace {
     bool sLightsDirty = true;
     bool sLightsSet = false;
     u32 sLightSet = NEBULA_NONE32;
-    // Whose lights those are (NebulaFrameLightOwner), with the world lights of its key and fill and of its point light:
-    // a set made from lights loaded on an earlier frame still brings its world lights into this frame's list.
-    NebulaFrameLightOwner sLightOwner = {};
-    NebulaFrameWorldLight sOwnerLights[2] = {};
-    NebulaFrameWorldLight sOwnerPoint = {};
-    // The stage's light, as the last frame that knew it said.
-    u64 sStageLight = 0;
-    f32 sStageAmbient[3] = {};
-    bool sStageLightKnown = false;
-    // The stage being played (NebulaFrameList::stage_hash).
-    u32 sStageHash = 0;
 
     // The pass's own decisions.
     bool sPassAlpha = false;
@@ -309,12 +308,6 @@ namespace {
     u32 sSceneCamera = NEBULA_NONE32;
     u32 sSceneView = NEBULA_NONE32;
 
-    // The last asker given out. A probe set ends with one more point that shows nothing and carries its asker in user_x
-    // (a whole number a float holds exactly), so an answer finds its asker.
-    const u32 cLastAsker = 1u << 24;
-    u32 sProbeAskers;
-    Grown< NebulaScreenProbe > sProbeAnswers;
-
     void resetStore(Store* pStore) {
         pStore->mPasses.mCount = 0;
         pStore->mItems.mCount = 0;
@@ -324,15 +317,8 @@ namespace {
         pStore->mLightSets.mCount = 0;
         pStore->mLights.mCount = 0;
         pStore->mLightFollow.mCount = 0;
-        pStore->mLightOwners.mCount = 0;
-        pStore->mWorldLights.mCount = 0;
-        pStore->mShadowDrops.mCount = 0;
-        pStore->mPointLights.mCount = 0;
-        pStore->mClipVolumes.mCount = 0;
-        pStore->mClipRule = NEBULA_CLIP_RULE_NONE;
         pStore->mCategories.mCount = 0;
         pStore->mConstants.mCount = 0;
-        pStore->mProbes.mCount = 0;
         pStore->mRingIndices.mCount = 0;
         pStore->mInstanceRows.mCount = 0;
         pStore->mNativeCalls.mCount = 0;
@@ -352,13 +338,13 @@ namespace {
         }
         Store* pFree = nullptr;
         for (Store* p = sStores; p != nullptr; p = p->mNext) {
-            if (p->mList.released != 0) {
+            if (nebula_frame_list_released(&p->mList) != 0) {
                 pFree = p;
                 break;
             }
         }
         if (pFree == nullptr) {
-            pFree = static_cast< Store* >(host()->heap_alloc(host()->user, sizeof(Store)));
+            pFree = static_cast< Store* >(heapRealloc(nullptr, sizeof(Store), "a frame's list"));
             memset(pFree, 0, sizeof(Store));
             pFree->mNext = sStores;
             sStores = pFree;
@@ -366,7 +352,6 @@ namespace {
         resetStore(pFree);
         sCurrent = pFree;
         sOpenDraw = -1;
-        sTracedOnly = false;
         sViewDirty = true;
         sLightsDirty = true;
         sLightSet = NEBULA_NONE32;
@@ -422,7 +407,7 @@ namespace {
     SitePipeline& siteEntry(u64 key, u32 state) {
         if (sSiteCount * 4 >= sSiteRoom * 3) {
             const u32 room = sSiteRoom != 0 ? sSiteRoom * 2 : 1024;
-            auto* pNew = static_cast< SitePipeline* >(host()->heap_alloc(host()->user, room * sizeof(SitePipeline)));
+            auto* pNew = static_cast< SitePipeline* >(heapRealloc(nullptr, room * sizeof(SitePipeline), "the pipeline table"));
             memset(pNew, 0, room * sizeof(SitePipeline));
             for (u32 i = 0; i < sSiteRoom; i++) {
                 const SitePipeline& rOld = sSitePipelines[i];
@@ -476,16 +461,6 @@ namespace Frame {
         rList.light_sets = pStore->mLightSets.mData;
         rList.lights = pStore->mLights.mData;
         rList.light_follow = pStore->mLightFollow.mData;
-        rList.light_set_owners = pStore->mLightOwners.mData;
-        rList.world_lights = pStore->mWorldLights.mData;
-        rList.world_light_count = pStore->mWorldLights.mCount;
-        rList.shadow_drops = pStore->mShadowDrops.mData;
-        rList.shadow_drop_count = pStore->mShadowDrops.mCount;
-        rList.point_lights = pStore->mPointLights.mData;
-        rList.point_light_count = pStore->mPointLights.mCount;
-        rList.clip_volumes = pStore->mClipVolumes.mData;
-        rList.clip_volume_count = pStore->mClipVolumes.mCount;
-        rList.clip_rule = pStore->mClipRule;
         // Each item's category, by the runs the draws were made in: a draw writes its item's flags whole when it is
         // made, so they are set now.
         for (u32 run = 0; run + 1 < pStore->mCategories.mCount; run += 2) {
@@ -496,18 +471,9 @@ namespace Frame {
                 pStore->mItems.mData[item].flags = (pStore->mItems.mData[item].flags & ~static_cast< u32 >(NEBULA_ITEM_CATEGORY_MASK)) | bits;
             }
         }
-        rList.stage_light_known = sStageLightKnown ? 1u : 0u;
-        rList.stage_light = sStageLight;
-        rList.stage_ambient[0] = sStageAmbient[0];
-        rList.stage_ambient[1] = sStageAmbient[1];
-        rList.stage_ambient[2] = sStageAmbient[2];
-        rList.stage_hash = sStageHash;
-        // A scene that stops saying what its light is has none on the next frame.
-        sStageLightKnown = false;
         rList.constants = pStore->mConstants.mData;
         rList.ring_vertices = pStore->mRingVertices;
         rList.ring_indices = pStore->mRingIndices.mData;
-        rList.probes = pStore->mProbes.mData;
         rList.instance_rows = pStore->mInstanceRows.mData;
         rList.instance_row_count = pStore->mInstanceRows.mCount;
         rList.native_calls = pStore->mNativeCalls.mData;
@@ -521,7 +487,6 @@ namespace Frame {
         rList.light_count = pStore->mLights.mCount;
         rList.light_follow_count = pStore->mLightFollow.mCount;
         rList.constants_count = pStore->mConstants.mCount;
-        rList.probe_count = pStore->mProbes.mCount;
         rList.ring_vertex_bytes = pStore->mRingBytes;
         rList.ring_index_count = pStore->mRingIndices.mCount;
         rList.camera_epoch = sCuts;
@@ -537,17 +502,26 @@ namespace Frame {
     }
 
     void* arena(u32 bytes, u32 align) {
+        // A length past this is a bad count; with the page's header and the alignment it would wrap.
+        if (bytes > 0x7FFFFF00u || align > 4096u || (align & (align - 1)) != 0) {
+            NEBULA_PANIC("frame memory of %u bytes aligned to %u", bytes, align);
+        }
+        if (align == 0) {
+            align = 1;
+        }
         Store* pStore = store();
         Page* pPage = pStore->mPage;
         u32 at = 0;
         if (pPage != nullptr) {
-            at = (pPage->mUsed + (align - 1)) & ~(align - 1);
+            at = alignedOffset(pPage, align);
         }
         while (pPage == nullptr || at + bytes > pPage->mRoom) {
             Page* pNext = pPage != nullptr ? pPage->mNext : nullptr;
             if (pNext == nullptr) {
-                const u32 room = bytes + 64 > cPageBytes ? bytes + 64 : cPageBytes;
-                pNext = static_cast< Page* >(host()->heap_alloc(host()->user, room));
+                // Room for the block after the header at any address the heap gives.
+                const u32 need = bytes + static_cast< u32 >(sizeof(Page)) + align;
+                const u32 room = need > cPageBytes ? need : cPageBytes;
+                pNext = static_cast< Page* >(heapRealloc(nullptr, room, "a frame's memory"));
                 pNext->mNext = nullptr;
                 pNext->mRoom = room;
                 pNext->mUsed = sizeof(Page);
@@ -558,7 +532,7 @@ namespace Frame {
                 }
             }
             pPage = pNext;
-            at = (pPage->mUsed + (align - 1)) & ~(align - 1);
+            at = alignedOffset(pPage, align);
         }
         pPage->mUsed = at + bytes;
         pStore->mPage = pPage;
@@ -568,7 +542,7 @@ namespace Frame {
     NebulaFrameItem& addItem() {
         Store* pStore = store();
         if (sOpenDraw < 0) {
-            NebulaFramePass& rPass = addPass(sTracedOnly ? NEBULA_PASS_TRACED_DRAW : NEBULA_PASS_DRAW);
+            NebulaFramePass& rPass = addPass(NEBULA_PASS_DRAW);
             rPass.first_item = pStore->mItems.mCount;
             sOpenDraw = static_cast< s32 >(pStore->mPasses.mCount - 1);
         }
@@ -753,14 +727,6 @@ namespace Frame {
             if (words != 0) {
                 memcpy(pStore->mLightFollow.addRun(words), sLightFollow.mData, words * sizeof(u32));
             }
-            pStore->mLightOwners.add() = sLightOwner;
-            if (sLightOwner.actor_light != 0) {
-                worldLight(sOwnerLights[0]);
-                worldLight(sOwnerLights[1]);
-            }
-            if (sLightOwner.point_light != 0) {
-                worldLight(sOwnerPoint);
-            }
             sLightSet = static_cast< u32 >(pStore->mLightSets.mCount - 1);
             sLightsDirty = false;
         }
@@ -779,100 +745,6 @@ namespace Frame {
         memcpy(rOut.direction, rLight.direction, sizeof(rOut.direction));
         sLightsDirty = true;
         sLightsSet = true;
-    }
-
-    void worldLight(const NebulaFrameWorldLight& rLight) {
-        Store* pStore = store();
-        Grown< NebulaFrameWorldLight >& rLights = pStore->mWorldLights;
-        // Ascending by id, each id once: the newest values of a light named twice stand.
-        u32 at = rLights.mCount;
-        while (at != 0 && rLights.mData[at - 1].id > rLight.id) {
-            at--;
-        }
-        if (at != 0 && rLights.mData[at - 1].id == rLight.id) {
-            rLights.mData[at - 1] = rLight;
-            return;
-        }
-        rLights.add();
-        for (u32 i = rLights.mCount - 1; i > at; i--) {
-            rLights.mData[i] = rLights.mData[i - 1];
-        }
-        rLights.mData[at] = rLight;
-    }
-
-    void shadowDrop(const NebulaFrameShadowDrop& rDrop) {
-        Grown< NebulaFrameShadowDrop >& rDrops = store()->mShadowDrops;
-        rDrops.add();
-        rDrops.mData[rDrops.mCount - 1] = rDrop;
-    }
-
-    void pointLight(const NebulaFramePointLight& rLight) {
-        Grown< NebulaFramePointLight >& rLights = store()->mPointLights;
-        rLights.add();
-        rLights.mData[rLights.mCount - 1] = rLight;
-    }
-
-    void clipVolume(const NebulaFrameClipVolume& rVolume) {
-        Grown< NebulaFrameClipVolume >& rVolumes = store()->mClipVolumes;
-        rVolumes.add();
-        rVolumes.mData[rVolumes.mCount - 1] = rVolume;
-    }
-
-    void clipRule(u32 rule) {
-        store()->mClipRule = rule;
-    }
-
-    void setLightOwner(const NebulaFrameWorldLight* pKey, const NebulaFrameWorldLight* pFill, const f32* pAmbient, u32 kind) {
-        NebulaFrameLightOwner owner = sLightOwner;
-        owner.actor_light = pKey != nullptr ? pKey->id : 0;
-        owner.kind = kind;
-        for (u32 c = 0; c < 3; c++) {
-            owner.ambient[c] = pAmbient != nullptr ? pAmbient[c] : 0.0f;
-        }
-        if (pKey != nullptr) {
-            sOwnerLights[0] = *pKey;
-            sOwnerLights[1] = *pFill;
-        }
-        if (memcmp(&owner, &sLightOwner, sizeof(owner)) != 0) {
-            sLightOwner = owner;
-            sLightsDirty = true;
-        }
-    }
-
-    void setLightPointOwner(const NebulaFrameWorldLight* pPoint) {
-        const u64 id = pPoint != nullptr ? pPoint->id : 0;
-        if (pPoint != nullptr) {
-            sOwnerPoint = *pPoint;
-        }
-        if (sLightOwner.point_light != id) {
-            sLightOwner.point_light = id;
-            sLightsDirty = true;
-        }
-    }
-
-    void setStageLight(u64 id, const f32* pAmbient) {
-        sStageLight = id;
-        for (u32 c = 0; c < 3; c++) {
-            sStageAmbient[c] = pAmbient[c];
-        }
-        sStageLightKnown = true;
-    }
-
-    void setStage(const char* pName) {
-        u32 hash = 0;
-        if (pName != nullptr && pName[0] != '\0') {
-            hash = 2166136261u;
-            for (const char* c = pName; *c != '\0'; c++) {
-                hash = (hash ^ static_cast< u8 >(*c)) * 16777619u;
-            }
-            hash = hash != 0 ? hash : 1;
-        }
-        if (hash != sStageHash) {
-            sStageHash = hash;
-            if (pName != nullptr && host()->game_stage != nullptr) {
-                host()->game_stage(host()->user, pName);
-            }
-        }
     }
 
     // Lights 0-31 at once.
@@ -1110,6 +982,15 @@ namespace Frame {
         rPass.over_frame_channels = channels;
     }
 
+    void targetBeginPixelsOverFrame(const void* pKey, u32 width, u32 height, u32 clearRgba, const void* pFrameKey,
+                                    NebulaTargetChannels channels, const void* pDepthKey) {
+        targetBeginOverFrame(pKey, 0.0f, 0.0f, clearRgba, pFrameKey, channels, pDepthKey);
+        NebulaFramePass& rPass = store()->mPasses.mData[sOpenDraw];
+        rPass.width = width;
+        rPass.height = height;
+        rPass.pixels = 1;
+    }
+
     void targetEnd(const void*, NebulaTargetChannels channels) {
         Store* pStore = store();
         // Every pass into the target carries what its picture holds.
@@ -1193,47 +1074,6 @@ namespace Frame {
         addPass(NEBULA_PASS_SHOW);
     }
 
-    u32 newProbeAsker() {
-        sProbeAskers = sProbeAskers == cLastAsker ? 1u : sProbeAskers + 1u;
-        return sProbeAskers;
-    }
-
-    void probeScreen(u32 channel, u32 asker, const NebulaScreenProbe* pProbes, u32 count, bool compared) {
-        if (count == 0) {
-            return;
-        }
-        Store* pStore = store();
-        const u32 first = pStore->mProbes.mCount;
-        for (u32 i = 0; i < count; i++) {
-            NebulaScreenProbe& rProbe = pStore->mProbes.add();
-            rProbe = pProbes[i];
-            if (rProbe.x >= 0.0f) {
-                rProbe.x *= NEBULA_FRAME_UNITS;
-                rProbe.y *= NEBULA_FRAME_UNITS;
-            }
-        }
-        NebulaScreenProbe& rMark = pStore->mProbes.add();
-        rMark = NebulaScreenProbe{-1.0f, -1.0f, static_cast< f32 >(asker), 0.0f, 0.0f, 0.0f};
-        NebulaFramePass& rPass = addPass(NEBULA_PASS_PROBE);
-        rPass.probe_channel = channel;
-        rPass.arg0 = compared ? NEBULA_PROBE_COMPARED : NEBULA_PROBE_DEPTH;
-        rPass.first_probe = first;
-        rPass.probe_count = count + 1;
-    }
-
-    // The channel's latest answers if they answer this asker's probes; none before its first have come back.
-    u32 screenProbeResults(u32 channel, u32 asker, NebulaScreenProbe* pProbes, u32 capacity) {
-        if (sProbeAnswers.mRoom < capacity + 1) {
-            sProbeAnswers.reserve(capacity + 1);
-        }
-        const u32 done = host()->probe_results(host()->user, channel, sProbeAnswers.mData, capacity + 1);
-        if (done == 0 || sProbeAnswers.mData[done - 1].user_x != static_cast< f32 >(asker)) {
-            return 0;
-        }
-        memcpy(pProbes, sProbeAnswers.mData, (done - 1) * sizeof(NebulaScreenProbe));
-        return done - 1;
-    }
-
     void sceneBegin(const f32 (*pView)[4]) {
         Store* pStore = store();
         pStore->mList.flags |= NEBULA_FRAME_HAS_SCENE;
@@ -1306,13 +1146,6 @@ namespace Frame {
         setObject(0, 0);
     }
 
-    void tracedOnly(bool on) {
-        if (sTracedOnly != on) {
-            sTracedOnly = on;
-            sOpenDraw = -1;  // the next draw opens a pass of the other kind
-        }
-    }
-
     void category(u8 category) {
         Store* pStore = store();
         Grown< u32 >& rRuns = pStore->mCategories;
@@ -1371,7 +1204,7 @@ namespace FrameRing {
             while (at + bytes > room) {
                 room *= 2;
             }
-            pStore->mRingVertices = static_cast< u8* >(host()->heap_realloc(host()->user, pStore->mRingVertices, room));
+            pStore->mRingVertices = static_cast< u8* >(heapRealloc(pStore->mRingVertices, room, "a frame's ring"));
             pStore->mRingRoom = room;
         }
         pStore->mRingBytes = at + bytes;

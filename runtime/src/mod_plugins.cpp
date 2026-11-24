@@ -71,6 +71,9 @@ struct Reload {
     bool asked = false;            // a take-out was asked (the mod was running)
 };
 std::optional<Reload> g_reload;
+// reload_later's queue (any thread in, dev_frame out).
+std::mutex g_later_mutex;
+std::vector<std::string> g_later;
 
 // NebulaModEvent's names in lower case, in its order: what an achievement's "when" names.
 constexpr const char* kEventNames[] = {
@@ -91,7 +94,7 @@ bool unlock_achievement_at(std::size_t index) {
 }
 
 // An event some achievement's "when" names: each one it matches is unlocked. What the event carries is not changed.
-int32_t achievement_event(const NebulaModEventData* data, void* user) {
+void achievement_event(const NebulaModEventData* data, void* user) {
     const int event = static_cast<int>(reinterpret_cast<std::intptr_t>(user));
     for (std::size_t i = 0; i < g_achievements.size(); ++i) {
         const AchievementToAdd& achievement = g_achievements[i];
@@ -100,7 +103,6 @@ int32_t achievement_event(const NebulaModEventData* data, void* user) {
         if (achievement.has_value && achievement.event_value != data->value) continue;
         (void)unlock_achievement_at(i);
     }
-    return data->value;
 }
 
 void say(const std::string& text) {
@@ -110,10 +112,12 @@ void say(const std::string& text) {
 void* open_library(const std::filesystem::path& path) {
 #if defined(_WIN32)
     // Beside it first, for what it brings; the game module is found already loaded.
-    return LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    void* const library = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
 #else
-    return dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    void* const library = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
 #endif
+    galaxy::luma_guard::add_library(library);  // a fault in its code, called by any mod, is a mod's
+    return library;
 }
 
 // The library a plugin runs from. On Windows, a copy of its folder's files (mods/.cooked/code/<process>-<n>): Windows
@@ -151,6 +155,7 @@ std::filesystem::path running_copy(const std::filesystem::path& library, std::si
 }
 
 void close_library(void* module) {
+    galaxy::luma_guard::remove_library(module);
 #if defined(_WIN32)
     FreeLibrary(static_cast<HMODULE>(module));
 #else
@@ -1036,7 +1041,23 @@ void reload(std::string_view mod_id) {
     begin_reload(std::string(mod_id), "null");
 }
 
+void reload_later(std::string_view mod_id) {
+    const std::lock_guard<std::mutex> lock(g_later_mutex);
+    g_later.emplace_back(mod_id);
+}
+
 void dev_frame() {
+    if (!g_reload) {
+        std::string next;
+        {
+            const std::lock_guard<std::mutex> lock(g_later_mutex);
+            if (!g_later.empty()) {
+                next = std::move(g_later.front());
+                g_later.erase(g_later.begin());
+            }
+        }
+        if (!next.empty()) begin_reload(std::move(next), "null");
+    }
     if (g_reload) {
         Reload& r = *g_reload;
         ++r.frames;

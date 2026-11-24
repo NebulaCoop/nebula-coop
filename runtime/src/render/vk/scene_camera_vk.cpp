@@ -84,17 +84,16 @@ void SceneCameraVk::shutdown() noexcept {
     exposure_.reset();
     Context& context = Context::get();
     if (!context.ready()) {
+        made_.clear();
         return;
     }
     const VkDevice device = context.device();
     if (meter_ != VK_NULL_HANDLE) vkDestroyPipeline(device, meter_, nullptr);
     meter_ = VK_NULL_HANDLE;
-    for (auto& kind : pipelines_) {
-        for (VkPipeline& pipeline : kind) {
-            if (pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
+    for (const Made& made : made_) {
+        if (made.pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, made.pipeline, nullptr);
     }
+    made_.clear();
     if (layout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, layout_, nullptr);
     if (set_layout_ != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, set_layout_, nullptr);
     layout_ = VK_NULL_HANDLE;
@@ -103,10 +102,12 @@ void SceneCameraVk::shutdown() noexcept {
 
 VkPipeline SceneCameraVk::pipeline(Kind kind, VkRenderPass pass, unsigned samples_log2) {
     samples_log2 = std::min(samples_log2, 3u);
-    VkPipeline& out = pipelines_[kind][samples_log2];
-    if (out != VK_NULL_HANDLE) {
-        return out;
+    for (const Made& made : made_) {
+        if (made.kind == kind && made.pass == pass) {
+            return made.pipeline;
+        }
     }
+    VkPipeline out = VK_NULL_HANDLE;
     const VkDevice device = Context::get().device();
     const VkShaderModule vs = module_of(UtilitySpirv::CameraVs);
     const VkShaderModule ps = module_of(kind == kWiden           ? UtilitySpirv::CameraWidenPs
@@ -166,7 +167,28 @@ VkPipeline SceneCameraVk::pipeline(Kind kind, VkRenderPass pass, unsigned sample
     }
     if (vs != VK_NULL_HANDLE) vkDestroyShaderModule(device, vs, nullptr);
     if (ps != VK_NULL_HANDLE) vkDestroyShaderModule(device, ps, nullptr);
+    made_.push_back({kind, pass, out});
     return out;
+}
+
+void SceneCameraVk::prepare_pipelines(const std::array<VkRenderPass, 4>& passes,
+                                      const std::array<VkRenderPass, 4>& wide_passes) {
+    for (unsigned samples_log2 = 0u; samples_log2 < 4u; ++samples_log2) {
+        // The widening draws in the wide set's pass; the camera in the base scene's, which is wide with HDR output.
+        if (wide_passes[samples_log2] != VK_NULL_HANDLE) {
+            (void)pipeline(kWiden, wide_passes[samples_log2], samples_log2);
+        }
+        for (const VkRenderPass pass : {passes[samples_log2], wide_passes[samples_log2]}) {
+            if (pass == VK_NULL_HANDLE) {
+                continue;
+            }
+            (void)pipeline(kCamera, pass, samples_log2);
+            (void)pipeline(kCameraResolve, pass, samples_log2);
+            if (samples_log2 != 0u) {
+                (void)pipeline(kCameraSamples, pass, samples_log2);
+            }
+        }
+    }
 }
 
 VkDescriptorSet SceneCameraVk::set_of(const SetAllocator& allocate, const Texture& sampled, const Texture* depth,
@@ -192,14 +214,13 @@ VkDescriptorSet SceneCameraVk::set_of(const SetAllocator& allocate, const Textur
 }
 
 void SceneCameraVk::full_screen(VkCommandBuffer commands, VkPipeline pipeline, VkDescriptorSet set, unsigned width,
-                                unsigned height, unsigned finish) const {
+                                unsigned height) const {
     const VkViewport viewport{0.0f, static_cast<float>(height), static_cast<float>(width), -static_cast<float>(height),
                               0.0f, 1.0f};
     const VkRect2D scissor{{0, 0}, {width, height}};
     camera::Constants constants{};
     constants.width = static_cast<float>(width);
     constants.height = static_cast<float>(height);
-    constants.finish = static_cast<float>(finish);
     vkCmdSetViewport(commands, 0, 1, &viewport);
     vkCmdSetScissor(commands, 0, 1, &scissor);
     vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -218,7 +239,7 @@ void SceneCameraVk::widen(VkCommandBuffer commands, VkRenderPass pass, unsigned 
 }
 
 void SceneCameraVk::meter(VkCommandBuffer commands, const Texture& wide, const Texture& depth, VkImageLayout depth_layout,
-                          unsigned width, unsigned height, float seconds, unsigned finish, const SetAllocator& allocate) {
+                          unsigned width, unsigned height, float seconds, const SetAllocator& allocate) {
     // The last frame's reads finish before the meter writes (a read before a write needs the execution dependency alone).
     image_barrier(commands, exposure_->image, VK_IMAGE_ASPECT_COLOR_BIT,
                   exposure_ready_ ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
@@ -228,7 +249,6 @@ void SceneCameraVk::meter(VkCommandBuffer commands, const Texture& wide, const T
     constants.width = static_cast<float>(std::min(width, wide.width));
     constants.height = static_cast<float>(std::min(height, wide.height));
     constants.seconds = exposure_ready_ ? seconds : -1.0f;
-    constants.finish = static_cast<float>(finish);
     exposure_ready_ = true;
     const VkDescriptorSet set = set_of(allocate, wide, &depth, depth_layout);
     vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, meter_);
@@ -241,12 +261,10 @@ void SceneCameraVk::meter(VkCommandBuffer commands, const Texture& wide, const T
 }
 
 void SceneCameraVk::draw(VkCommandBuffer commands, VkRenderPass pass, unsigned samples_log2, const Texture& wide,
-                         unsigned width, unsigned height, bool per_sample, const SetAllocator& allocate, bool resolve,
-                         unsigned finish) {
+                         unsigned width, unsigned height, bool per_sample, const SetAllocator& allocate, bool resolve) {
     const VkPipeline camera = pipeline(resolve ? kCameraResolve : per_sample ? kCameraSamples : kCamera, pass, samples_log2);
     if (camera != VK_NULL_HANDLE) {
-        full_screen(commands, camera, set_of(allocate, wide), std::min(width, wide.width), std::min(height, wide.height),
-                    finish);
+        full_screen(commands, camera, set_of(allocate, wide), std::min(width, wide.width), std::min(height, wide.height));
     }
 }
 

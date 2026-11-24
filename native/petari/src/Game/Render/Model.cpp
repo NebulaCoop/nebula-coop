@@ -152,12 +152,12 @@ namespace Skeleton {
         pBasic->init(rScale, rMtx);
         mCurrentMtxCalc = pBasic;
 
-        const NebulaModelStep* pSteps = reinterpret_cast< const NebulaModelStep* >(pData->at(pData->mFile->steps_at));
-        const u32 count = pData->mFile->step_count;
+        const u32 count = pData->mView.step_count;
         Saved* pTop = sStack;
         for (u32 i = 0; i < count; i++) {
-            Joint* pJoint = pData->getJointAt(pSteps[i].joint);
-            if (pSteps[i].op == NEBULA_STEP_ENTER) {
+            const NebulaModelStep& rStep = pData->entry< NebulaModelStep >(pData->mView.steps_at, pData->mView.step_stride, i);
+            Joint* pJoint = pData->getJointAt(rStep.joint);
+            if (rStep.op == NEBULA_STEP_ENTER) {
                 NebulaMtxCopy(mCurrentMtx, pTop->mMtx);
                 pTop->mS = mCurrentS;
                 pTop->mParentS = mParentS;
@@ -299,8 +299,7 @@ int ItemBuffer::entryMatSort(MaterialEntry* pEntry) {
         Material* pMaterial = pEntry->getMaterial();
         const u32 texNo = pMaterial->getTextureIndex(0);
         if (texNo != NEBULA_NONE32) {
-            const ResTIMG* pTimg = pMaterial->getModelData()->getTexture(texNo);
-            const NebulaTexture* pRecord = nebula_texture_record(pTimg->image());
+            const NebulaTexture* pRecord = nebula_texture_record(pMaterial->getModelData()->getTexture(texNo)->mImage);
             image = pRecord != nullptr ? static_cast< u32 >(pRecord->image_id) : 0;
         }
         for (u32 i = 0; i < mEntryCount; i++) {
@@ -602,7 +601,7 @@ u32 Model::poseBlock(ModelPose* pPose) {
 u32 Model::block(const Material* pMaterial) {
     ModelPose* pPose = mDrawPose;
     const u32 plain = poseBlock(pPose);
-    if (pMaterial->mFile->has_scale == 0) {
+    if ((pMaterial->mFile->flags & NEBULA_MATL_NORMAL_SCALE) == 0) {
         return plain;
     }
     if (ModelSys::mViewOverride != nullptr) {

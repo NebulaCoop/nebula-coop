@@ -9,7 +9,7 @@
 
 #include "galaxy/render/ambient_occlusion_objects.h"
 #include "galaxy/render/gpu_upload_ring.h"
-#include "galaxy/render/rt_types.h"
+#include "galaxy/render/scene_view.h"
 
 #include <array>
 #include <cstdint>
@@ -22,7 +22,7 @@ class DescriptorRing;
 // Ambient occlusion of the 3D scene (RenderConfig::ambient_occlusion; ambient_occlusion.hlsl): ground-truth ambient
 // occlusion from the scene target's depth, multiplied into its colour after the opaque phases, before the translucent ones
 // (glass, water, glows and effects stay as drawn). Every perspective scene gets it, the game's baked map geometry
-// included; ray-traced lighting has its own. Occlusion pixels: ambient_occlusion_shape.h.
+// included. Occlusion pixels: ambient_occlusion_shape.h.
 class AmbientOcclusion {
 public:
     AmbientOcclusion() = default;
@@ -30,10 +30,14 @@ public:
     AmbientOcclusion& operator=(const AmbientOcclusion&) = delete;
     ~AmbientOcclusion() { shutdown(); }
 
-    // The root signature and compute pipelines (precompiled shaders); the multiply's pipelines are made per sample
-    // count at first use. False leaves the pass off.
+    // The root signature and compute pipelines (precompiled shaders); the multiply's pipelines are prepare_pipelines'.
+    // False leaves the pass off.
     bool initialize(ID3D12Device* device);
     void shutdown() noexcept;
+    // Every pipeline of the pass for each sample count up to `max_samples` (a power of two, at most 8) while the renderer
+    // starts (P-052), so a frame never makes one; one the device refuses is not tried again. On any thread, while no
+    // frame records with the pass.
+    void prepare_pipelines(unsigned max_samples);
     [[nodiscard]] bool ready() const noexcept { return ready_; }
 
     struct Inputs {
@@ -49,7 +53,7 @@ public:
         bool ssao = false;                // SSAO instead of GTAO
         const std::vector<ao::ObjectOccluder>* objects = nullptr;  // the scene's models
         UploadRing* ring = nullptr;       // where their buffers go
-        RtView view{};                    // the scene's projection, depth range and viewport (scene target pixels)
+        SceneView view{};                    // the scene's projection, depth range and viewport (scene target pixels)
     };
     // Records the occlusion and multiplies it into `color_rtv`'s RGB. Leaves this pass's root signatures, pipeline
     // and render target bound. Returns false when nothing was recorded.
@@ -89,6 +93,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D12PipelineState> denoise_;
     // 1, 2, 4, 8 samples; then HDR.
     std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 8> apply_{};
+    unsigned apply_failed_ = 0u;  // apply_ entries the device would not make (not tried again)
     Target distance_;  // eye distance per occlusion pixel (R32F)
     Target raw_;       // occlusion, eye distance (R16G16F)
     Target denoised_;

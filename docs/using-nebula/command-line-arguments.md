@@ -17,7 +17,7 @@ The Start menu shortcut on Windows and `nebula-launch` on Linux pass `--pak` and
 |---|---|---|
 | `--pak FILE` | The game content, `game.pak`. Required. | None |
 | `--saves FOLDER` | The saves folder. Required, except with `--benchmark 1`. | None |
-| `--module FILE` | The game module. | `smg_game.dll` (`libsmg_game.so` on Linux and Android, `libsmg_game.dylib` on macOS) beside the executable |
+| `--module FILE` | The game module. | `smg_game.dll` (`libsmg_game.so` on Linux and Android, `libsmg_game.dylib` on macOS) beside the executable (on macOS in the app's `Contents/Frameworks`). Without mod support only the plain module, `smg_game_plain`, is shipped: the game module's name is then the name it would have, and the plain module is the file beside it |
 | `--data FOLDER` | Nebula's data folder: shader caches, crash dumps, downloaded libraries in `vendor`, and the settings unless `--settings` names another folder. | `%LOCALAPPDATA%\Nebula` on Windows; `$XDG_DATA_HOME/Nebula`, else `~/.local/share/Nebula`, elsewhere |
 | `--settings FOLDER` | The folder that holds `config.ini` and `runtime_settings.ini`, with `Movies`, `TextureDumps` and `mods` beside them. | The data folder |
 | `--crash-dumps FOLDER` | Crash dumps and crash reports. | `crashes` in the data folder |
@@ -31,7 +31,10 @@ The Start menu shortcut on Windows and `nebula-launch` on Linux pass `--pak` and
 | `--home 1` or `--home 0` | `1` shows the home screen (**Play**, **Settings**, **Benchmark**, **Quit** and an update notice) before the title screen. `0`, the default, goes straight into the game. |
 | `--safe-start 1` | Turns every mod off for this start only. Your choices on the **Mods** page stay as they are for the next start. Holding <kbd>Shift</kbd> while Nebula starts does the same. |
 | `--seconds N` | Ends the game after N seconds. |
+| `--start-check N` | Checks that the program starts, without the game's files. Opens the window and the renderer, draws and shows N frames of a blank picture, then exits. Exits with 0 when at least one picture was shown, 3 when the renderer did not start, 4 when no picture was shown, and 5 when the renderer stopped taking frames. Only this check may use a software renderer, and only when no graphics card runs the renderer. `--pak` and `--saves` are not needed. |
+| `--module-check 1` | Checks that the program finds its game module and the system loads it, as a start does: no game files, no window, no renderer. Prints `module check: FILE loaded (...)` and exits with 0. When the module is not there or the system refuses it, it stops with the reason (exit 3, and the report's NEB-S03). Packages are checked with it (`platform/apple/check_module.sh`). |
 | `--hidden 1` | Linux and macOS. Starts without a window and never reads your keyboard, mouse or controllers. Test tools use it. On Windows, a start with a hidden window does the same. |
+| `--no-focus 1` | Windows. The game window never asks for the keyboard focus: it is shown without being made the active window, and the game runs as it does with the focus (it never pauses, mutes or slows down because another program is in front). Test tools use it for runs with a visible window, so a run does not take your keys. Other systems accept it and ignore it. |
 
 To choose the graphics card, use **Settings** in Nebula, or set `gpu=` in `config.ini`. When `gpu=` is empty, Nebula uses the high-performance graphics card.
 
@@ -58,6 +61,7 @@ After a crash with mods turned on, the next start is a safe start. If only mod c
 | `--timeline FILE` | Where the recorded timeline goes. The default is `diagnostics/timeline-PROCESS-ID.bin` in the data folder. |
 | `--console-log 1` | Writes the log to the terminal Nebula was started from, or to a console window of its own, instead of `logs/latest.log` in the settings folder. When the output already goes to a pipe or a file, the log stays there without this argument. |
 | `--gpu-validation 1` or `--gpu-validation 2` | Turns on the graphics API's validation layer. `1` is the Direct3D 12 debug layer, or the Khronos validation layer when it is installed. `2` also turns on Direct3D 12 GPU-based validation. After a lost Direct3D 12 device, the log lists the objects that were still alive (`[D3D12-LIVE-OBJECT]`). The game runs much slower with validation on. |
+| `--software-device 1` | Runs on a software graphics device, with no graphics card. Direct3D 12 and Direct3D 11 take Microsoft's software adapter and no other, and Vulkan takes a device of the processor type. A computer that has none ends the start with the line `[gpu] --software-device: no software device for RENDERER` and a non-zero exit code; no other renderer is tried in its place. Metal has no software device and always ends this way. The game is much slower on a software device. Test tools use it to play recorded plays without a graphics card. |
 
 ## Benchmark
 

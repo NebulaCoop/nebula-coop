@@ -3,6 +3,7 @@
 
 #include "sdl_host.h"
 #include "galaxy/display_timeline.h"
+#include "galaxy/vsync_grid.h"
 
 #if defined(__ANDROID__)
 #include <android/choreographer.h>
@@ -26,12 +27,11 @@ namespace galaxy::sdl {
 
 namespace {
 
-// Choreographer's frame callbacks on a looper thread of their own: the latest vsync's time (CLOCK_MONOTONIC) and the
-// interval between vsyncs, smoothed. The frame slots are predicted from them on that grid rather than woken by them, so
-// a callback delivered late (its thread not scheduled at once) never delays a frame.
+// Choreographer's frame callbacks on a looper thread of their own: the vsync grid (CLOCK_MONOTONIC). The frame slots are
+// predicted on that grid rather than woken by the callbacks, so a callback delivered late (its thread not scheduled at
+// once) never delays a frame.
 std::mutex g_mutex;
-std::int64_t g_vsync_ns = 0;
-std::int64_t g_interval_ns = 0;
+galaxy::VsyncGrid g_grid;
 std::int64_t g_expected_presentation_ns = 0;
 std::once_flag g_started;
 // The latest frame slot on the vsync grid and the frame period there (display_present_target); 0 while frames
@@ -40,6 +40,11 @@ std::atomic<std::int64_t> g_frame_slot_ns{0};
 std::atomic<std::int64_t> g_frame_period_ns{0};
 // The display's vsync period as the system states it (refresh-rate callbacks); 0 until the first.
 std::atomic<std::int64_t> g_display_period_ns{0};
+// Held (set_display_clock_held): a callback posts no next one. g_posted: a callback is asked for (the looper
+// thread's own; it posts again when let go). g_looper: that thread's looper, to wake it.
+std::atomic<bool> g_held{false};
+bool g_posted = false;
+std::atomic<ALooper*> g_looper{nullptr};
 
 std::int64_t monotonic_ns() noexcept {
     timespec now{};
@@ -68,27 +73,34 @@ struct TimelineApi {
 
 void record_frame(std::int64_t frame_ns, std::int64_t expected) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    const auto stated = g_display_period_ns.load(std::memory_order_relaxed);
-    const std::int64_t delta = frame_ns - g_vsync_ns;
-    if (stated > 0) {
-        // A missed callback is not a refresh-rate change. The platform reports those separately.
-        g_interval_ns = stated;
-    } else if (g_vsync_ns != 0 && delta > 2000000 && delta < 50000000) {
-        const bool changed = g_interval_ns != 0 && std::llabs(delta - g_interval_ns) > g_interval_ns / 8;
-        g_interval_ns = g_interval_ns == 0 || changed ? delta : (g_interval_ns * 7 + delta) / 8;
-    }
-    g_vsync_ns = frame_ns;
+    g_grid.note(frame_ns, g_display_period_ns.load(std::memory_order_relaxed));
     g_expected_presentation_ns = expected;
+}
+
+void on_frame(std::int64_t frame_ns, void* choreographer);
+void on_timeline(const AChoreographerFrameCallbackData* data, void* choreographer);
+
+// The next callback, unless the clock is held (the looper thread only).
+void post_next(AChoreographer* choreographer) {
+    g_posted = !g_held.load(std::memory_order_relaxed);
+    if (!g_posted) {
+        return;
+    }
+    if (g_timeline.post != nullptr) {
+        g_timeline.post(choreographer, on_timeline, choreographer);
+    } else {
+        AChoreographer_postFrameCallback64(choreographer, on_frame, choreographer);
+    }
 }
 
 void on_frame(std::int64_t frame_ns, void* choreographer) {
     record_frame(frame_ns, 0);
-    AChoreographer_postFrameCallback64(static_cast<AChoreographer*>(choreographer), on_frame, choreographer);
+    post_next(static_cast<AChoreographer*>(choreographer));
 }
 
 void on_timeline(const AChoreographerFrameCallbackData* data, void* choreographer) {
     record_frame(g_timeline.frame_time(data), g_timeline.expected(data, g_timeline.preferred(data)));
-    g_timeline.post(static_cast<AChoreographer*>(choreographer), on_timeline, choreographer);
+    post_next(static_cast<AChoreographer*>(choreographer));
 }
 
 void on_refresh_rate(std::int64_t vsync_period_ns, void*) {
@@ -104,59 +116,56 @@ void clock_thread() {
     }
     if (g_timeline.load()) {
         std::fprintf(stderr, "[display] Android preferred presentation timeline enabled\n");
-        g_timeline.post(choreographer, on_timeline, choreographer);
     } else {
-        AChoreographer_postFrameCallback64(choreographer, on_frame, choreographer);
+        g_timeline.post = nullptr;
     }
+    g_looper.store(ALooper_forThread(), std::memory_order_release);
+    post_next(choreographer);
     AChoreographer_registerRefreshRateCallback(choreographer, on_refresh_rate, nullptr);
     for (;;) {
+        // A callback, or a wake from set_display_clock_held: let go with none asked for, it asks again.
         ALooper_pollOnce(-1, nullptr, nullptr, nullptr);
+        if (!g_posted) {
+            post_next(choreographer);
+        }
     }
 }
 
 }  // namespace
 
-bool wait_display_frame(std::int64_t period_ns, std::int64_t& last_ns) noexcept {
+bool wait_display_frame(std::int64_t period_ns, std::int64_t& last_ns, bool in_between) noexcept {
     try {
         std::call_once(g_started, [] { std::thread(clock_thread).detach(); });
     } catch (...) {
         return false;
     }
-    std::int64_t base = 0;
-    std::int64_t interval = 0;
+    galaxy::VsyncGrid grid;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        base = g_vsync_ns;
-        interval = g_interval_ns;
+        grid = g_grid;
     }
-    const std::int64_t now = monotonic_ns();
-    // No vsyncs yet, or none for a quarter second (out of sight): the host's clock.
-    if (base == 0 || interval == 0 || now - base > 250000000) {
+    // The next frame slot on the vsync grid (galaxy/vsync_grid.h), or the host's clock when there is no grid that
+    // keeps the game at its speed.
+    std::int64_t target = 0;
+    std::int64_t frame_period = 0;
+    if (!grid.next_slot(period_ns, last_ns, monotonic_ns(), in_between, target, frame_period)) {
         g_frame_slot_ns.store(0, std::memory_order_relaxed);
         return false;
     }
-    // Only a display whose vsyncs divide the frame period (60, 120, 180 or 240 Hz) keeps the game at its speed; at
-    // 90 Hz, say, the host's own clock runs it.
-    const double vsyncs = static_cast<double>(period_ns) / static_cast<double>(interval);
-    if (std::abs(vsyncs - std::round(vsyncs)) > 0.03 || std::round(vsyncs) < 1.0) {
-        g_frame_slot_ns.store(0, std::memory_order_relaxed);
-        return false;
-    }
-    // The first vsync at least one frame period (less half a vsync) after the last frame slot; from now when the clock
-    // fell behind (a suspended app, a stalled thread), as a display skips the fields it missed.
-    std::int64_t earliest = last_ns + period_ns - interval / 2;
-    if (last_ns == 0 || earliest < now - period_ns) {
-        earliest = now;
-    }
-    const std::int64_t steps = std::max<std::int64_t>((earliest - base + interval - 1) / interval, 0);
-    const std::int64_t target = base + steps * interval;
     const timespec wake{static_cast<time_t>(target / 1000000000), static_cast<long>(target % 1000000000)};
     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wake, nullptr) != 0) {
     }
     last_ns = target;
-    g_frame_period_ns.store(std::llround(vsyncs) * interval, std::memory_order_relaxed);
+    g_frame_period_ns.store(frame_period, std::memory_order_relaxed);
     g_frame_slot_ns.store(target, std::memory_order_release);
     return true;
+}
+
+void set_display_clock_held(bool held) noexcept {
+    g_held.store(held, std::memory_order_relaxed);
+    if (ALooper* const looper = g_looper.load(std::memory_order_acquire); looper != nullptr && !held) {
+        ALooper_wake(looper);
+    }
 }
 
 bool display_grid(std::int64_t& slot_ns, std::int64_t& period_ns, std::int64_t& vsync_ns,
@@ -165,7 +174,7 @@ bool display_grid(std::int64_t& slot_ns, std::int64_t& period_ns, std::int64_t& 
     period_ns = g_frame_period_ns.load(std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        vsync_ns = g_interval_ns;
+        vsync_ns = g_grid.interval_ns;
         if (g_expected_presentation_ns > 0) {
             slot_ns = galaxy::presentation_grid_at(slot_ns, g_expected_presentation_ns, vsync_ns);
         }
@@ -177,8 +186,8 @@ bool display_grid(std::int64_t& slot_ns, std::int64_t& period_ns, std::int64_t& 
 bool vsync_grid(std::int64_t& vsync_ns, std::int64_t& interval_ns) noexcept {
     const std::int64_t stated = g_display_period_ns.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(g_mutex);
-    vsync_ns = g_vsync_ns;
-    interval_ns = stated > 0 ? stated : g_interval_ns;
+    vsync_ns = g_grid.vsync_ns;
+    interval_ns = stated > 0 ? stated : g_grid.interval_ns;
     return vsync_ns != 0 && interval_ns != 0;
 }
 
@@ -187,14 +196,16 @@ double display_refresh_hz() noexcept {
         return 1e9 / static_cast<double>(period);
     }
     std::lock_guard<std::mutex> lock(g_mutex);
-    return g_interval_ns != 0 ? 1e9 / static_cast<double>(g_interval_ns) : 0.0;
+    return g_grid.interval_ns != 0 ? 1e9 / static_cast<double>(g_grid.interval_ns) : 0.0;
 }
 
 #elif !defined(NEBULA_HOST_APPLE)  // Apple's display link: platform/apple/display_clock_apple.mm
 
-bool wait_display_frame(std::int64_t, std::int64_t&) noexcept {
+bool wait_display_frame(std::int64_t, std::int64_t&, bool) noexcept {
     return false;
 }
+
+void set_display_clock_held(bool) noexcept {}
 
 bool display_grid(std::int64_t&, std::int64_t&, std::int64_t&, std::int64_t&) noexcept {
     return false;

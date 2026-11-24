@@ -426,6 +426,16 @@ void MarioActor::calcViewAndEntry() {
         calcFogLighting();
     }
 
+    // A mod's hidden body (player.set_drawn): his attachments hidden each frame (the game shows new ones as they come:
+    // a morph's wings, a taken shell), shown once when the body is drawn again.
+    if ((mModHidden & kModHiddenBody) != 0) {
+        hideBeeFur();
+        mModHidden |= kModHiddenAttached;
+    } else if ((mModHidden & kModHiddenAttached) != 0) {
+        mModHidden &= static_cast< u8 >(~kModHiddenAttached);
+        showBeeFur();
+    }
+
     switch (mCurrModel) {
     case 0:
         swapTexture("EyeLid_v", static_cast< u8 >(mEyeLidFrame));
@@ -517,23 +527,6 @@ void MarioActor::drawMarioModel() const {
     if (!mFlag.mIsHiddenModel) {
         model->mDrawPasses &= ~PlayerModel::Pass_BehindMark;
         if (mMario->isStatusActive(MarioStatus_FpView)) {
-            // With ray tracing on, the body the camera fades or hides still casts: whole, into the tracer's scene
-            // alone (the faded draw below is blended, so no light stops at it).
-            if ((NebulaHost::option(NEBULA_OPTION_RAY_TRACING) & static_cast< u32 >(NEBULA_RAY_TRACING_ON)) != 0) {
-                const u32 passes = model->mDrawPasses;
-                MR::showJoint(model, "HandR0");
-                MR::showJoint(model, "HandL0");
-                MR::showJoint(model, "Face0");
-                model->setDynamicList(mCurrModel == 4 ? nullptr : &mLightTint);  // as the third-person draw below
-                Frame::tracedOnly(true);
-                model->setDrawView(0);
-                model->directDraw();
-                Frame::tracedOnly(false);
-                model->mDrawPasses = passes;
-                MR::hideJoint(model, "HandR0");
-                MR::hideJoint(model, "HandL0");
-                MR::hideJoint(model, "Face0");
-            }
             if (mFpViewHidden) {
                 return;
             }
@@ -589,7 +582,7 @@ void MarioActor::drawMarioModel() const {
 
 bool MarioActor::isAllHidden() const {
     bool hidden = false;
-    if (mHidden || mMorphHidden || mHiddenByDemo || mModHidden) {
+    if (mHidden || mMorphHidden || mHiddenByDemo || (mModHidden & kModHiddenBody) != 0) {
         hidden = true;
     }
 
@@ -609,11 +602,11 @@ static u32 findEyeLidTexture(ModelData* pModelData, u32 textureNum, u32 texNo) {
 void MarioActor::swapTextureInit() {
     ModelData* actorData = MR::getModelData(this);
     const u32 textureCount = actorData->getTextureCount();
-    mSwapTextures = new ResTIMG*[textureCount];
+    mSwapTextures = new const ModelTexture*[textureCount];
     mEyeLidFrame = 0;
 
     for (u32 i = 0; i < textureCount; i++) {
-        mSwapTextures[i] = MR::getResTIMG(this, i);
+        mSwapTextures[i] = MR::getModelTexture(this, i);
     }
 
     mSwapImages = new const void*[12]();
@@ -621,10 +614,10 @@ void MarioActor::swapTextureInit() {
     u32 texNo = findEyeLidTexture(actorData, textureCount, 0);
 
     mEyeLidTexBase = texNo;
-    mSwapImages[0] = mSwapTextures[texNo]->image();
-    mSwapImages[1] = mSwapTextures[texNo + 1]->image();
-    mSwapImages[2] = mSwapTextures[texNo + 2]->image();
-    mSwapImages[3] = mSwapTextures[texNo + 3]->image();
+    mSwapImages[0] = mSwapTextures[texNo]->mImage;
+    mSwapImages[1] = mSwapTextures[texNo + 1]->mImage;
+    mSwapImages[2] = mSwapTextures[texNo + 2]->mImage;
+    mSwapImages[3] = mSwapTextures[texNo + 3]->mImage;
 
     if (mBeeModel != nullptr) {
         ModelData* beeData = MR::getModelData(mBeeModel);
@@ -633,13 +626,13 @@ void MarioActor::swapTextureInit() {
         texNo = findEyeLidTexture(beeData, textureNum, texNo);
 
         for (u32 i = 0; i < textureNum; i++) {
-            mSwapTextures[i] = MR::getResTIMG(mBeeModel, i);
+            mSwapTextures[i] = MR::getModelTexture(mBeeModel, i);
         }
 
-        mSwapImages[4] = mSwapTextures[texNo]->image();
-        mSwapImages[5] = mSwapTextures[texNo + 1]->image();
-        mSwapImages[6] = mSwapTextures[texNo + 2]->image();
-        mSwapImages[7] = mSwapTextures[texNo + 3]->image();
+        mSwapImages[4] = mSwapTextures[texNo]->mImage;
+        mSwapImages[5] = mSwapTextures[texNo + 1]->mImage;
+        mSwapImages[6] = mSwapTextures[texNo + 2]->mImage;
+        mSwapImages[7] = mSwapTextures[texNo + 3]->mImage;
     }
 
     if (mHopperModel != nullptr) {
@@ -649,13 +642,13 @@ void MarioActor::swapTextureInit() {
         texNo = findEyeLidTexture(hopperData, textureNum, texNo);
 
         for (u32 i = 0; i < textureNum; i++) {
-            mSwapTextures[i] = MR::getResTIMG(mHopperModel, i);
+            mSwapTextures[i] = MR::getModelTexture(mHopperModel, i);
         }
 
-        mSwapImages[8] = mSwapTextures[texNo]->image();
-        mSwapImages[9] = mSwapTextures[texNo + 1]->image();
-        mSwapImages[10] = mSwapTextures[texNo + 2]->image();
-        mSwapImages[11] = mSwapTextures[texNo + 3]->image();
+        mSwapImages[8] = mSwapTextures[texNo]->mImage;
+        mSwapImages[9] = mSwapTextures[texNo + 1]->mImage;
+        mSwapImages[10] = mSwapTextures[texNo + 2]->mImage;
+        mSwapImages[11] = mSwapTextures[texNo + 3]->mImage;
     }
 
     initBlink();
@@ -873,7 +866,8 @@ void MarioActor::drawIndirectModel() const {
 }
 
 void MarioActor::drawReflectModel() const {
-    if (isAllHidden()) {
+    // A mod's hidden body still shows in mirrors and water (a first-person camera's player sees himself there).
+    if (mHidden || mMorphHidden || mHiddenByDemo) {
         return;
     }
 

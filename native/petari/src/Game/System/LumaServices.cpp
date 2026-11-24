@@ -15,6 +15,7 @@
 #include "Game/System/LumaDrawNative.hpp"
 #include "Game/System/LumaDrawPost.hpp"
 #include "Game/System/LumaDrawView.hpp"
+#include "Game/System/LumaEvents.hpp"
 #include "Game/System/LumaLoader.hpp"
 #include "Game/System/LumaSave.hpp"
 #include "Game/System/LumaTime.hpp"
@@ -48,6 +49,7 @@ namespace luma {
             // service once that service is defined; none is yet.
             const CatalogRow cCatalog[] = {
                 {"time", 1, 0, nullptr, "services-time"},
+                {"events", 1, 0, nullptr, "services-events"},
                 {"system", 1, 0, nullptr, "services-system"},
                 {"system.clipboard", 1, 0, LUMA_SYSTEM_CLIPBOARD_PERMISSION, "services-system"},
                 {"system.links", 1, 0, LUMA_SYSTEM_LINKS_PERMISSION, "services-system"},
@@ -61,11 +63,11 @@ namespace luma {
                 {"draw", 1, 0, nullptr, "draw"},
                 {"movie", 1, 0, nullptr, "movies"},
                 {"draw.inst", 1, 0, nullptr, "draw"},
-                {"draw.view", 1, 0, nullptr, "draw"},
+                {"draw.view", 1, 1, nullptr, "draw"},
                 {"draw.post", 1, 0, nullptr, "draw"},
                 {"draw.native", 1, 0, LUMA_DRAW_NATIVE_PERMISSION, "draw"},
                 {"anim", 1, 1, nullptr, "animation"},
-                {"player", 1, 0, nullptr, "services-player"},
+                {"player", 1, 1, nullptr, "services-player"},
                 {"coop", 1, 0, nullptr, "services-coop"},
                 {"save", 1, 1, nullptr, "services-save"},
                 {"save.global", 1, 0, nullptr, "services-save"},
@@ -75,7 +77,7 @@ namespace luma {
                 {"net.local", 1, 4, LUMA_NET_LOCAL_PERMISSION, "services-net"},
                 {"net.internet", 1, 4, LUMA_NET_INTERNET_PERMISSION, "services-net"},
                 {"assets", 1, 1, nullptr, "services-assets"},
-                {"input", 1, 3, nullptr, "services-input"},
+                {"input", 1, 4, nullptr, "services-input"},
                 {"input.inject", 1, 0, LUMA_INPUT_INJECT_PERMISSION, "services-input"},
                 {"input.dev", 1, 0, LUMA_INPUT_DEV_PERMISSION, "services-input"},
                 {"audio", 1, 1, nullptr, "services-audio"},
@@ -679,6 +681,7 @@ namespace luma {
             // The module's own services, each once it is defined: time (services/time.md), content.fx (effects),
             // content.model (models).
             (void)provide(luma::time::provider());
+            (void)provide(luma::events::provider());
             (void)provide(luma::content::fx::provider());
             (void)provide(luma::content::model::provider());
             (void)provide(luma::ui::provider());

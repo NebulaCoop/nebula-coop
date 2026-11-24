@@ -101,7 +101,18 @@ DeviceIdentity identify(VkPhysicalDevice physical, bool has_driver_properties) {
 }
 
 DeviceQuirks quirks_for(const DeviceIdentity& id) {
+#if defined(_WIN32)
+    return quirks_for(id, true);
+#else
+    return quirks_for(id, false);
+#endif
+}
+
+DeviceQuirks quirks_for(const DeviceIdentity& id, bool windows) {
     DeviceQuirks quirks;
+    // NVIDIA's own driver on Linux (SteamOS and the Deck are AMD): see DeviceQuirks::no_present_wait. Windows' driver, which the
+    // program has run on since the start of the native work, keeps it.
+    quirks.no_present_wait = id.driver == DriverKind::NvidiaProprietary && !windows;
     const bool qualcomm = id.driver == DriverKind::QualcommProprietary;
     const bool arm = id.driver == DriverKind::ArmProprietary;
     // ANGLE preferDrawClearOverVkCmdClearAttachments: vkCmdClearAttachments races with draws on Qualcomm drivers
@@ -179,7 +190,14 @@ std::string describe(const DeviceQuirks& quirks) {
     add(quirks.clear_by_command, "clear-by-command");
     add(quirks.depth_d24, "depth-d24");
     add(quirks.no_cache_file, "no-cache-file");
+    add(quirks.no_present_wait, "no-present-wait");
     return text.empty() ? "none" : text;
+}
+
+std::uint32_t allocator_api_version(std::uint32_t instance_version, std::uint32_t device_version) noexcept {
+    const std::uint32_t version = instance_version < device_version ? instance_version : device_version;
+    const std::uint32_t minor = VK_API_VERSION_MAJOR(version) > 1u ? 3u : VK_API_VERSION_MINOR(version);
+    return VK_MAKE_API_VERSION(0u, 1u, minor < 3u ? minor : 3u, 0u);
 }
 
 std::string driver_key(const DeviceIdentity& id) {

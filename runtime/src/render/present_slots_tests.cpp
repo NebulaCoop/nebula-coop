@@ -182,9 +182,103 @@ void check_frames(double hz) {
     }
 }
 
+// A queue that keeps the newest picture alone (MAILBOX; Android's async BufferQueue): a picture waits until the first
+// refresh it was ready 2 ms before and its asked-for time has come, and a present replaces the one waiting. Pictures one
+// refresh apart at 120 Hz, each ready up to 60 % of a refresh late. Untimed, nearly every one is shown; held for a slot two
+// refreshes ahead (the least depth at 120 Hz), each is replaced by the next before its slot: the rule presents_timed keeps.
+unsigned shown_by_newest_picture_queue(bool timed) {
+    const std::int64_t vsync = std::llround(1e9 / 120.0);
+    const std::int64_t grid = 1'000'000'000;
+    Random random;
+    struct Waiting {
+        std::int64_t ready, wanted;
+    };
+    bool waiting = false;
+    Waiting picture{};
+    unsigned shown = 0;
+    std::int64_t refresh = grid;
+    for (unsigned i = 0; i < 1200u; ++i) {
+        const std::int64_t ready = grid + static_cast<std::int64_t>(i) * vsync +
+                                   static_cast<std::int64_t>(random.next() * 0.6 * static_cast<double>(vsync));
+        // The refreshes before this present latch what waits.
+        for (; refresh < ready; refresh += vsync) {
+            if (waiting && picture.ready <= refresh - kLatchNs && picture.wanted <= refresh) {
+                ++shown;
+                waiting = false;
+            }
+        }
+        picture = {ready, timed ? ready + 2 * vsync : 0};
+        waiting = true;  // in place of any picture still waiting
+    }
+    return shown;
+}
+
+void check_swap_queues() {
+    static_assert(presents_timed(SwapQueue::EveryPicture) && !presents_timed(SwapQueue::NewestPicture) &&
+                  !presents_timed(SwapQueue::Tearing));
+    static_assert(pictures_on_refreshes(SwapQueue::EveryPicture) && pictures_on_refreshes(SwapQueue::NewestPicture) &&
+                  !pictures_on_refreshes(SwapQueue::Tearing));
+    const unsigned untimed = shown_by_newest_picture_queue(false);
+    const unsigned timed = shown_by_newest_picture_queue(true);
+    if (untimed < 1080u || timed * 2u >= untimed) {
+        std::printf("FAIL: a newest-picture queue showed %u of 1200 untimed and %u timed\n", untimed, timed);
+        ++failures;
+    }
+}
+
 }  // namespace
 
+// After a second of late presents, calm ones: the time until the depth comes down again is the same at every rate (it
+// was counted in presents: at 240 Hz a quarter of the time at 60).
+std::int64_t ms_to_step_down(double hz) {
+    const std::int64_t vsync = std::llround(1e9 / hz);
+    const std::int64_t grid = 1'000'000'000;
+    PresentSlots slots;
+    std::int64_t raised = 0;
+    for (std::int64_t moment = grid;; moment += vsync) {
+        PresentClock clock;
+        clock.by_moment = true;
+        clock.moment = moment;
+        clock.grid = grid;
+        clock.vsync = vsync;
+        clock.step = vsync;
+        const std::int64_t slot = slots.place(clock);
+        const std::int64_t depth = slots.depth_used();
+        raised = std::max(raised, depth);
+        if (slots.take_skip()) {
+            moment += vsync;  // a picture fewer: the depth comes down a vsync
+        }
+        if (moment - grid < 1'500'000'000) {
+            // Late by a vsync (missed by less than two frame periods: the device's pace).
+            slots.observe(slot, slot + vsync, slot + vsync, 0, vsync, vsync / 2);
+        } else {
+            slots.observe(slot, slot, slot, 50'000'000, vsync, vsync / 2);
+            if (depth < raised) {
+                return (moment - grid) / 1'000'000;
+            }
+        }
+        if (moment - grid > 120'000'000'000) {
+            return -1;
+        }
+    }
+}
+
+void check_windows_by_time() {
+    const std::int64_t at60 = ms_to_step_down(60.0);
+    for (double hz : {120.0, 144.0, 240.0, 360.0}) {
+        const std::int64_t ms = ms_to_step_down(hz);
+        // One window (a second) of difference at most: windows start at different presents.
+        if (at60 < 0 || ms < 0 || std::llabs(ms - at60) > 1100) {
+            std::printf("FAIL: the depth comes down after %lld ms at %.0f Hz, %lld ms at 60 Hz\n",
+                        static_cast<long long>(ms), hz, static_cast<long long>(at60));
+            ++failures;
+        }
+    }
+}
+
 int main() {
+    check_swap_queues();
+    check_windows_by_time();
     // Refresh rates that are and are not multiples of 60, fractional ones, and pictures one and two vsyncs apart.
     const double rates[] = {59.94, 60.0, 72.0, 75.0, 90.0, 100.0, 119.88, 120.0, 143.98, 144.0, 165.0, 170.0, 180.0,
                             185.0, 200.0, 240.0, 360.0};

@@ -8,6 +8,10 @@
 //   clock title                    a test with no stage: frame 0 is not before the title screen ("boot: title screen")
 //   device pad                     the controls are a controller's (NEBULA_EXT_CONTROLS_PAD); its motor is the fact
 //                                  input.motor (0 to 255) at each change
+//   time real|steps                the host's own clocks, or fixed steps (the default)
+//   memory <seconds>               the fact process.memory {"seconds", "bytes"} at frame 0 and each <seconds> (1 to
+//                                  3600) of wall time after it: the process's own memory (process_memory.h), what a
+//                                  soak run (tools/gate/soak.py) watches for growth
 //   setup <item ...>               given to the game half in order ("setup save.spin 1", ..., "setup done")
 //   step <at|after> <action ...>   a step; `at` a frame of the test clock, or `after` with the cond lines below it
 //   cond fact <key> <op> <within|-> <JSON>   the step above waits for this fact (its newest value) to hold
@@ -23,11 +27,13 @@
 // harness.end {"frame"} at the end step; harness.stop {"verdict", "reason"} when setup or a step failed. The runner
 // decides every verdict from these files.
 #include "harness.h"
+#include "process_memory.h"
 
 #include <luma_harness.h>
 
 #include <cctype>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -366,7 +372,8 @@ std::string json_string(std::string_view text) {
 
 // --- The plan ------------------------------------------------------------------------------------------------------
 
-enum class Action { Hold, Stick, Shake, Pointer, Key, Text, Settings, Picture, Wait, End, Game, TakeOut, Reload, Forget };
+enum class Action { Hold, Stick, Shake, Pointer, Key, Text, Settings, Picture, Wait, End, Game, TakeOut, Reload, Forget,
+                    Window, LoseDevice };
 
 struct Cond {
     bool log = false;
@@ -387,6 +394,7 @@ struct Step {
     std::uint32_t buttons = 0u;
     float x = 0.0f, y = 0.0f;
     std::uint32_t key = 0u;
+    std::uint32_t width = 0u, height = 0u;  // window's
     std::int64_t frames = 0;
     std::vector<Cond> conds;
     std::int64_t timeout = 600;
@@ -420,6 +428,10 @@ struct State {
     bool bare = false;
     bool clock_title = false;     // frame 0 waits for the title screen
     bool as_pad = false;          // `device pad`
+    bool real_time = false;       // `time real`: the host's own clocks, not fixed steps
+    double memory_every = 0.0;    // `memory <seconds>`; 0: no process.memory facts
+    std::optional<std::chrono::steady_clock::time_point> memory_start;  // frame 0's wall time
+    double memory_next = 0.0;     // the seconds after frame 0 of the next process.memory fact
     bool title_seen = false;
     bool setup_finished = false;  // "setup done" answered
     std::string out;
@@ -448,6 +460,9 @@ struct State {
     bool finished = false;
     // The end step's frame while a picture it follows is still to be taken by a present (picture_path ends the run).
     std::optional<std::int64_t> end_at;
+    // The last picture was taken: the run ends at the next present, once that picture's present is done (the window
+    // closing never cuts off the present that takes it).
+    bool end_after_present = false;
 } g;
 
 std::recursive_mutex g_lock;
@@ -477,6 +492,10 @@ void write_fact(const std::string& key, const std::string& json, std::optional<s
 void set_base(std::uint64_t game_frame) {
     g.base = game_frame;
     write_fact("harness.clock", "{\"game_frame\":" + std::to_string(game_frame) + "}", 0);
+    // In the log too, among the game's own lines: what the log says after it is the test's (tools/gate/pace.py).
+    if (g.log != nullptr) {
+        g.log("harness: frame 0 is game frame " + std::to_string(game_frame));
+    }
 }
 
 // Ends the run: the end step, or a failure the runner names.
@@ -598,6 +617,22 @@ bool read_line(const std::string& line, std::string& why) {
         g.as_pad = true;
         return true;
     }
+    if (w[0] == "time") {
+        if (w.size() != 2u || (w[1] != "real" && w[1] != "steps")) {
+            why = "a time line is `time real` or `time steps`";
+            return false;
+        }
+        g.real_time = w[1] == "real";
+        return true;
+    }
+    if (w[0] == "memory") {
+        if (w.size() != 2u || !number(w[1], value) || !(value >= 1.0 && value <= 3600.0)) {
+            why = "a memory line is `memory <seconds>`, 1 to 3600";
+            return false;
+        }
+        g.memory_every = value;
+        return true;
+    }
     if (w[0] == "bare") {
         g.bare = w.size() == 2u && w[1] == "1";
         return true;
@@ -705,6 +740,20 @@ bool read_line(const std::string& line, std::string& why) {
             // The Mods page's FORGET of a removed mod (services/mods.md 8), as the player chooses it.
             s.action = Action::Forget;
             s.mod = args[0];
+        } else if (a == "window" && args.size() == 2u) {
+            // The window's inside resized to width x height pixels, as the player drags it.
+            double height = 0.0;
+            if (!number(args[0], value) || !number(args[1], height) || value < 1.0 || height < 1.0 || value > 65535.0 ||
+                height > 65535.0 || value != std::floor(value) || height != std::floor(height)) {
+                why = "step " + std::to_string(s.number) + ": window takes a width and a height in pixels, 1 to 65535";
+                return false;
+            }
+            s.action = Action::Window;
+            s.width = static_cast<std::uint32_t>(value);
+            s.height = static_cast<std::uint32_t>(height);
+        } else if (a == "lose_device" && args.empty()) {
+            // The graphics device lost at the renderer's next frame, as a driver reset loses it.
+            s.action = Action::LoseDevice;
         } else {
             why = "step " + std::to_string(s.number) + ": not an action this host half knows: " + a;
             return false;
@@ -870,9 +919,25 @@ void run_step(Step& s, std::int64_t now) {
     // The plan's pointer is in 0..1 of the screen; the host's in -1..1.
     case Action::Pointer: g.inputs.push_back({now, s.frames, 0u, false, false, true, s.x * 2.0f - 1.0f, s.y * 2.0f - 1.0f}); break;
     case Action::Key:
-        if (g.host != nullptr && g.host->menu_key != nullptr) {
-            g.host->menu_key(g.host->host, s.key);
+        if (g.host == nullptr || g.host->menu_key == nullptr) {
+            finish("harness-error", "step " + std::to_string(s.number) + ": this host takes no menu keys");
+            return;
         }
+        g.host->menu_key(g.host->host, s.key);
+        break;
+    case Action::Window:
+        if (g.host == nullptr || g.host->resize_window == nullptr) {
+            finish("harness-error", "step " + std::to_string(s.number) + ": this host cannot size its window");
+            return;
+        }
+        g.host->resize_window(g.host->host, s.width, s.height);
+        break;
+    case Action::LoseDevice:
+        if (g.host == nullptr || g.host->lose_gpu_device == nullptr) {
+            finish("harness-error", "step " + std::to_string(s.number) + ": this host cannot lose its graphics device");
+            return;
+        }
+        g.host->lose_gpu_device(g.host->host);
         break;
     case Action::Text:
         if (g.host == nullptr || g.host->size < offsetof(NebulaHostForExtension, type_text) + sizeof(g.host->type_text) ||
@@ -1130,6 +1195,30 @@ bool on() {
     return g.on;
 }
 
+// `memory <seconds>`: the process's own memory at frame 0 and each given seconds of wall time after it (a run that
+// falls behind writes one fact, not the ones it missed). bytes is null where the system does not say.
+static void sample_memory() {
+    if (g.memory_every <= 0.0) {
+        return;
+    }
+    const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+    if (!g.memory_start) {
+        g.memory_start = now;
+    }
+    const double seconds = std::chrono::duration<double>(now - *g.memory_start).count();
+    if (seconds < g.memory_next) {
+        return;
+    }
+    while (g.memory_next <= seconds) {
+        g.memory_next += g.memory_every;
+    }
+    const std::optional<std::uint64_t> bytes = process_private_bytes();
+    char at[32];
+    std::snprintf(at, sizeof(at), "%.3f", seconds);
+    write_fact("process.memory", std::string("{\"seconds\":") + at + ",\"bytes\":" +
+                                     (bytes ? std::to_string(*bytes) : std::string("null")) + "}");
+}
+
 void frame(std::uint64_t game_frames) {
     std::lock_guard<std::recursive_mutex> hold(g_lock);
     if (!g.on || g.finished) {
@@ -1143,6 +1232,7 @@ void frame(std::uint64_t game_frames) {
         return;
     }
     const std::int64_t now = test_frame();
+    sample_memory();
     bool before_done = true;      // every step written before this one has run
     bool game_waiting = false;    // a game step written before this one is not answered yet
     for (Step& s : g.steps) {
@@ -1245,6 +1335,12 @@ void controls(std::uint64_t game_frames, NebulaExtensionControls* out) {
 
 const char* picture_path(std::uint64_t game_frame, std::uint32_t kind) {
     std::lock_guard<std::recursive_mutex> hold(g_lock);
+    if (g.end_after_present) {
+        // The render thread presents in order: the last picture's present has ended.
+        g.end_after_present = false;
+        finish({}, {});
+        return nullptr;
+    }
     if (!g.on || g.pictures.empty() || kind == NEBULA_EXT_PICTURE_GENERATED || game_frame < g.pictures.front().game_frame) {
         return nullptr;
     }
@@ -1254,7 +1350,7 @@ const char* picture_path(std::uint64_t game_frame, std::uint32_t kind) {
     write_fact("picture." + p.name, "{\"game_frame\":" + std::to_string(game_frame) + ",\"asked_at\":" +
                                         std::to_string(static_cast<long long>(p.game_frame) - static_cast<long long>(g.base.value_or(0u))) + "}");
     if (g.end_at && g.pictures.empty()) {
-        finish({}, {});
+        g.end_after_present = true;
     }
     return g.picture_file.c_str();
 }
@@ -1352,6 +1448,10 @@ const void* service(const char* name, std::uint32_t major, std::uint32_t minor) 
 
 bool as_pad() {
     return g.on && g.as_pad;
+}
+
+bool real_time() {
+    return g.on && g.real_time;
 }
 
 void motor(std::uint8_t strength) {

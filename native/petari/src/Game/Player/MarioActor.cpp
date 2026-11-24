@@ -1470,9 +1470,8 @@ void MarioActor::decLife(u16 amt) {
         return;
     }
 
-    if (!mExtra && NebulaMods::fire(NEBULA_MOD_EVENT_PLAYER_DAMAGE, 1) == 0) {
-        mLifeDamageQueue = 0;
-        return;
+    if (!mExtra) {
+        NebulaMods::fire(NEBULA_MOD_EVENT_PLAYER_DAMAGE, 1);
     }
 
     if (mHealth) {
@@ -2001,7 +2000,7 @@ void MarioActor::calcAnim() {
         MR::updateModelDiffMaterials(this);
     }
 
-    if (MR::isHiddenModel(this) && mHidden == 0 && !mModHidden) {
+    if (MR::isHiddenModel(this) && mHidden == 0) {
         MR::showModel(this);
     }
 

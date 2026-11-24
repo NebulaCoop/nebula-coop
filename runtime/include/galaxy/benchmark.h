@@ -55,11 +55,13 @@ inline void stop() noexcept {
 }
 
 // The renderers, as one frame's pass timestamps are read back (render thread): each pass's milliseconds in that frame,
-// `names[i]` static text. Set only while a window measures.
-inline std::atomic<void (*)(const char* const* names, const double* ms, std::size_t count)> g_gpu_frame_hook{nullptr};
-inline void note_gpu_frame(const char* const* names, const double* ms, std::size_t count) noexcept {
-    if (void (*hook)(const char* const*, const double*, std::size_t) = g_gpu_frame_hook.load(std::memory_order_acquire)) {
-        hook(names, ms, count);
+// `names[i]` static text; `game_frame`: the frame drew the scene for a game step, not a picture between steps
+// (interpolation) or one without the scene. Set only while a window measures.
+using GpuFrameHook = void (*)(const char* const* names, const double* ms, std::size_t count, bool game_frame);
+inline std::atomic<GpuFrameHook> g_gpu_frame_hook{nullptr};
+inline void note_gpu_frame(const char* const* names, const double* ms, std::size_t count, bool game_frame) noexcept {
+    if (const GpuFrameHook hook = g_gpu_frame_hook.load(std::memory_order_acquire)) {
+        hook(names, ms, count, game_frame);
     }
 }
 
@@ -151,12 +153,12 @@ struct Options {
 };
 
 // The run as the game's run panel shows it (live_state).
-enum class Part : unsigned { Yours, Standard, Probe, Again };
+enum class Part : unsigned { Yours, Probe, Again };
 struct LiveState {
     std::uint32_t step = 0u, steps = 0u;  // the step running, from 1, of the run's steps
-    Part part = Part::Yours;              // what the step measures: your settings, the standard settings, one
-                                          // optional pass, or the first stage again (the device warmed up)
-    bool showing = false;                 // the step's stage is on screen: its opening, warming up or measured
+    Part part = Part::Yours;              // what the step measures: your settings, one optional pass, or the
+                                          // first stage again (the device warmed up)
+    bool showing = false;                 // the step's stage is on screen: under the cover until play, warming up or measured
                                           // (not loading)
     std::uint32_t cover = 0u;             // black over the game, under the panel, 0 to 255: settings change under it
     std::uint32_t fps_tenths = 0u;        // pictures shown a second over the last half second, in tenths; 0 not known
@@ -170,6 +172,8 @@ struct LiveState {
 // The main thread before the game module attaches (--benchmark 1), or any thread while the game runs (Options::here).
 // False while a run is going.
 bool start(const Options& options);
+// The renderer this build runs: d3d12, d3d11, vulkan or metal, as a result's "backend" names it.
+[[nodiscard]] const char* running_backend() noexcept;
 // The game, each frame no reset of its own runs (NEBULA_HOME_MENU_RESET): true once for each reset a run in the running
 // game asks for (its start and its end).
 [[nodiscard]] bool take_reset() noexcept;

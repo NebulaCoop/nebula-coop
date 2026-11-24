@@ -1,8 +1,12 @@
 // RendererD3D12: device and swap chain, scene targets and copies, presentation.
+#include "galaxy/render/present_clock.h"
 #include "galaxy/render/utility_shaders.h"
+#include "dxgi_pacing.h"
+#include "galaxy/host_extension.h"
 #include "galaxy/benchmark.h"
 #include "galaxy/launch_args.h"
 #include "galaxy/render/renderer_d3d12.h"
+#include "render/core/utility_pipeline_d3d12.h"
 #include "galaxy/render/program_table.h"
 #include <nebula_frame_list.h>
 #include "galaxy/render/host_window_win32.h"
@@ -18,9 +22,7 @@
 #include "barriers_d3d12.h"
 #include "galaxy/render/render_config.h"
 #include "galaxy/render/renderer_choice.h"
-#include "galaxy/render/rt/rt_backend.h"
-#include "galaxy/render/rt/rt_shaders.h"
-#include "galaxy/render/rt_caps.h"
+#include "galaxy/render/device_memory.h"
 #include "galaxy/render/streamline_bridge.h"
 #include "galaxy/render/xess_library.h"
 #include "galaxy/render/texture_store.h"
@@ -52,12 +54,15 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -107,12 +112,6 @@ static bool s_listing_live_objects = false;
 #if GALAXY_WITH_STREAMLINE_BRIDGE != 0 && !defined(GALAXY_STREAMLINE_BRIDGE_READY)
 #error "GALAXY_WITH_STREAMLINE_BRIDGE requires the real Streamline bridge to define GALAXY_STREAMLINE_BRIDGE_READY"
 #endif
-
-// The tier as major x 10 + minor (D3D12_RAYTRACING_TIER_1_1 is 11), 0 without ray tracing. The tiers are
-// enumerators, so later ones read the same way without naming them.
-unsigned raytracing_tier_code(D3D12_RAYTRACING_TIER tier) {
-    return tier >= D3D12_RAYTRACING_TIER_1_0 ? static_cast<unsigned>(tier) : 0u;
-}
 
 void copy_adapter_description(
     const DXGI_ADAPTER_DESC1& desc,
@@ -395,6 +394,11 @@ bool DescriptorRing::initialize(
     frame_ready_ = false;
     bound_list_ = nullptr;
     bound_heap_ = nullptr;
+    views_.clear();
+    view_heap_.Reset();
+    free_view_slots_.clear();
+    view_capacity_ = view_next_ = 0u;
+    view_frame_ = views_made_ = 0u;
     // The null block: typed 2D null views, what any slot a pass leaves unwritten holds.
     D3D12_SHADER_RESOURCE_VIEW_DESC null_view{};
     null_view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -478,6 +482,161 @@ void DescriptorRing::begin_frame(unsigned frame_slot) {
     cursor_     = frame_base_;
     frame_ready_ = true;
     bound_list_ = nullptr;
+    // The views no frame wrote in the last frames_in_flight + 1 give back their slot and their resource.
+    ++view_frame_;
+    for (auto it = views_.begin(); it != views_.end();) {
+        if (view_frame_ - it->second.written_frame > frames_in_flight_ + 1u) {
+            free_view_slots_.push_back(it->second.slot);
+            it = views_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+namespace {
+// The view cache's first size; it doubles when full.
+constexpr unsigned kFirstViewCache = 64u;
+
+template <typename T>
+void put(std::array<unsigned char, 48>& bytes, std::size_t at, const T& value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    std::memcpy(bytes.data() + at, &value, sizeof(value));
+}
+
+// Copies the union member `member` (fields of four bytes only, so no padding) to the key's place for it.
+template <typename T>
+void put_member(std::array<unsigned char, 48>& bytes, const T& member) {
+    static_assert(sizeof(T) % 4u == 0u && sizeof(T) <= 32u);
+    put(bytes, 16u, member);
+}
+}  // namespace
+
+std::size_t DescriptorRing::ViewKeyHash::operator()(const ViewKey& key) const noexcept {
+    // FNV-1a.
+    std::uint64_t hash = 14695981039346656037ull;
+    const auto mix = [&hash](const unsigned char* p, std::size_t n) {
+        for (std::size_t i = 0; i < n; ++i) {
+            hash = (hash ^ p[i]) * 1099511628211ull;
+        }
+    };
+    const std::uintptr_t resource = reinterpret_cast<std::uintptr_t>(key.resource);
+    mix(reinterpret_cast<const unsigned char*>(&resource), sizeof(resource));
+    mix(reinterpret_cast<const unsigned char*>(&key.kind), sizeof(key.kind));
+    mix(key.desc.data(), key.desc.size());
+    return static_cast<std::size_t>(hash);
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE DescriptorRing::view_slot(const ViewKey& key, ID3D12Resource* resource, bool& made) {
+    auto found = views_.find(key);
+    made = found == views_.end();
+    if (made) {
+        unsigned slot = 0u;
+        if (!free_view_slots_.empty()) {
+            slot = free_view_slots_.back();
+            free_view_slots_.pop_back();
+        } else {
+            if (view_next_ == view_capacity_) {
+                // A larger CPU-only heap with the views so far: their slots stay.
+                const unsigned capacity = view_capacity_ == 0u ? kFirstViewCache : view_capacity_ * 2u;
+                D3D12_DESCRIPTOR_HEAP_DESC dhd{};
+                dhd.Type = type_;
+                dhd.NumDescriptors = capacity;
+                dhd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+                Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
+                if (FAILED(device_->CreateDescriptorHeap(&dhd, IID_PPV_ARGS(&heap)))) {
+                    return {};
+                }
+                if (view_capacity_ > 0u) {
+                    device_->CopyDescriptorsSimple(view_capacity_, heap->GetCPUDescriptorHandleForHeapStart(),
+                                                   view_heap_->GetCPUDescriptorHandleForHeapStart(), type_);
+                }
+                view_heap_ = std::move(heap);
+                view_capacity_ = capacity;
+            }
+            slot = view_next_++;
+        }
+        found = views_.emplace(key, KeptView{Microsoft::WRL::ComPtr<ID3D12Resource>(resource), slot, 0u}).first;
+        ++views_made_;
+    }
+    found->second.written_frame = view_frame_;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = view_heap_->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += static_cast<SIZE_T>(found->second.slot) * increment_;
+    return cpu;
+}
+
+void DescriptorRing::write_view(D3D12_CPU_DESCRIPTOR_HANDLE at, ID3D12Resource* resource,
+                                const D3D12_SHADER_RESOURCE_VIEW_DESC& desc) {
+    ViewKey key;
+    key.resource = resource;
+    key.kind = 0u;
+    put(key.desc, 0u, desc.Format);
+    put(key.desc, 4u, desc.ViewDimension);
+    put(key.desc, 8u, desc.Shader4ComponentMapping);
+    bool known = true;
+    switch (desc.ViewDimension) {
+    case D3D12_SRV_DIMENSION_BUFFER:
+        put(key.desc, 16u, desc.Buffer.FirstElement);
+        put(key.desc, 24u, desc.Buffer.NumElements);
+        put(key.desc, 28u, desc.Buffer.StructureByteStride);
+        put(key.desc, 32u, desc.Buffer.Flags);
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE1D: put_member(key.desc, desc.Texture1D); break;
+    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: put_member(key.desc, desc.Texture1DArray); break;
+    case D3D12_SRV_DIMENSION_TEXTURE2D: put_member(key.desc, desc.Texture2D); break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: put_member(key.desc, desc.Texture2DArray); break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMS: put_member(key.desc, desc.Texture2DMS); break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: put_member(key.desc, desc.Texture2DMSArray); break;
+    case D3D12_SRV_DIMENSION_TEXTURE3D: put_member(key.desc, desc.Texture3D); break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBE: put_member(key.desc, desc.TextureCube); break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: put_member(key.desc, desc.TextureCubeArray); break;
+    default: known = false; break;  // made in place each time
+    }
+    bool made = false;
+    const D3D12_CPU_DESCRIPTOR_HANDLE kept = known ? view_slot(key, resource, made) : D3D12_CPU_DESCRIPTOR_HANDLE{};
+    if (kept.ptr == 0u) {
+        device_->CreateShaderResourceView(resource, &desc, at);
+        return;
+    }
+    if (made) {
+        device_->CreateShaderResourceView(resource, &desc, kept);
+    }
+    device_->CopyDescriptorsSimple(1u, at, kept, type_);
+}
+
+void DescriptorRing::write_view(D3D12_CPU_DESCRIPTOR_HANDLE at, ID3D12Resource* resource,
+                                const D3D12_UNORDERED_ACCESS_VIEW_DESC& desc) {
+    ViewKey key;
+    key.resource = resource;
+    key.kind = 1u;
+    put(key.desc, 0u, desc.Format);
+    put(key.desc, 4u, desc.ViewDimension);
+    bool known = true;
+    switch (desc.ViewDimension) {
+    case D3D12_UAV_DIMENSION_BUFFER:
+        put(key.desc, 16u, desc.Buffer.FirstElement);
+        put(key.desc, 24u, desc.Buffer.NumElements);
+        put(key.desc, 28u, desc.Buffer.StructureByteStride);
+        put(key.desc, 32u, desc.Buffer.CounterOffsetInBytes);
+        put(key.desc, 40u, desc.Buffer.Flags);
+        break;
+    case D3D12_UAV_DIMENSION_TEXTURE1D: put_member(key.desc, desc.Texture1D); break;
+    case D3D12_UAV_DIMENSION_TEXTURE1DARRAY: put_member(key.desc, desc.Texture1DArray); break;
+    case D3D12_UAV_DIMENSION_TEXTURE2D: put_member(key.desc, desc.Texture2D); break;
+    case D3D12_UAV_DIMENSION_TEXTURE2DARRAY: put_member(key.desc, desc.Texture2DArray); break;
+    case D3D12_UAV_DIMENSION_TEXTURE3D: put_member(key.desc, desc.Texture3D); break;
+    default: known = false; break;  // made in place each time
+    }
+    bool made = false;
+    const D3D12_CPU_DESCRIPTOR_HANDLE kept = known ? view_slot(key, resource, made) : D3D12_CPU_DESCRIPTOR_HANDLE{};
+    if (kept.ptr == 0u) {
+        device_->CreateUnorderedAccessView(resource, nullptr, &desc, at);
+        return;
+    }
+    if (made) {
+        device_->CreateUnorderedAccessView(resource, nullptr, &desc, kept);
+    }
+    device_->CopyDescriptorsSimple(1u, at, kept, type_);
 }
 
 DescriptorRing::Persistent DescriptorRing::allocate_persistent(unsigned count) {
@@ -985,7 +1144,7 @@ bool RendererD3D12::create_scene_msaa(SceneMsaa& msaa, ID3D12Resource* color, ID
 // the descriptor ring).
 void RendererD3D12::write_msaa_depth_view(SceneMsaa& msaa) {
     if (!msaa.depth_srv) {
-        msaa.depth_srv = allocate_persistent_descriptors(1u);
+        msaa.depth_srv = fresh_persistent(1u);
     }
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
     view.Format = kSceneDepthSrvFormat;
@@ -1045,26 +1204,7 @@ void RendererD3D12::record_scene_resolve(ID3D12GraphicsCommandList* list, bool c
         uses.undo();
     }
     if (depth) {
-        if (!depth_resolve_pso_) {
-            const UtilityShaderBytes vs = utility_shader(UtilityShader::BlitVs);
-            const UtilityShaderBytes ps = utility_shader(UtilityShader::DepthResolvePs);
-            D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
-            pd.pRootSignature = s_blit_root_sig.Get();
-            pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
-            pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
-            pd.SampleMask = UINT_MAX;
-            pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-            pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-            pd.DepthStencilState.DepthEnable = TRUE;
-            pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-            pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-            pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-            pd.NumRenderTargets = 0;
-            pd.DSVFormat = kSceneDepthFormat;
-            pd.SampleDesc.Count = 1;
-            d3d_check(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&depth_resolve_pso_)),
-                      "depth resolve PSO");
-        }
+        make_depth_resolve_pipeline();
         if (!msaa.depth_srv) {
             write_msaa_depth_view(msaa);
         }
@@ -1105,9 +1245,6 @@ HRESULT create_draw_root_signature(
     tex_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     tex_range.NumDescriptors = UINT_MAX;
     tex_range.RegisterSpace = 1u;
-    // The same table as Texture3D (t0 space2, from the heap's start too): the light volume (program.hlsli traced_air).
-    D3D12_DESCRIPTOR_RANGE tex_ranges[2] = {tex_range, tex_range};
-    tex_ranges[1].RegisterSpace = 2u;
     D3D12_DESCRIPTOR_RANGE samp_range{};
     samp_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
     samp_range.NumDescriptors = UINT_MAX;
@@ -1124,8 +1261,8 @@ HRESULT create_draw_root_signature(
     params[3].Constants.Num32BitValues = gpu::kDrawRootWords;
     params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[4].DescriptorTable.NumDescriptorRanges = 2;
-    params[4].DescriptorTable.pDescriptorRanges = tex_ranges;
+    params[4].DescriptorTable.NumDescriptorRanges = 1;
+    params[4].DescriptorTable.pDescriptorRanges = &tex_range;
     params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[5].DescriptorTable.NumDescriptorRanges = 1;
@@ -1265,6 +1402,10 @@ void RendererD3D12::reset_sampler_frame() {
     if (config_key == sampler_config_ && !full) {
         return;
     }
+    if (full) {
+        std::fprintf(stderr, "[samplers] %u of %u slots made: the heap starts again once the GPU is past them\n",
+                     sampler_slots_.used(), kSamplerHeapSlots);
+    }
     if (sampler_config_ != ~0u) {
         wait_for_gpu();
     }
@@ -1283,8 +1424,7 @@ void RendererD3D12::bind_draw_textures(gpu::Address lists) {
     encoder_.set_texture_arrays(srv_ring_.texture_gpu_start(), sampler_heap_->GetGPUDescriptorHandleForHeapStart(), lists);
 }
 
-// The capture pipelines (root signature: SceneConversionShaderConstants, one SRV table, a static linear clamp sampler)
-// and the screen probes' compute pipeline (constants, the depth's SRV table, the pixels' SRV, the values' UAV).
+// The capture pipelines (root signature: SceneConversionShaderConstants, one SRV table, a static linear clamp sampler).
 bool RendererD3D12::create_conversion_pipeline() {
     {
         D3D12_DESCRIPTOR_RANGE range{};
@@ -1347,49 +1487,15 @@ bool RendererD3D12::create_conversion_pipeline() {
         pd.NumRenderTargets      = 1;
         pd.RTVFormats[0]         = kSceneColorFormat;
         pd.SampleDesc.Count      = 1;
-        d3d_check(device_->CreateGraphicsPipelineState(
-            &pd, IID_PPV_ARGS(&conv_pipeline_)), "CreateConvPSO");
+        d3d_check(core::utility_pipeline(device_.Get(), pd, &conv_pipeline_), "CreateConvPSO");
         pd.RTVFormats[0] = kSceneHdrColorFormat;
-        d3d_check(device_->CreateGraphicsPipelineState(
-            &pd, IID_PPV_ARGS(&conv_pipeline_wide_)), "CreateConvPSO wide");
+        d3d_check(core::utility_pipeline(device_.Get(), pd, &conv_pipeline_wide_), "CreateConvPSO wide");
         const UtilityShaderBytes filter = utility_shader(UtilityShader::DisplayFilterPs);
         pd.PS = {filter->GetBufferPointer(), filter->GetBufferSize()};
         pd.RTVFormats[0] = kSceneColorFormat;
-        d3d_check(device_->CreateGraphicsPipelineState(
-            &pd, IID_PPV_ARGS(&display_filter_pipeline_)), "CreateDisplayFilterPSO");
+        d3d_check(core::utility_pipeline(device_.Get(), pd, &display_filter_pipeline_), "CreateDisplayFilterPSO");
         pd.RTVFormats[0] = kSceneHdrColorFormat;
-        d3d_check(device_->CreateGraphicsPipelineState(
-            &pd, IID_PPV_ARGS(&display_filter_pipeline_wide_)), "CreateDisplayFilterPSO wide");
-    }
-
-    // Screen probes: b0 the count, t0 the depth (a table), t1 the pixels and u0 the values (root views).
-    {
-        D3D12_DESCRIPTOR_RANGE range{};
-        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        range.NumDescriptors = 1;
-        D3D12_ROOT_PARAMETER params[4]{};
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants.Num32BitValues = 1;
-        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[1].DescriptorTable.NumDescriptorRanges = 1;
-        params[1].DescriptorTable.pDescriptorRanges = &range;
-        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        params[2].Descriptor.ShaderRegister = 1;
-        params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-        params[3].Descriptor.ShaderRegister = 0;
-        D3D12_ROOT_SIGNATURE_DESC rsd{};
-        rsd.NumParameters = 4;
-        rsd.pParameters = params;
-        ComPtr<ID3DBlob> blob, err;
-        d3d_check(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err), "SerializeProbeRS");
-        d3d_check(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
-                                               IID_PPV_ARGS(&probe_root_signature_)),
-                  "CreateProbeRS");
-        const UtilityShaderBytes cs = utility_shader(UtilityShader::ScreenProbeCs);
-        D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
-        cd.pRootSignature = probe_root_signature_.Get();
-        cd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
-        d3d_check(device_->CreateComputePipelineState(&cd, IID_PPV_ARGS(&probe_pipeline_)), "CreateProbePSO");
+        d3d_check(core::utility_pipeline(device_.Get(), pd, &display_filter_pipeline_wide_), "CreateDisplayFilterPSO wide");
     }
 
     // CPU-only RTV slot reused after each conversion bind is recorded.
@@ -1417,6 +1523,43 @@ void RendererD3D12::refresh_scene_conversion_source_views() {
     }
     release_conv_table(conv_scene_table_);
     write_scene_conversion_views(*conv_scene_source_table_);
+}
+
+void RendererD3D12::retire_persistent(std::optional<DescriptorRing::Persistent>& table, unsigned count) {
+    if (table) {
+        retired_persistent_.push_back({*table, count, frame_index_ + kFramesInFlight + 1u});
+        table.reset();
+    }
+}
+
+DescriptorRing::Persistent RendererD3D12::fresh_persistent(unsigned count) {
+    for (auto it = retired_persistent_.begin(); it != retired_persistent_.end(); ++it) {
+        if (it->count == count && frame_index_ >= it->free_from) {
+            const DescriptorRing::Persistent table = it->table;
+            retired_persistent_.erase(it);
+            return table;
+        }
+    }
+    return allocate_persistent_descriptors(count);
+}
+
+void RendererD3D12::retire_scene_set(SceneTargetSet& set, bool own_depth_view) {
+    // std::addressof: ComPtr's operator& releases what it holds.
+    for (ComPtr<ID3D12Resource>* resource : {std::addressof(set.color), std::addressof(set.depth),
+                                             std::addressof(set.msaa.color), std::addressof(set.msaa.depth)}) {
+        if (*resource) {
+            retired_targets_[frame_slot_].push_back(std::move(*resource));
+        }
+        resource->Reset();
+    }
+    retire_persistent(set.conv_table, 2u);
+    set.conv_color_index = set.conv_depth_index = DescriptorRing::kNoPersistent;
+    if (own_depth_view) {
+        retire_persistent(set.msaa.depth_srv, 1u);
+    } else {
+        set.msaa.depth_srv.reset();
+    }
+    release_conv_table(set.conv_ring);
 }
 
 // A set's views left a ring entry: free once the frames that could read it are done.
@@ -1493,14 +1636,15 @@ void RendererD3D12::begin_scene_rectangle() {
         dynamic_resolution_.set_walk(dynamic_resolution_offered() &&
                                      ::galaxy::diagnosing(::galaxy::kDiagnoseResolutionSteps));
         scene_rectangle_ = dynamic_resolution_.update(cfg.dynamic_resolution && dynamic_resolution_offered(), scene_extent_,
-                                                      dynamic_resolution_floor(), native_scene_gpu_ema_ms_,
+                                                      dynamic_resolution_floor(), frame_gpu_.scene_ema_ms(),
                                                       resolution_budget_ms(rate, display_refresh_hz_));
         if (::galaxy::diagnosing(::galaxy::kDiagnoseResolutionSteps | ::galaxy::kDiagnosePresentStats) &&
             dynamic_resolution_.sixteenths() != before) {
-            std::fprintf(stderr, "[dynres] frame %llu: %u/16, %ux%u of %ux%u (floor %u/16)\n",
+            // With the samplers made so far, so what a step adds shows.
+            std::fprintf(stderr, "[dynres] frame %llu: %u/16, %ux%u of %ux%u (floor %u/16), samplers %zu\n",
                          static_cast<unsigned long long>(frame_index_), dynamic_resolution_.sixteenths(),
                          scene_rectangle_.width, scene_rectangle_.height, scene_extent_.width, scene_extent_.height,
-                         dynamic_resolution_.lowest_sixteenths());
+                         dynamic_resolution_.lowest_sixteenths(), static_cast<std::size_t>(sampler_slots_.used()));
         }
     }
     if (!(scene_rectangle_.width <= frame_extent_.width && scene_rectangle_.height <= frame_extent_.height) ||
@@ -1518,24 +1662,7 @@ bool RendererD3D12::publish_scene_depth_copy(std::uint64_t key, TextureStore& te
     if (extent.width == 0u || extent.height == 0u || conv_scene_depth_index_ == ~0u) {
         return false;
     }
-    if (!depth_copy_pso_) {
-        const UtilityShaderBytes vs = utility_shader(UtilityShader::BlitVs);
-        const UtilityShaderBytes ps = utility_shader(UtilityShader::DepthCopyPs);
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
-        pd.pRootSignature = s_conv_root_sig.Get();
-        pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
-        pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
-        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-        pd.SampleMask = UINT_MAX;
-        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-        pd.RasterizerState.DepthClipEnable = TRUE;
-        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        pd.NumRenderTargets = 1;
-        pd.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
-        pd.SampleDesc.Count = 1;
-        d3d_check(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&depth_copy_pso_)), "depth copy PSO");
-    }
+    make_depth_copy_pipeline();
     // Its own key beside the colour captures' (channels in bits 48 and up, at most 4): freed with the texture's id.
     const std::uint64_t dest_key = static_cast<std::uint64_t>(static_cast<std::uint32_t>(key)) | (0xFFull << 48);
     FramePassTarget& dest = frame_pass_targets_[dest_key];
@@ -1741,10 +1868,6 @@ gpu::TextureRef RendererD3D12::swap_scene_color(gpu::TextureRef fresh) {
     return picture;
 }
 
-// The share of wall time the GPU may spend on the frame's command lists before Match Output steps down: the rest is
-// headroom for heavier frames than the window's average, the compositor and other processes.
-constexpr double kGpuBudgetBusy = 0.80;
-
 void RendererD3D12::sync_post_process_settings() {
     if (!post_process_.ready()) {
         return;
@@ -1803,9 +1926,6 @@ void RendererD3D12::apply_window_size() {
     for (auto& retired : retired_targets_) {
         retired.clear();
     }
-    readback_buf_.Reset();
-    readback_pending_ = false;
-    readback_fence_value_ = 0u;
     const FrameMap previous = scene_extent_;
     if (format_changes) {
         // The post chain first: a format it cannot take leaves everything as it was.
@@ -1845,20 +1965,16 @@ void RendererD3D12::apply_window_size() {
 }
 
 bool RendererD3D12::scene_fits_memory(const FrameMap& map) const {
-    if (!adapter3_) {
-        return true;
-    }
-    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
-    if (FAILED(adapter3_->QueryVideoMemoryInfo(
-            0u, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)) || info.Budget == 0u) {
+    std::uint64_t usage = 0u;
+    std::uint64_t budget = 0u;
+    if (!memory_.read_now(usage, budget)) {
         return true;
     }
     // Size-dependent residency: scene colour (4 bytes per pixel) and depth (kSceneDepthBytes) and at most the display
     // picture pair plus one full-picture copy (12 bytes per pixel).
     const auto bytes = [](const FrameMap& m) { return (4.0 + kSceneDepthBytes + 12.0) * m.width * m.height; };
     const double needed = bytes(map) - bytes(scene_extent_);
-    return static_cast<double>(info.CurrentUsage) + needed <=
-           0.9 * static_cast<double>(info.Budget);
+    return static_cast<double>(usage) + needed <= 0.9 * static_cast<double>(budget);
 }
 
 void RendererD3D12::probe_occlusion() {
@@ -1873,42 +1989,7 @@ void RendererD3D12::probe_occlusion() {
 }
 
 bool RendererD3D12::video_memory(std::uint64_t& usage, std::uint64_t& budget) const noexcept {
-    usage = budget = 0u;
-    if (!adapter3_) {
-        return false;
-    }
-    // The use moves with every allocation and is read at most every 100 ms; the budget moves when the OS says (the event), and
-    // that is read at once.
-    const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 std::chrono::steady_clock::now().time_since_epoch()).count();
-    const bool moved = budget_event_ != nullptr && WaitForSingleObject(budget_event_, 0u) == WAIT_OBJECT_0;
-    if (moved || memory_budget_ == 0u || now - memory_read_ms_ >= 100) {
-        DXGI_QUERY_VIDEO_MEMORY_INFO info{};
-        if (FAILED(adapter3_->QueryVideoMemoryInfo(0u, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)) || info.Budget == 0u) {
-            return false;
-        }
-        if (moved) {
-            std::cout << "[vram] the OS moved the budget from " << (memory_budget_ >> 20u) << " MB to " << (info.Budget >> 20u)
-                      << " MB\n";
-        }
-        memory_read_ms_ = now;
-        memory_usage_ = info.CurrentUsage;
-        memory_budget_ = info.Budget;
-    }
-    usage = memory_usage_;
-    budget = memory_budget_;
-    return true;
-}
-
-void RendererD3D12::release_budget_notification() noexcept {
-    if (adapter3_ && budget_cookie_ != 0u) {
-        adapter3_->UnregisterVideoMemoryBudgetChangeNotification(budget_cookie_);
-    }
-    budget_cookie_ = 0u;
-    if (budget_event_ != nullptr) {
-        CloseHandle(budget_event_);
-        budget_event_ = nullptr;
-    }
+    return memory_.read(usage, budget);
 }
 
 bool RendererD3D12::create_clear_pipeline() {
@@ -1936,8 +2017,7 @@ bool RendererD3D12::create_clear_pipeline() {
     return clear_pipeline(true) != nullptr && clear_pipeline(false) != nullptr;
 }
 
-ID3D12PipelineState* RendererD3D12::clear_pipeline(bool color) {
-    const std::uint8_t variant = scene_variant();
+ID3D12PipelineState* RendererD3D12::clear_pipeline(bool color, std::uint8_t variant) {
     ComPtr<ID3D12PipelineState>& pipeline =
         (color ? clear_rgb_pipelines_ : clear_alpha_pipelines_)[variant];
     if (pipeline) {
@@ -1960,9 +2040,81 @@ ID3D12PipelineState* RendererD3D12::clear_pipeline(bool color) {
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = color
         ? D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE
         : D3D12_COLOR_WRITE_ENABLE_ALPHA;
-    d3d_check(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pipeline)),
+    d3d_check(core::utility_pipeline(device_.Get(), pd, &pipeline),
               color ? "CreateClearRgbPSO" : "CreateClearAlphaPSO");
     return pipeline.Get();
+}
+
+void RendererD3D12::make_depth_resolve_pipeline() {
+    if (depth_resolve_pso_) {
+        return;
+    }
+    const UtilityShaderBytes vs = utility_shader(UtilityShader::BlitVs);
+    const UtilityShaderBytes ps = utility_shader(UtilityShader::DepthResolvePs);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = s_blit_root_sig.Get();
+    pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+    pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.DepthStencilState.DepthEnable = TRUE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 0;
+    pd.DSVFormat = kSceneDepthFormat;
+    pd.SampleDesc.Count = 1;
+    d3d_check(core::utility_pipeline(device_.Get(), pd, &depth_resolve_pso_),
+              "depth resolve PSO");
+}
+
+void RendererD3D12::make_depth_copy_pipeline() {
+    if (depth_copy_pso_) {
+        return;
+    }
+    const UtilityShaderBytes vs = utility_shader(UtilityShader::BlitVs);
+    const UtilityShaderBytes ps = utility_shader(UtilityShader::DepthCopyPs);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = s_conv_root_sig.Get();
+    pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+    pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
+    pd.SampleDesc.Count = 1;
+    d3d_check(core::utility_pipeline(device_.Get(), pd, &depth_copy_pso_), "depth copy PSO");
+}
+
+void RendererD3D12::prepare_utility_pipelines() {
+    const unsigned max_samples = msaa_max_samples();
+    // The texture targets' format at a sample count the scene's formats take may still be one the device does not
+    // draw: asked, not assumed (CreateGraphicsPipelineState would fail and the clear's check throws).
+    const auto target_takes = [&](unsigned samples) {
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{kTargetColorFormat, samples};
+        return samples == 1u ||
+               (SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels, sizeof(levels))) &&
+                levels.NumQualityLevels > 0u);
+    };
+    for (std::uint8_t variant = 0u; variant < kSceneVariantCount; ++variant) {
+        const unsigned samples = 1u << (variant & kSceneVariantSamplesMask);
+        if (samples > max_samples || ((variant & kSceneVariantTarget) != 0u && !target_takes(samples))) {
+            continue;
+        }
+        (void)clear_pipeline(true, variant);
+        (void)clear_pipeline(false, variant);
+    }
+    for (unsigned samples = 1u; samples <= max_samples; samples *= 2u) {
+        (void)layer_pipeline(false, samples);
+        (void)layer_pipeline(true, samples);
+    }
+    make_depth_resolve_pipeline();
+    make_depth_copy_pipeline();
 }
 
 bool RendererD3D12::initialize(int window_width, int window_height, const FrameMap& frame) {
@@ -1995,11 +2147,13 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
     const auto configuration = [&](REFCLSID which, REFIID riid, void** out) {
         return agility ? agility->GetConfigurationInterface(which, riid, out) : D3D12GetDebugInterface(riid, out);
     };
+    bool debug_layer_on = false;
     try {
         if (d3d_debug_level >= 1) {
             ComPtr<ID3D12Debug> d;
             if (SUCCEEDED(configuration(kClsidDebug, IID_PPV_ARGS(&d)))) {
                 d->EnableDebugLayer();
+                debug_layer_on = true;
                 if (d3d_debug_level >= 2) {
                     ComPtr<ID3D12Debug1> d1;
                     if (SUCCEEDED(d.As(&d1))) {
@@ -2008,6 +2162,9 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
                 }
             }
         }
+        // Whether the debug layer is really on (the validate lane of the gate reads this line, as it reads Direct3D 11's and
+        // Vulkan's: it is off when the layer is not installed).
+        std::cout << "[gpu] d3d12 debug-layer=" << (debug_layer_on ? 1 : 0) << '\n';
         // --diagnostics device-faults: the removal data dump_device_removal prints (auto-breadcrumbs, page-fault
         // allocations, breadcrumb contexts), asked for before the device exists. Otherwise the system's choice.
         if (::galaxy::diagnosing(::galaxy::kDiagnoseDeviceFaults)) {
@@ -2035,7 +2192,8 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
         // Every hardware adapter is tried in preference order and the first that
         // creates a D3D12 device is kept (entry zero may not). Legacy enumeration
         // covers systems without IDXGIFactory6 or a failed preferred enumeration.
-        // A software adapter is never selected.
+        // A software adapter is selected only by the start check (launch_args.h start_check), on a computer without a
+        // graphics card, or by --software-device, which takes no other (renderer_choice.h adapter_allowed).
         ComPtr<IDXGIAdapter1> adapter;
         DXGI_ADAPTER_DESC1 adapter_desc{};
         std::string refused;  // the last adapter passed over for what the renderer needs, and why
@@ -2043,7 +2201,8 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
             DXGI_ADAPTER_DESC1 description{};
             if (candidate == nullptr ||
                 FAILED(candidate->GetDesc1(&description)) ||
-                (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0u ||
+                !adapter_allowed((description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0u, ::galaxy::launch_args().software_device,
+                                 ::galaxy::launch_args().start_check != 0u) ||
                 (same_card_only_ && (description.AdapterLuid.LowPart != card_.LowPart ||
                                      description.AdapterLuid.HighPart != card_.HighPart))) {
                 return false;
@@ -2124,6 +2283,10 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
             }
             record_gpu_choices(std::move(choices));
         }
+        // --software-device: no card is used, so no card's DLSS starts.
+        if (::galaxy::launch_args().software_device) {
+            expect_rtx = false;
+        }
         const bool frame_generation = get_render_config().frame_generation != 0u;
         std::thread streamline_start;
         if (expect_rtx) {
@@ -2183,6 +2346,12 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
             streamline_start.join();
         }
         if (!adapter || !device_) {
+            if (::galaxy::launch_args().software_device) {
+                // Said at the start, and no other renderer is tried in its place.
+                const std::string missing = software_device_missing_line(RendererKind::kD3D12);
+                std::cout << missing << '\n';
+                throw std::runtime_error(missing.substr(std::string("[gpu] ").size()));
+            }
             if (!same_card_only_) note_no_device();
             throw std::runtime_error(refused.empty() ? std::string("No hardware D3D12 adapter supports feature level 11_0")
                                                      : "No hardware D3D12 adapter can run the renderer (" + refused + ")");
@@ -2198,16 +2367,7 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
         host_window::rtx_adapter.store(adapter_desc.VendorId == 0x10DEu &&
                                        std::wcsstr(adapter_desc.Description, L"RTX") != nullptr,
                                        std::memory_order_relaxed);
-        (void)adapter.As(&adapter3_);
-        release_budget_notification();
-        if (adapter3_) {
-            budget_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            if (budget_event_ != nullptr &&
-                FAILED(adapter3_->RegisterVideoMemoryBudgetChangeNotificationEvent(budget_event_, &budget_cookie_))) {
-                budget_cookie_ = 0u;
-                release_budget_notification();
-            }
-        }
+        memory_.attach(adapter.Get());
         {
             const std::string narrow = narrow_utf8(adapter_desc.Description);
             const bool is_software =
@@ -2301,48 +2461,16 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
             }
             std::cerr << "[d3d12] barriers: " << (BarrierPath::enhanced() ? "enhanced" : "legacy") << '\n';
         }
-        ComPtr<ID3D12Device5> device5;
-        const bool dxr_device5_supported = SUCCEEDED(device_.As(&device5));
-        D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5{};
-        // --diagnostics rt-absent: taken as a device without ray tracing.
-        const bool rt_absent = ::galaxy::diagnosing(::galaxy::kDiagnoseRtAbsent);
-        const bool dxr_runtime_supported =
-            !rt_absent && dxr_device5_supported &&
-            SUCCEEDED(device_->CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS5,
-                &options5,
-                sizeof(options5))) &&
-            options5.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
         {
-            // What the tracer needs of the device (rt_caps.h): inline ray queries (DXR 1.1 with the shader model its
-            // shaders are compiled for, 6.5) and every texture in one table (resource binding tier 3).
-            D3D12_FEATURE_DATA_SHADER_MODEL shader_model{D3D_SHADER_MODEL_6_5};
-            D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
-            RtCaps rt{};
-            rt.acceleration_structures = dxr_runtime_supported;
-            rt.ray_queries = dxr_runtime_supported && options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1 &&
-                             SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shader_model,
-                                                                    sizeof(shader_model))) &&
-                             shader_model.HighestShaderModel >= D3D_SHADER_MODEL_6_5;
-            rt.bindless = SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) &&
-                          options.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_3;
-            rt.micromaps = !rt_absent && static_cast<int>(options5.RaytracingTier) >= 12;  // D3D12_RAYTRACING_TIER_1_2
+            // The GPU shares the system's memory (D3D12's own answer: UMA).
             D3D12_FEATURE_DATA_ARCHITECTURE1 architecture{};
-            rt.unified_memory = SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE1, &architecture, sizeof(architecture))) &&
-                                architecture.UMA != FALSE;
-            rt.shaders = rt_shaders_present();
-            rt.enabled = true;  // Direct3D 12 enables nothing per device
-            set_rt_caps(rt);
-            log_rt_caps("d3d12", rt, get_render_config().ray_tracing_enabled);
-            if (get_render_config().ray_tracing_enabled && rt_capable(rt)) {
-                (void)rt::shaders_load(device_.Get());
-            }
-            const bool offered = kRayTracingRowOffered && rt_capable(rt);
-            host_window::ray_tracing_offered.store(offered, std::memory_order_relaxed);
+            set_device_unified_memory(
+                SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE1, &architecture, sizeof(architecture))) &&
+                architecture.UMA != FALSE);
             std::array<char, 128> description{};
             copy_adapter_description(adapter_desc, description);
             record_render_adapter(description.data(), adapter_desc.VendorId, adapter_desc.DeviceId,
-                                  adapter_desc.SubSysId, offered);
+                                  adapter_desc.SubSysId);
             record_render_driver(dxgi_driver_version(adapter.Get()));
         }
         RenderFeatureCaps caps{};
@@ -2358,9 +2486,6 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
         caps.adapter_luid_high =
             static_cast<std::uint32_t>(adapter_desc.AdapterLuid.HighPart);
         copy_adapter_description(adapter_desc, caps.adapter_description);
-        caps.dxr_device5_supported = dxr_device5_supported;
-        caps.dxr_raytracing_tier =
-            rt_absent ? 0u : raytracing_tier_code(options5.RaytracingTier);
         const bool dlss_ready = streamline::active() &&
                                 streamline::attach_device(device_.Get(), adapter_desc.AdapterLuid);
         boot_step("streamline device");
@@ -2370,7 +2495,7 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
             msaa_max_samples() > 1u,
             true,
             true,
-            msaa_max_samples() > 1u ? "scene target targets multisampled; off with DLSS, FSR 3 or ray tracing"
+            msaa_max_samples() > 1u ? "scene target targets multisampled; off with DLSS or FSR 3"
                                     : "the GPU has no multisampled scene target formats");
         caps.taa = make_render_feature_status(
             false,
@@ -2378,14 +2503,6 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
             false,
             false,
             "motion vectors, jitter, and history resources are not built");
-        caps.dxr = make_render_feature_status(
-            true,
-            dxr_runtime_supported,
-            host_window::ray_tracing_offered.load(std::memory_order_relaxed),
-            host_window::ray_tracing_offered.load(std::memory_order_relaxed),
-            host_window::ray_tracing_offered.load(std::memory_order_relaxed) ? "ray tracing (GRAPHICS: RAY TRACING)"
-            : rt_refusal(rt_caps()) != nullptr                                ? rt_refusal(rt_caps())
-                                                                              : "ray tracing is not offered yet");
         caps.streamline = make_render_feature_status(
             caps.streamline_bridge_built,
             streamline::active(),
@@ -2558,12 +2675,15 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
             pd.NumRenderTargets      = 1;
             pd.RTVFormats[0]         = kBackbufferFormat;
             pd.SampleDesc.Count      = 1;
-            d3d_check(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&blit_pipeline_)), "CreateBlitPSO");
+            d3d_check(core::utility_pipeline(device_.Get(), pd, &blit_pipeline_), "CreateBlitPSO");
         }
 
         frame_pass_heap_.initialize(device_.Get());
         boot_step("targets, root signature, blit");
 
+        // The passes' pipelines for every sample count, each pass on a thread of its own beside the rest of the start
+        // (P-052); a future's destructor waits for its thread on every way out of initialize.
+        std::vector<std::future<void>> preparing;
         // Presentation post-processing (SMAA, FSR 1, RCAS, box resample).
         {
             const RenderConfig cfg = get_render_config();
@@ -2598,6 +2718,14 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
             if (!game_bloom_.initialize(device_.Get())) {
                 std::cerr << "[bloom] unavailable: the game's own chain\n";
             }
+            const unsigned max_samples = msaa_max_samples();
+            const auto prepare = [max_samples](auto& pass) {
+                return std::async(std::launch::async, [&pass, max_samples] { pass.prepare_pipelines(max_samples); });
+            };
+            if (post_process_.ready()) preparing.push_back(prepare(post_process_));
+            if (ambient_occlusion_.ready()) preparing.push_back(prepare(ambient_occlusion_));
+            if (camera_pass_.ready()) preparing.push_back(prepare(camera_pass_));
+            if (game_bloom_.ready()) preparing.push_back(prepare(game_bloom_));
         }
         boot_step("post-process and ambient occlusion");
 
@@ -2646,6 +2774,17 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
         // Conversion sources occupy the descriptor ring's immutable prefix.
         if (!create_conversion_pipeline()) return false;
         if (!create_clear_pipeline()) return false;
+        prepare_utility_pipelines();
+        for (std::future<void>& prepared : preparing) {
+            prepared.get();
+        }
+        {
+            const core::UtilityPipelineCounts counts = core::utility_pipeline_counts();
+            utility_pipelines_seen_ = counts.loaded + counts.made;
+            std::cerr << "[pipelines] the renderer's own: " << counts.loaded << " loaded from the driver cache, " << counts.made
+                      << " made\n";
+        }
+        boot_step("pass pipelines");
 
         // Upload-ring buffers, logged next to the [gpu] adapter line.
         std::cerr << "[gpu-rings]"
@@ -2777,38 +2916,31 @@ std::uint32_t RendererD3D12::sampler_slot(const SamplerKey& key) {
     return allocation.index;
 }
 
-void RendererD3D12::write_texture_list(const std::uint32_t* pairs, std::uint32_t count, gpu::Address& lists,
-                                       std::uint32_t& first) {
-    TextureListBuffer& buffer = texture_lists_[frame_slot_];
-    if (buffer.resource == nullptr || texture_lists_used_ + count > buffer.capacity) {
-        if (buffer.resource != nullptr) {
-            retired_texture_lists_.push_back({std::move(buffer.resource), next_fence_value_ + 1u});
-        }
-        const std::uint32_t capacity = std::max(4096u, 2u * std::max(buffer.capacity, count));
-        D3D12_HEAP_PROPERTIES heap{};
-        heap.Type = D3D12_HEAP_TYPE_UPLOAD;
-        D3D12_RESOURCE_DESC desc{};
-        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        desc.Width = UINT64{capacity} * 8u;
-        desc.Height = 1u;
-        desc.DepthOrArraySize = 1u;
-        desc.MipLevels = 1u;
-        desc.SampleDesc.Count = 1u;
-        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        d3d_check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
-                                                   nullptr, IID_PPV_ARGS(&buffer.resource)),
-                  "create texture lists");
-        const D3D12_RANGE none{0u, 0u};
-        void* mapped = nullptr;
-        d3d_check(buffer.resource->Map(0u, &none, &mapped), "map texture lists");
-        buffer.mapped = static_cast<std::uint32_t*>(mapped);
-        buffer.capacity = capacity;
-        texture_lists_used_ = 0u;
+bool RendererD3D12::make_texture_list_chunk(std::uint32_t pairs, std::uint32_t*& mapped, gpu::Address& address) {
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = UINT64{pairs} * 8u;
+    desc.Height = 1u;
+    desc.DepthOrArraySize = 1u;
+    desc.MipLevels = 1u;
+    desc.SampleDesc.Count = 1u;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                IID_PPV_ARGS(&resource)))) {
+        return false;
     }
-    std::memcpy(buffer.mapped + std::size_t{texture_lists_used_} * 2u, pairs, std::size_t{count} * 8u);
-    lists = buffer.resource->GetGPUVirtualAddress();
-    first = texture_lists_used_;
-    texture_lists_used_ += count;
+    const D3D12_RANGE none{0u, 0u};
+    void* at = nullptr;
+    if (FAILED(resource->Map(0u, &none, &at))) {
+        return false;
+    }
+    mapped = static_cast<std::uint32_t*>(at);
+    address = resource->GetGPUVirtualAddress();
+    texture_list_chunks_.push_back(std::move(resource));
+    return true;
 }
 
 void RendererD3D12::free_target(std::uint32_t id, TextureStore& textures) {
@@ -2891,9 +3023,6 @@ void RendererD3D12::log_video_memory(const VideoMemoryOutside& outside) {
             }
         }
     }
-    for (const RetiredBuffer& retired : retired_texture_lists_) {
-        retired_buffers += allocation_bytes(retired.resource.Get());
-    }
     std::uint64_t ring_local = 0u;
     std::uint64_t ring_host = 0u;
     std::uint64_t chunk_local = 0u;
@@ -2942,7 +3071,7 @@ void RendererD3D12::list_live_objects(Kept& kept) {
 RendererD3D12::Kept RendererD3D12::take_apart_lost_device() {
     keep_window_ = true;
     device_gone_ = true;
-    readback_pending_ = backbuffer_readback_pending_ = selected_display_readback_pending_ = false;
+    captures_.clear();  // their copies went with the device
     try {
         shutdown();
     } catch (const std::exception& error) {
@@ -2954,7 +3083,7 @@ RendererD3D12::Kept RendererD3D12::take_apart_lost_device() {
 }
 
 void RendererD3D12::shutdown() {
-    native_scene_gpu_ema_ms_ = 0.0;
+    frame_gpu_.reset_scene_ema();
     frame_scene_drawn_.fill(false);
     if (fsr_swap_chain_ && swap_chain_) {
         wait_for_gpu();
@@ -2988,17 +3117,9 @@ void RendererD3D12::shutdown() {
     }
     // A diagnostic copy can be the last submitted list: its data goes to the
     // background PPM writers before any D3D resource is released.
-    retain_shutdown_failure("scene target diagnostic readback", [&] {
-        debug_log_readback();
-    });
-    retain_shutdown_failure("backbuffer diagnostic readback", [&] {
+    retain_shutdown_failure("diagnostic captures", [&] {
         debug_log_backbuffer_readback();
-    });
-    retain_shutdown_failure("selected display picture diagnostic readback", [&] {
-        debug_log_selected_display_readback();
-    });
-    retain_shutdown_failure("diagnostic writer drain", [&] {
-        reap_debug_capture_writers(true);
+        wait_picture_files();
     });
     // Streamline shuts down before the swap chain and device it wraps go.
     retain_shutdown_failure("Streamline", [&] {
@@ -3007,7 +3128,7 @@ void RendererD3D12::shutdown() {
         streamline::shutdown();
     });
     if (fence_event_) { CloseHandle(fence_event_); fence_event_ = nullptr; }
-    release_budget_notification();
+    memory_.release();
     host_window::pending_resize_extent.store(0u, std::memory_order_relaxed);
     s_blit_root_sig.Reset();
     set_mod_post_compiler(nullptr, false);
@@ -3035,6 +3156,7 @@ void RendererD3D12::shutdown() {
     conv_scene_color_index_ = conv_scene_depth_index_ = DescriptorRing::kNoPersistent;
     conv_scene_source_table_.reset();
     conv_scene_tables_.clear();
+    retired_persistent_.clear();
     conv_scene_table_ = ~std::size_t{0};
     for (SceneTargetSet* set : {&alt_scene_, &target_scene_, &fg_hudless_scene_target_, &hdr_scene_scene_, &layer2d_set_}) {
         set->conv_ring = ~std::size_t{0};
@@ -3050,9 +3172,6 @@ void RendererD3D12::shutdown() {
     for (auto& entry : target_slots_) {
         entry.second.set.conv_ring = ~std::size_t{0};
     }
-    probe_pipeline_.Reset();
-    probe_root_signature_.Reset();
-    probe_slots_ = {};
     s_clear_root_sig.Reset();
     clear_rgb_pipelines_ = {};
     clear_alpha_pipelines_ = {};
@@ -3062,12 +3181,6 @@ void RendererD3D12::shutdown() {
     timestamp_readback_.Reset();
     timestamp_pending_.fill(false);
     timestamp_frequency_ = 0;
-    readback_buf_.Reset();
-    readback_pending_ = false;
-    readback_fence_value_ = 0;
-    next_scene_capture_path_.clear();
-    readback_capture_path_.clear();
-    backbuffer_readback_buf_.Reset();
     hdr_capture_target_.Reset();
     hdr_capture_rtv_heap_.Reset();
     hdr_active_ = false;
@@ -3076,19 +3189,7 @@ void RendererD3D12::shutdown() {
     display_read_ = false;
     display_reading_ = OutputHdr{};
     set_display_hdr(DisplayHdr{});
-    backbuffer_readback_pending_ = false;
-    backbuffer_readback_fence_value_ = 0;
-    backbuffer_readback_width_ = backbuffer_readback_height_ =
-        backbuffer_readback_row_pitch_ = 0;
-    next_backbuffer_capture_path_.clear();
-    backbuffer_readback_capture_path_.clear();
-    selected_display_readback_buf_.Reset();
-    selected_display_readback_source_.Reset();
-    selected_display_readback_pending_ = false;
-    selected_display_readback_fence_ = 0;
-    selected_display_readback_width_ = selected_display_readback_height_ =
-        selected_display_readback_pitch_ = 0;
-    selected_display_readback_path_.clear();
+    captures_.clear();
     if (frame_pass_requests_ != 0u) {
         std::cerr << "[frame-pass-work] requests=" << frame_pass_requests_
                   << " passes=" << frame_passes_drawn_ << '\n';
@@ -3104,10 +3205,7 @@ void RendererD3D12::shutdown() {
     for (auto& b : backbuffers_) b.Reset();
     rtv_heap_.Reset(); dsv_heap_.Reset(); sampler_heap_.Reset(); root_signature_.Reset();
     sampler_slots_.reset();
-    for (TextureListBuffer& lists : texture_lists_) {
-        lists = TextureListBuffer{};
-    }
-    retired_texture_lists_.clear();
+    texture_list_chunks_.clear();
     retired_heaps_.clear();
     mirrored_backend_ = nullptr;
     mirrored_store_ = nullptr;
@@ -3383,9 +3481,7 @@ void RendererD3D12::invalidate_draw_bindings() {
 }
 
 void RendererD3D12::set_render_targets(ID3D12GraphicsCommandList* list, unsigned aux) const {
-    if (aux == kAuxPrepass) {
-        list->OMSetRenderTargets(1, &item_rtv_, FALSE, &scene_dsv_);
-    } else if (aux == 3u) {
+    if (aux == 3u) {
         const D3D12_CPU_DESCRIPTOR_HANDLE targets[4]{scene_rtv_, reactive_rtv_, layer_color_rtv_, layer_trans_rtv_};
         list->OMSetRenderTargets(4, targets, FALSE, &scene_dsv_);
     } else if (aux != 0u) {
@@ -3532,19 +3628,8 @@ gpu::Address RendererD3D12::zero_stream(std::uint32_t bytes) {
     return zero_stream_.gpu;
 }
 
-namespace {
-constexpr const char* kPassTimeNames[] = {"scene", "resolve", "frame read", "display copy", "bloom", "scene aa", "scene ao",
-                                          "upscale", "ray tracing", "present", "camera"};
-}  // namespace
-
 std::size_t RendererD3D12::gpu_pass_times(GpuPassTime* out, std::size_t capacity) const noexcept {
-    std::size_t count = 0u;
-    for (std::size_t pass = 0u; pass < std::size(kPassTimeNames) && count < capacity; ++pass) {
-        if (const float ms = pass_ema_ms_[pass].load(std::memory_order_relaxed); ms > 0.0f) {
-            out[count++] = {kPassTimeNames[pass], ms};
-        }
-    }
-    return count;
+    return pass_times_.page_times(out, capacity);
 }
 
 // The pass timestamps' query heap and readback, made when the settings page asks for them (the diagnostics make theirs at start).
@@ -3584,11 +3669,11 @@ void RendererD3D12::gpu_pass(GpuPass pass) {
     current_pass_ = pass;
     // The pass by name for PIX and RenderDoc.
     if (pass_list_open_ && pass != GpuPass::Count) {
-        const char* const name = kPassTimeNames[static_cast<std::size_t>(pass)];
+        const char* const name = kGpuPassPageNames[static_cast<std::size_t>(pass)];
         command_list_->SetMarker(1u, name, static_cast<UINT>(std::strlen(name) + 1u));
     }
     unsigned& marks = pass_mark_count_[frame_slot_];
-    if (!pass_timing_on_ || !pass_query_heap_ || !pass_list_open_ || marks + 1u >= kGpuPassSlots) {
+    if (!pass_times_.timed() || !pass_query_heap_ || !pass_list_open_ || marks + 1u >= kGpuPassSlots) {
         return;
     }
     command_list_->EndQuery(pass_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_slot_ * kGpuPassSlots + marks);
@@ -3604,10 +3689,19 @@ void RendererD3D12::lose_device() {
 
 void RendererD3D12::begin_frame() {
     scene_drawn_ = false;
+    {
+        // The passes' pipelines are made at the start (P-052): one made since (a settings change) is named here.
+        const core::UtilityPipelineCounts counts = core::utility_pipeline_counts();
+        if (const std::uint64_t now = counts.loaded + counts.made; now != utility_pipelines_seen_) {
+            std::cerr << "[pipelines] the renderer's own after the start: " << now - utility_pipelines_seen_
+                      << " more by frame " << frame_index_ << "\n";
+            utility_pipelines_seen_ = now;
+        }
+    }
     // Display and size changes apply here, between command-list recordings.
     // They wait for the GPU themselves, so they come before any per-slot state
     // below is touched.
-    host_window::poll_render_config_file();
+    host_window::watch_render_config_file();
     reconcile_display_state();
     apply_pending_resize();
     if (const bool fsr = fsr_generation_wanted(); fsr != fsr_swap_chain_ && !streamline_frame_open_) {
@@ -3630,29 +3724,32 @@ void RendererD3D12::begin_frame() {
     apply_dynamic_resolution();
     sync_post_process_settings();
     {
-        if (temporal_interp_suspended_ && temporal_interp_key() != temporal_interp_key_) {
-            // The settings changed: decided again.
-            temporal_interp_suspended_ = false;
+        // A hold of the temporal upscaler on generated frames: decided again when its settings changed, tried again
+        // when its wait passed (the governor then measures generated frames again, not by the cost that held it).
+        if (temporal_interp_hold_.lift_at_frame_start([this] { return temporal_interp_key() != temporal_interp_key_; },
+                                                      galaxy::qpc_to_ns(galaxy::qpc_now()))) {
+            frame_gpu_.reset_generated_ema();
+            std::cerr << "[interp] temporal upscaling of generated frames tried again\n";
         }
         // A ring whose frames took over half their budget (or spilled) grows before the next frame; one whose last 30 seconds
         // (and 600 frames) stayed under a quarter of it gives half of its memory back on a frame without the scene
         // (UploadRing::kQuietNs). Only that ring is made again. --diagnostics ring-stress makes them all again (at the size
         // each wants) every kRingStressFrames frames.
-        const bool ring_stress =
-            ::galaxy::diagnosing(::galaxy::kDiagnoseRingStress) && frame_index_ % ::galaxy::kRingStressFrames == 0u;
         // No wait for the GPU: a ring is made again as a new buffer, and the old one and its chunks go to the newest frame in
         // flight's retired list, released after that frame's fence, which is past every earlier frame's.
         const UploadRingSlot rings[] = {{&vertex_ring_, "vertex", kRingSegments, true},
                                         {&index_ring_, "index", kFramesInFlight, true},
                                         {&constant_ring_, "constant", kFramesInFlight, true},
                                         {&matrix_ring_, "matrix", kRingSegments, false}};
-        if (ring_stress || (!ring_growth_failed_ && std::any_of(std::begin(rings), std::end(rings),
-                                                                [](const UploadRingSlot& s) { return s.ring->wants_new_size(); }))) {
+        if (const RingRemake due = upload_rings_due(rings, frame_index_, ring_growth_failed_); due != RingRemake::None) {
             const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::RingResize);
             std::vector<gpu::BufferRef>& old = retired_targets_[(frame_index_ + kFramesInFlight - 1u) % kFramesInFlight];
-            if (remake_upload_rings(device_.Get(), rings, ring_stress, ring_growth_failed_, old)) {
-                history_segment_ = 0u;
-                history_segment_fence_.fill(0u);
+            if (remake_upload_rings(device_.Get(), rings, due == RingRemake::All, ring_growth_failed_, old)) {
+                // The vertex and matrix rings share one segment counter and one fence for each segment (history_segment_,
+                // history_segment_fence_). A ring made again is a new buffer, every segment of which is free; a ring that was not made
+                // again (the vertex ring, when only the matrix ring grew) keeps the segments the frames in flight write and read, so
+                // the counter and the fences stay as they are: with the counter at 0 and the fences gone, the next frame wrote the
+                // segment a frame in flight was still drawing from (P-339).
                 history_used_ = true;
             }
         }
@@ -3720,16 +3817,8 @@ void RendererD3D12::begin_frame() {
                     static_cast<double>(timestamps[1] - timestamps[0]) *
                     1000.0 / static_cast<double>(timestamp_frequency_);
                 telemetry_gpu_ms_ += gpu_ms;
-                if (frame_scene_drawn_[frame_slot_]) {
-                    native_scene_gpu_ema_ms_ = native_scene_gpu_ema_ms_ == 0.0 ? gpu_ms :
-                        native_scene_gpu_ema_ms_ + (gpu_ms - native_scene_gpu_ema_ms_) * 0.1;
-                }
+                frame_gpu_.add(gpu_ms, frame_scene_drawn_[frame_slot_], frame_generated_[frame_slot_]);
                 telemetry_gpu_by_place_[timestamp_list_place_[frame_slot_]] += gpu_ms;
-                if (frame_generated_[frame_slot_]) {
-                    generated_gpu_ms_ += gpu_ms;
-                    ++generated_gpu_samples_;
-                    generated_gpu_ema_ms_ = generated_gpu_ema_ms_ == 0.0 ? gpu_ms : generated_gpu_ema_ms_ + (gpu_ms - generated_gpu_ema_ms_) * 0.1;
-                }
                 ++telemetry_gpu_by_place_count_[timestamp_list_place_[frame_slot_]];
                 ++telemetry_gpu_samples_;
             }
@@ -3745,24 +3834,9 @@ void RendererD3D12::begin_frame() {
         void* mapped = nullptr;
         if (SUCCEEDED(pass_readback_->Map(0, &read_range, &mapped))) {
             const auto* ticks = reinterpret_cast<const std::uint64_t*>(static_cast<const std::byte*>(mapped) + offset);
-            std::array<double, static_cast<std::size_t>(GpuPass::Count)> frame_ms{};
-            for (unsigned i = 0; i + 1u < marks; ++i) {
-                if (ticks[i + 1u] >= ticks[i]) {
-                    const double ms = static_cast<double>(ticks[i + 1u] - ticks[i]) * 1000.0 /
-                                      static_cast<double>(timestamp_frequency_);
-                    telemetry_pass_ms_[static_cast<std::size_t>(pass_marks_[frame_slot_][i])] += ms;
-                    frame_ms[static_cast<std::size_t>(pass_marks_[frame_slot_][i])] += ms;
-                }
-            }
-            // The page's running average of each pass over the frames that ran it.
-            for (std::size_t pass = 0u; pass < frame_ms.size(); ++pass) {
-                if (frame_ms[pass] > 0.0) {
-                    const float before = pass_ema_ms_[pass].load(std::memory_order_relaxed);
-                    const float value = static_cast<float>(frame_ms[pass]);
-                    pass_ema_ms_[pass].store(before == 0.0f ? value : before + (value - before) * 0.1f, std::memory_order_relaxed);
-                }
-            }
-            galaxy::bench::note_gpu_frame(kPassTimeNames, frame_ms.data(), std::min(std::size(kPassTimeNames), frame_ms.size()));
+            pass_times_.add_frame(gpu_pass_ms(ticks, pass_marks_[frame_slot_].data(), marks - 1u,
+                                              1000.0 / static_cast<double>(timestamp_frequency_)),
+                                  frame_scene_drawn_[frame_slot_] && !frame_generated_[frame_slot_]);
             const D3D12_RANGE no_write{0, 0};
             pass_readback_->Unmap(0, &no_write);
         }
@@ -3817,12 +3891,7 @@ void RendererD3D12::begin_frame() {
         if (timing && !pass_query_heap_) {
             ensure_pass_queries();
         }
-        if (!timing && pass_timing_on_) {
-            for (std::atomic<float>& average : pass_ema_ms_) {
-                average.store(0.0f, std::memory_order_relaxed);
-            }
-        }
-        pass_timing_on_ = timing && pass_query_heap_;
+        pass_times_.begin_frame(timing && pass_query_heap_);
     }
     pass_list_open_ = true;
     if (stats_query_heap_) {
@@ -3848,10 +3917,8 @@ void RendererD3D12::begin_frame() {
     index_ring_.begin_frame(frame_slot_);
     constant_ring_.begin_frame(frame_slot_);
     srv_ring_.begin_frame(frame_slot_);
-    texture_lists_used_ = 0u;
     {
         const std::uint64_t completed = completed_fence_value();
-        std::erase_if(retired_texture_lists_, [&](const RetiredBuffer& retired) { return retired.fence <= completed; });
         std::erase_if(retired_heaps_, [&](const RetiredHeap& retired) { return retired.fence <= completed; });
     }
     reset_sampler_frame();
@@ -3909,6 +3976,7 @@ void RendererD3D12::refresh_display_rate(bool read_mode) {
         }
     }
     variable_refresh_ = variable;
+    g_variable_refresh.store(variable, std::memory_order_relaxed);
     const double hz = variable ? variable_refresh_cap(mode_hz) : (timed ? measured_hz : mode_hz);
     if (hz <= 1.0) {
         return;
@@ -4098,7 +4166,7 @@ ID3D12Resource* RendererD3D12::hdr_capture_picture(const DisplayTexture& source,
     if (!hdr_capture_target_ || hdr_capture_target_->GetDesc().Width != host_window::backbuffer_width ||
         hdr_capture_target_->GetDesc().Height != host_window::backbuffer_height) {
         if (hdr_capture_target_) {
-            wait_for_gpu();
+            retired_targets_[frame_slot_].push_back(std::move(hdr_capture_target_));  // P-028: no GPU drain
         }
         hdr_capture_target_.Reset();
         if (!hdr_capture_rtv_heap_) {
@@ -4143,24 +4211,8 @@ ID3D12Resource* RendererD3D12::hdr_capture_picture(const DisplayTexture& source,
 
 UINT RendererD3D12::present_sync_interval(unsigned configured, float max_fps) {
     const bool game_frame = std::exchange(present_game_frame_, false);
-    if (configured != 1u || variable_refresh_) {
-        return configured;  // a variable refresh display shows a frame at once: whole refreshes mean nothing
-    }
-    const double hz = display_refresh_hz_;
-    if (hz <= 0.0) {
-        return 1u;
-    }
-    // EnumDisplaySettings reports whole hertz: 119 for 119.88, 239 for 239.76. A game frame without generated frames
-    // holds for its whole 60 Hz frame (4 refreshes at 240 Hz) rather than the next refresh after it is ready, which
-    // drifts against the display.
-    const double rate = game_frame ? std::min(kGameStepRate, present_frame_rate(max_fps, configured, hz))
-                                   : present_frame_rate(max_fps, configured, hz);
-    const double multiple = std::round(hz / rate);
-    if (multiple >= 2.0 && multiple <= 4.0 &&
-        std::abs(hz - rate * multiple) <= 0.015 * hz) {
-        return static_cast<UINT>(multiple);
-    }
-    return 1u;
+    return dxgi_sync_interval(configured, variable_refresh_, display_refresh_hz_, max_fps, game_frame,
+                              [this] { return interpolation_mode(); });
 }
 
 void RendererD3D12::present_to_swap_chain() {
@@ -4286,7 +4338,9 @@ void RendererD3D12::present_to_swap_chain() {
                     statistics.PresentRefreshCount,
                 statistics.SyncRefreshCount);
         }
-        if (timeline_present_ordinal % 30u == 1u) {
+        // The compositor's timing twice a second, at any present rate.
+        static galaxy::ClockInterval dwm_look{500, true};
+        if (dwm_look.due()) {
             using DwmTimingFn = HRESULT(WINAPI*)(HWND, DWM_TIMING_INFO*);
             static const DwmTimingFn dwm_timing = [] {
                 const HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
@@ -4306,6 +4360,11 @@ void RendererD3D12::present_to_swap_chain() {
     if (FAILED(present_hr)) {
         dump_device_removal(device_.Get());
         d3d_check(present_hr, "Present");
+    }
+    {
+        std::int64_t vblank = 0, period = 0;
+        report_dxgi_present(swap_chain_.Get(), !generating && !fsr_swap_chain_ && present_hr == S_OK,
+                            vblank_grid(vblank, period) ? period : 0);
     }
     {
         LARGE_INTEGER now{};
@@ -4432,16 +4491,9 @@ void RendererD3D12::present_to_swap_chain() {
                                 : 0.0);
             }
             if (pass_query_heap_) {
-                static constexpr const char* kPassNames[] = {"scene", "resolve", "frame-read", "display-copy", "bloom",
-                                                             "scene-aa", "scene-ao", "upscale", "rt", "present",
-                                                             "camera"};
-                static_assert(std::size(kPassNames) == static_cast<std::size_t>(GpuPass::Count));
-                message << " gpu-pass-ms=";
+                // Each pass's ms a timed frame (gpu_pass_times.h).
+                message << pass_times_.take_window_field();
                 const double presents = static_cast<double>(std::max<std::uint64_t>(telemetry_present_count_, 1u));
-                for (std::size_t pass = 0; pass < std::size(kPassNames); ++pass) {
-                    message << (pass == 0 ? "" : ",") << kPassNames[pass] << ':' << telemetry_pass_ms_[pass] / presents;
-                }
-                telemetry_pass_ms_.fill(0.0);
                 const D3D12_QUERY_DATA_PIPELINE_STATISTICS& st = telemetry_stats_;
                 message << " gpu-stats=vs:" << static_cast<double>(st.VSInvocations) / presents
                         << ",hs:" << static_cast<double>(st.HSInvocations) / presents
@@ -4570,27 +4622,13 @@ std::uint64_t RendererD3D12::end_frame(
     history_segment_fence_[history_segment_] = submitted_fence;
     frame_generated_[frame_slot_] = generated;
     frame_scene_drawn_[frame_slot_] = scene_drawn_;
-    for (ScreenProbeSlot& slot : probe_slots_) {
-        if (slot.fence == kProbesInFrame) {
-            slot.fence = submitted_fence;
-        }
-    }
     const HRESULT signal_hr = queue_->Signal(fence_.Get(), submitted_fence);
     if (FAILED(signal_hr)) {
         dump_device_removal(device_.Get());
         d3d_check(signal_hr, "Queue Signal");
     }
     // Readbacks recorded on this list complete at this signal; nothing waits for them here.
-    if (readback_pending_ && readback_fence_value_ == 0u) {
-        readback_fence_value_ = submitted_fence;
-    }
-    if (backbuffer_readback_pending_ &&
-        backbuffer_readback_fence_value_ == 0u) {
-        backbuffer_readback_fence_value_ = submitted_fence;
-    }
-    if (selected_display_readback_pending_ && selected_display_readback_fence_ == 0u) {
-        selected_display_readback_fence_ = submitted_fence;
-    }
+    captures_.submitted(submitted_fence);
     // Reached only after a successful signal; presenting follows.
     if (on_submitted != nullptr) {
         on_submitted(submission_context, submitted_fence);
@@ -4791,10 +4829,6 @@ bool RendererD3D12::ensure_motion_target() {
     }
     rd.Format = kReactiveMaskFormat;
     cv.Format = kReactiveMaskFormat;
-    // The tracer writes into it too where the device can trace (where the added light changed).
-    if (rt_capable(rt_caps())) {
-        rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    }
     if (FAILED(create_texture(device_.Get(), &hp, D3D12_HEAP_FLAG_NONE, &rd, gpu::Use::ColorWrite,
             &cv, IID_PPV_ARGS(&reactive_target_)))) {
         motion_target_.Reset();
@@ -4841,7 +4875,7 @@ bool RendererD3D12::interpolation_mode() const {
     const double rate = present_frame_rate(presented_max_fps(cfg), cfg.vsync_interval, display_refresh_hz_);
     // With a temporal upscaler every presented frame is upscaled, its motion from the frame presented before (any
     // rate: the slots' t need not divide the game frame evenly), unless the GPU could not afford it.
-    if (temporal_mode() && temporal_interp_suspended_) {
+    if (temporal_mode() && temporal_interp_hold_.held()) {
         return false;
     }
     return interpolated_frames_per_game_frame(rate) != 0u;
@@ -4861,13 +4895,13 @@ RendererD3D12::TemporalInterpKey RendererD3D12::temporal_interp_key() const {
 }
 
 void RendererD3D12::suspend_temporal_interpolation(double ms_per_frame) {
-    if (temporal_interp_suspended_) {
+    if (temporal_interp_hold_.held()) {
         return;
     }
-    temporal_interp_suspended_ = true;
+    temporal_interp_hold_.hold(galaxy::qpc_to_ns(galaxy::qpc_now()));
     temporal_interp_key_ = temporal_interp_key();
     std::cerr << "[interp] temporal upscaling of generated frames off: " << ms_per_frame
-              << " ms GPU per presented frame\n";
+              << " ms GPU per presented frame; tried again in " << temporal_interp_hold_.wait_ns() / 1000000000 << " s\n";
 }
 
 bool RendererD3D12::begin_motion_scene() {
@@ -4926,13 +4960,11 @@ void RendererD3D12::prepare_temporal_upscaler() {
     const RenderConfig cfg = get_render_config();
     const unsigned kind = cfg.upscaler;
     const unsigned quality = std::min(cfg.temporal_quality, 5u);
-    // DLSS as Ray Reconstruction while the tracer runs, where it is installed and supported.
-    const bool rr = kind == 3u && render_tracing() && streamline::dlss_rr_supported();
     // A failed creation is not retried until its sizes or mode change.
     const bool wide = float_scene_;
     if (rw == temporal_render_w_ && rh == temporal_render_h_ && ow == temporal_output_w_ &&
         oh == temporal_output_h_ && kind == temporal_kind_ && wide == temporal_wide_ &&
-        (kind < 3u || (quality == temporal_quality_ && rr == temporal_rr_))) {
+        (kind < 3u || quality == temporal_quality_)) {
         if (temporal_pending_.valid() &&
             temporal_pending_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
             temporal_ = temporal_pending_.get();
@@ -4952,7 +4984,6 @@ void RendererD3D12::prepare_temporal_upscaler() {
     temporal_pending_ = {};
     temporal_kind_ = kind;
     temporal_quality_ = quality;
-    temporal_rr_ = rr;
     temporal_wide_ = wide;
     temporal_history_valid_ = false;
     temporal_render_w_ = rw;
@@ -4973,7 +5004,7 @@ void RendererD3D12::prepare_temporal_upscaler() {
         });
         return;
     }
-    temporal_ = create_dlss_upscaler(rw, rh, ow, oh, quality, rr, wide);
+    temporal_ = create_dlss_upscaler(rw, rh, ow, oh, quality, wide);
     if (temporal_) {
         std::cout << "[Renderer] " << temporal_->name() << " " << rw << "x" << rh
                   << " -> " << ow << "x" << oh << "\n";
@@ -5086,14 +5117,6 @@ bool RendererD3D12::record_temporal_upscale(const FrameMap& output) {
         handed.texture(in.motion, gpu::Use::ColorWrite, gpu::Use::Common);
         handed.texture(in.reactive, gpu::Use::ColorWrite, gpu::Use::Common);
         handed.texture(in.output, gpu::Use::ColorWrite, gpu::Use::Common);
-        // An outside denoiser's guides (DLSS Ray Reconstruction), from the shader-read layout the tracer left them in.
-        if (const rt::Denoiser* denoiser = temporal_->denoiser()) {
-            if (const rt::DenoiseGuides guides = denoiser->pending_guides(); guides.valid) {
-                for (void* guide : {guides.diffuse_albedo, guides.specular_albedo, guides.normal_roughness, guides.hit_distance}) {
-                    handed.texture(static_cast<ID3D12Resource*>(guide), gpu::Use::ShaderRead, gpu::Use::Common);
-                }
-            }
-        }
         handed.issue();
     }
     const bool recorded = temporal_inputs_match(in) && temporal_->evaluate(in);
@@ -5296,13 +5319,9 @@ bool RendererD3D12::create_scene_set(
     bool unordered_access, unsigned samples, bool hdr, unsigned width, unsigned height, bool target) {
     const UINT w = static_cast<UINT>(std::lround(static_cast<double>(width) * map.sx));
     const UINT h = static_cast<UINT>(std::lround(static_cast<double>(height) * map.sy));
-    if (set.color) {
-        wait_for_gpu();
-    }
-    set.color.Reset();
-    set.depth.Reset();
+    // The old set goes when the frames that drew or read it are done (P-028); its own views with it.
+    retire_scene_set(set, true);
     set.map = set.extent = FrameMap{};
-    release_conv_table(set.conv_ring);
     if (!rtv_heap) {
         D3D12_DESCRIPTOR_HEAP_DESC dhd{};
         dhd.NumDescriptors = 1;
@@ -5354,8 +5373,7 @@ bool RendererD3D12::create_scene_set(
         return false;
     }
     if (persistent_views) {
-        write_scene_set_views(set, set.conv_table ? *set.conv_table
-                                                : allocate_persistent_descriptors(2u));
+        write_scene_set_views(set, set.conv_table ? *set.conv_table : fresh_persistent(2u));
     } else {
         // The caller writes views into the frame's descriptor segment per use.
         set.conv_table.reset();
@@ -5424,7 +5442,9 @@ bool RendererD3D12::begin_target_pass(std::uint64_t key, std::uint32_t width, st
     }
     TargetSlot& slot = target_slots_[key];
     const FrameMap map(width, height);
-    const bool kept = slot.set.color && slot.set.map == map;
+    // The test hook NEBULA_EXT_REMAKE_TARGETS makes it again at the same size, as a size change does (P-028).
+    const bool kept = slot.set.color && slot.set.map == map &&
+                      (galaxy::extensions::flags() & NEBULA_EXT_REMAKE_TARGETS) == 0u;
     // A new set starts as a render target; the pass's first clear (RenderCore) fills it. Its copy views are written
     // per use (no persistent descriptors per key).
     if (!kept) {
@@ -5560,11 +5580,6 @@ void RendererD3D12::take_fg_hudless_scene() {
         return;
     }
     if (!fg_hudless_scene_target_.color || fg_hudless_scene_target_.map != frame_) {
-        if (fg_hudless_scene_target_.color) {
-            wait_for_gpu();
-        }
-        fg_hudless_scene_target_.color.Reset();
-        fg_hudless_scene_target_.depth.Reset();
         if (!create_scene_set(fg_hudless_scene_target_, fg_hudless_rtv_heap_, fg_hudless_dsv_heap_, frame_)) {
             return;
         }
@@ -5589,7 +5604,7 @@ void RendererD3D12::copy_fg_hudless_display(const DisplayTexture& dest) {
     if (!fg_hudless_display_.texture || fg_hudless_display_.texture->GetDesc().Width != desc.Width ||
         fg_hudless_display_.texture->GetDesc().Height != desc.Height) {
         if (fg_hudless_display_.texture) {
-            wait_for_gpu();
+            retired_targets_[frame_slot_].push_back(std::move(fg_hudless_display_.texture));  // P-028: no GPU drain
         }
         fg_hudless_display_.texture.Reset();
         D3D12_HEAP_PROPERTIES hp{};
@@ -5635,7 +5650,7 @@ void RendererD3D12::present_fg_hudless(const DisplayTexture& source, const D3D12
     if (!fg_hudless_target_ || fg_hudless_target_->GetDesc().Width != host_window::backbuffer_width ||
         fg_hudless_target_->GetDesc().Height != host_window::backbuffer_height) {
         if (fg_hudless_target_) {
-            wait_for_gpu();
+            retired_targets_[frame_slot_].push_back(std::move(fg_hudless_target_));  // P-028: no GPU drain
         }
         fg_hudless_target_.Reset();
         if (!fg_hudless_target_rtv_heap_) {
@@ -5686,7 +5701,7 @@ void RendererD3D12::present_fg_hudless(const DisplayTexture& source, const D3D12
         sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         sd.Texture2D.MipLevels = 1;
-        device_->CreateShaderResourceView(fg_hudless_display_.texture.Get(), &sd, tbl.cpu);
+        srv_ring_.write_view(tbl.cpu, fg_hudless_display_.texture.Get(), sd);
         command_list_->SetGraphicsRootSignature(s_blit_root_sig.Get());
         command_list_->SetPipelineState(blit_pipeline_.Get());
         srv_ring_.bind(command_list_.Get());
@@ -5746,11 +5761,7 @@ bool RendererD3D12::ensure_wide_set(SceneTargetSet& set, ComPtr<ID3D12Descriptor
                       set.color->GetDesc().Height == desc.Height && set.color->GetDesc().Format == format &&
                       set.msaa.samples == samples;
     if (!same) {
-        if (set.color) {
-            wait_for_gpu();
-        }
-        set.color.Reset();
-        set.msaa.color.Reset();
+        retire_scene_set(set, false);  // P-028: no GPU drain
         if (!rtv_heap) {
             D3D12_DESCRIPTOR_HEAP_DESC heap{};
             heap.NumDescriptors = 2;
@@ -5806,7 +5817,7 @@ bool RendererD3D12::ensure_wide_set(SceneTargetSet& set, ComPtr<ID3D12Descriptor
     set.msaa.depth_dirty = scene_msaa_.depth_dirty;
     if (set.depth != scene_depth_) {
         set.depth = scene_depth_;
-        write_scene_set_views(set, set.conv_table ? *set.conv_table : allocate_persistent_descriptors(2u));
+        write_scene_set_views(set, set.conv_table ? *set.conv_table : fresh_persistent(2u));
     }
     return true;
 }
@@ -5863,14 +5874,14 @@ void RendererD3D12::record_hdr_begin() {
     bind_scene();
 }
 
-void RendererD3D12::end_wide_scene(unsigned finish) {
+void RendererD3D12::end_wide_scene() {
     if (!wide_live_) {
         return;
     }
-    record_hdr_end(finish);
+    record_hdr_end();
 }
 
-void RendererD3D12::record_hdr_end(unsigned finish) {
+void RendererD3D12::record_hdr_end() {
     if (!wide_live_) {
         return;
     }
@@ -5903,7 +5914,6 @@ void RendererD3D12::record_hdr_end(unsigned finish) {
     in.resolve = resolve_output;
     // After a load or a long pause the eye starts open.
     in.seconds = seconds > 1.0f ? -1.0f : seconds;
-    in.finish = finish;
     static_cast<void>(camera_pass_.record(command_list_.Get(), srv_ring_, in));
     if (scene_msaa_.samples > 1u) {
         scene_msaa_.color_dirty = true;
@@ -5956,7 +5966,7 @@ ID3D12PipelineState* RendererD3D12::layer_pipeline(bool merge, unsigned samples)
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = merge ? kSceneHdrColorFormat : kSceneColorFormat;
     pd.SampleDesc.Count = samples;
-    if (FAILED(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&slot)))) {
+    if (FAILED(core::utility_pipeline(device_.Get(), pd, &slot))) {
         slot.Reset();
         return nullptr;
     }
@@ -6078,10 +6088,10 @@ void RendererD3D12::end_layer_2d() {
     view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     view.Texture2D.MipLevels = 1;
     view.Format = kSceneColorFormat;
-    device_->CreateShaderResourceView(layer2d_set_.color.Get(), &view, table.cpu);
+    srv_ring_.write_view(table.cpu, layer2d_set_.color.Get(), view);
     D3D12_CPU_DESCRIPTOR_HANDLE second = table.cpu;
     second.ptr += device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    device_->CreateShaderResourceView(layer2d_base_.Get(), &view, second);
+    srv_ring_.write_view(second, layer2d_base_.Get(), view);
     // Into the float set's target (each sample with MSAA, resolved again when next read).
     record_layer_draw(layer_pipeline(true, scene_msaa_.samples), layer2d_merge_root_.Get(), scene_rtv_,
                       static_cast<unsigned>(desc.Width), desc.Height, table.gpu, false);
@@ -6093,174 +6103,6 @@ void RendererD3D12::end_layer_2d() {
     invalidate_draw_bindings();
     bound_rt_aux_ = 0xFFu;
     bind_scene();
-}
-
-RendererD3D12::RtCommands RendererD3D12::rt_commands_begin() {
-    rt_outer_pass_ = current_pass_;
-    gpu_pass(GpuPass::RayTracing);
-    return {command_list_.Get(), &srv_ring_};
-}
-
-// A pass leaves its own pipeline bound: the next draw binds the scene's again.
-void RendererD3D12::rt_commands_end() {
-    gpu_pass(rt_outer_pass_);
-    invalidate_draw_bindings();
-}
-
-bool RendererD3D12::rt_depth_begin(rt::TextureView& depth, unsigned& width, unsigned& height, rt::ImageFormat& color,
-                                   rt::TextureView* color_view) {
-    if (!scene_depth_ || !scene_color_ || scene_msaa_.samples > 1u) {
-        return false;
-    }
-    BarriersD3D12 uses{command_list_.Get()};
-    uses.texture(scene_depth_.Get(), gpu::Use::DepthWrite, gpu::Use::ShaderRead);
-    rt_color_read_ = color_view != nullptr;
-    if (rt_color_read_) {
-        uses.texture(scene_color_.Get(), gpu::Use::ColorWrite, gpu::Use::ComputeRead);
-        *color_view = {scene_color_.Get(), static_cast<std::uint32_t>(scene_color_->GetDesc().Format)};
-    }
-    uses.issue();
-    const D3D12_RESOURCE_DESC desc = scene_depth_->GetDesc();
-    depth = {scene_depth_.Get(), static_cast<std::uint32_t>(kSceneDepthSrvFormat)};
-    width = static_cast<unsigned>(desc.Width);
-    height = desc.Height;
-    color = scene_color_->GetDesc().Format == kSceneHdrColorFormat ? rt::ImageFormat::Rgba16f : rt::ImageFormat::Rgb10a2;
-    return true;
-}
-
-void RendererD3D12::rt_depth_end() {
-    BarriersD3D12 uses{command_list_.Get()};
-    uses.texture(scene_depth_.Get(), gpu::Use::ShaderRead, gpu::Use::DepthWrite);
-    if (rt_color_read_) {
-        uses.texture(scene_color_.Get(), gpu::Use::ComputeRead, gpu::Use::ColorWrite);
-        rt_color_read_ = false;
-    }
-    uses.issue();
-}
-
-void RendererD3D12::rt_copy_to_scene(void* image) {
-    auto* const source = static_cast<ID3D12Resource*>(image);
-    if (source == nullptr || !scene_color_) {
-        return;
-    }
-    const D3D12_RESOURCE_DESC from = source->GetDesc(), to = scene_color_->GetDesc();
-    if (from.Width != to.Width || from.Height != to.Height || from.Format != to.Format || to.SampleDesc.Count != 1u) {
-        return;
-    }
-    BarriersD3D12 uses{command_list_.Get()};
-    uses.texture(scene_color_.Get(), gpu::Use::ColorWrite, gpu::Use::CopyDest);
-    uses.issue();
-    command_list_->CopyResource(scene_color_.Get(), source);
-    uses.undo();
-}
-
-bool RendererD3D12::rt_items_begin() {
-    if (!scene_depth_ || !scene_color_ || scene_msaa_.samples > 1u) {
-        return false;
-    }
-    const D3D12_RESOURCE_DESC depth = scene_depth_->GetDesc();
-    if (!item_target_ || item_target_->GetDesc().Width != depth.Width || item_target_->GetDesc().Height != depth.Height) {
-        if (item_target_) {
-            retired_targets_[frame_slot_].push_back(std::move(item_target_));  // this frame's commands may name it
-        }
-        item_target_.Reset();
-        if (!item_rtv_heap_) {
-            D3D12_DESCRIPTOR_HEAP_DESC heap{};
-            heap.NumDescriptors = 1;
-            heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-            if (FAILED(device_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&item_rtv_heap_)))) {
-                return false;
-            }
-        }
-        D3D12_HEAP_PROPERTIES hp{};
-        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC rd{};
-        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        rd.Width = depth.Width;
-        rd.Height = depth.Height;
-        rd.DepthOrArraySize = 1;
-        rd.MipLevels = 1;
-        rd.Format = kItemFormat;
-        rd.SampleDesc.Count = 1;
-        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        D3D12_CLEAR_VALUE cv{};
-        cv.Format = kItemFormat;
-        if (FAILED(create_texture(device_.Get(), &hp, D3D12_HEAP_FLAG_NONE, &rd, gpu::Use::ColorWrite, &cv,
-                                  IID_PPV_ARGS(&item_target_)))) {
-            return false;
-        }
-        item_target_->SetName(L"ray tracing item target");
-        item_rtv_ = item_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
-        device_->CreateRenderTargetView(item_target_.Get(), nullptr, item_rtv_);
-    }
-    const float none[4]{};
-    command_list_->ClearRenderTargetView(item_rtv_, none, 0u, nullptr);
-    return true;
-}
-
-bool RendererD3D12::rt_light_begin(rt::TextureView& depth, rt::TextureView& items, unsigned& width, unsigned& height) {
-    if (!scene_depth_ || !item_target_ || scene_msaa_.samples > 1u) {
-        return false;
-    }
-    BarriersD3D12 uses{command_list_.Get()};
-    uses.texture(scene_depth_.Get(), gpu::Use::DepthWrite, gpu::Use::ShaderRead);
-    uses.texture(item_target_.Get(), gpu::Use::ColorWrite, gpu::Use::ComputeRead);
-    uses.issue();
-    const D3D12_RESOURCE_DESC desc = scene_depth_->GetDesc();
-    depth = {scene_depth_.Get(), static_cast<std::uint32_t>(kSceneDepthSrvFormat)};
-    items = {item_target_.Get(), static_cast<std::uint32_t>(kItemFormat)};
-    width = static_cast<unsigned>(desc.Width);
-    height = desc.Height;
-    return true;
-}
-
-void RendererD3D12::rt_light_end() {
-    BarriersD3D12 uses{command_list_.Get()};
-    uses.texture(scene_depth_.Get(), gpu::Use::ShaderRead, gpu::Use::DepthWrite);
-    uses.texture(item_target_.Get(), gpu::Use::ComputeRead, gpu::Use::ColorWrite);
-    uses.issue();
-}
-
-bool RendererD3D12::rt_reactive_begin(rt::TextureView& reactive) {
-    if (!reactive_scene_ || !reactive_target_ ||
-        (reactive_target_->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == D3D12_RESOURCE_FLAG_NONE) {
-        return false;
-    }
-    BarriersD3D12 uses{command_list_.Get()};
-    uses.texture(reactive_target_.Get(), gpu::Use::ColorWrite, gpu::Use::ComputeWrite);
-    uses.issue();
-    reactive = {reactive_target_.Get(), static_cast<std::uint32_t>(kReactiveMaskFormat)};
-    return true;
-}
-
-void RendererD3D12::rt_reactive_end() {
-    BarriersD3D12 uses{command_list_.Get()};
-    uses.texture(reactive_target_.Get(), gpu::Use::ComputeWrite, gpu::Use::ColorWrite);
-    uses.issue();
-}
-
-void RendererD3D12::rt_unpublish_lights(TextureStore& textures) {
-    for (unsigned which = 0u; which < kRtLightPictures; ++which) {  // light, added, mirror, facing, volume, scatter, transmit, indirect, two guides
-        const auto found = pictures_.find(kRtLightPicture + which);
-        if (found == pictures_.end()) {
-            continue;
-        }
-        if (found->second.view != ~0u) {
-            textures.retire_view(found->second.view, std::move(found->second.viewed));
-        }
-        pictures_.erase(found);
-    }
-}
-
-std::uint32_t RendererD3D12::rt_publish_light(void* image, TextureStore& textures, unsigned which) {
-    auto* const resource = static_cast<ID3D12Resource*>(image);
-    if (resource == nullptr) {
-        return null_texture_slot_;
-    }
-    const D3D12_RESOURCE_DESC desc = resource->GetDesc();
-    static_cast<void>(publish_picture(kRtLightPicture + which, static_cast<std::uint32_t>(desc.Width), desc.Height,
-                                      gpu::TextureRef(resource), 0u, textures));
-    return pictures_[kRtLightPicture + which].view;
 }
 
 // The scene target's depth, single-sample (MSAA resolves it, sample 0), read by the occlusion; the product lands on the
@@ -6429,7 +6271,6 @@ bool RendererD3D12::begin_output_scene(bool resolve_msaa_only) {
     }
     // The whole scene scene target, resampled into the output target with the display
     // copy's identity settings (no filter, gamma 1.0, alpha kept).
-    FramePassRequest params{};
     const unsigned w = output.width;
     const unsigned h = output.height;
     const FramePassGeometry sampling = frame_pass_geometry(w, h, frame_);
@@ -6744,87 +6585,6 @@ bool RendererD3D12::draw_shown_frame_pass(const FramePassRequest& params, const 
     return made;
 }
 
-bool RendererD3D12::record_screen_probes(std::size_t slot, std::span<const ScreenProbe> probes, bool compared) {
-    (void)compared;
-    if (slot >= probe_slots_.size()) probe_slots_.resize(slot + 1u);
-    ScreenProbeSlot& out = probe_slots_[slot];
-    if (out.fence != 0u || probes.empty()) {
-        return false;
-    }
-    const std::uint64_t bytes = probes.size() * sizeof(float);
-    if (out.bytes < bytes) {
-        D3D12_HEAP_PROPERTIES heap{};
-        D3D12_RESOURCE_DESC desc{};
-        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        desc.Width = bytes;
-        desc.Height = 1;
-        desc.DepthOrArraySize = 1;
-        desc.MipLevels = 1;
-        desc.SampleDesc.Count = 1;
-        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        heap.Type = D3D12_HEAP_TYPE_READBACK;
-        d3d_check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
-                                                   nullptr, IID_PPV_ARGS(&out.readback)),
-                  "screen probe readback");
-        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        d3d_check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
-                                                   IID_PPV_ARGS(&out.values)),
-                  "screen probe values");
-        out.mapped = reinterpret_cast<const float*>(pin_readback_mapping(out.readback.Get()));
-        if (out.mapped == nullptr) throw std::runtime_error("screen probe readback could not be mapped");
-        out.bytes = bytes;
-    }
-    const UploadRing::Allocation pixels = constant_ring_.allocate(probes.size() * sizeof(ScreenProbePixel), 16u);
-    for (std::size_t i = 0; i < probes.size(); ++i) {
-        const ScreenProbePixel pixel = screen_probe_pixel(probes[i], frame_);
-        std::memcpy(pixels.cpu + i * sizeof(ScreenProbePixel), &pixel, sizeof(pixel));
-    }
-
-    ID3D12GraphicsCommandList* const list = command_list_.Get();
-    resolve_scene(true, false);  // depth alone
-    BarriersD3D12 depth{list};
-    depth.texture(scene_depth_.Get(), gpu::Use::DepthWrite, gpu::Use::ComputeRead);
-    depth.issue();
-
-    const std::uint32_t count = static_cast<std::uint32_t>(probes.size());
-    list->SetComputeRootSignature(probe_root_signature_.Get());
-    list->SetPipelineState(probe_pipeline_.Get());
-    srv_ring_.bind(list);
-    list->SetComputeRoot32BitConstants(0, 1, &count, 0);
-    list->SetComputeRootDescriptorTable(1, srv_ring_.gpu_at(conv_scene_depth_index_));
-    list->SetComputeRootShaderResourceView(2, pixels.gpu);
-    list->SetComputeRootUnorderedAccessView(3, out.values->GetGPUVirtualAddress());
-    list->Dispatch((count + kScreenProbeGroup - 1u) / kScreenProbeGroup, 1, 1);
-
-    // The depth goes back with the values' change to the copy, in one call.
-    BarriersD3D12 after{list};
-    after.texture(scene_depth_.Get(), gpu::Use::ComputeRead, gpu::Use::DepthWrite);
-    after.buffer(out.values.Get(), gpu::Use::ComputeWrite, gpu::Use::CopySource);
-    after.issue();
-    list->CopyBufferRegion(out.readback.Get(), 0, out.values.Get(), 0, bytes);
-    BarriersD3D12 values{list};
-    values.buffer(out.values.Get(), gpu::Use::CopySource, gpu::Use::ComputeWrite);
-    values.issue();
-
-    // The drawing state as the scene's draws expect it.
-    list->SetGraphicsRootSignature(root_signature_.Get());
-    invalidate_draw_bindings();
-    bind_scene();
-    out.fence = kProbesInFrame;  // fenced at end_frame
-    return true;
-}
-
-const float* RendererD3D12::screen_probes_finished(std::size_t slot) {
-    ScreenProbeSlot& out = probe_slots_[slot];
-    if (out.fence == 0u || out.fence == kProbesInFrame || completed_fence_value() < out.fence) {
-        return nullptr;
-    }
-    out.fence = 0u;
-    return out.mapped;
-}
-
 // A readback heap may stay mapped while the GPU writes it (D3D12 leaves the
 // synchronization to the fences the callers already wait on). The reference
 // taken here is never released; the resource's destruction ends the mapping.
@@ -6840,283 +6600,12 @@ void RendererD3D12::finish_pictures() {
     if (queue_ && fence_) {
         wait_for_gpu();
     }
-    debug_log_readback();
     debug_log_backbuffer_readback();
-    debug_log_selected_display_readback();
-    reap_debug_capture_writers(true);
+    wait_picture_files();
 }
 
-void RendererD3D12::set_debug_capture_paths(
-    std::string scene_ppm_path,
-    std::string backbuffer_ppm_path) {
-    next_scene_capture_path_ = std::move(scene_ppm_path);
+void RendererD3D12::set_debug_capture_paths(std::string backbuffer_ppm_path) {
     next_backbuffer_capture_path_ = std::move(backbuffer_ppm_path);
-}
-
-void RendererD3D12::reap_debug_capture_writers(bool wait_for_all) {
-    for (auto it = debug_ppm_writers_.begin();
-         it != debug_ppm_writers_.end();) {
-        if (!wait_for_all &&
-            it->completion.wait_for(std::chrono::seconds(0)) !=
-                std::future_status::ready) {
-            ++it;
-            continue;
-        }
-        try {
-            it->completion.get();
-        } catch (const std::exception& error) {
-            std::cerr << '[' << it->tag << "] failed path=" << it->path
-                      << " error=" << error.what() << '\n';
-            it = debug_ppm_writers_.erase(it);
-            continue;
-        }
-        std::cerr << '[' << it->tag << "] wrote " << it->path << '\n';
-        it = debug_ppm_writers_.erase(it);
-    }
-}
-
-void RendererD3D12::queue_debug_ppm_capture(
-    const char* tag,
-    const std::string& path,
-    const std::uint8_t* source,
-    unsigned width,
-    unsigned height,
-    unsigned row_pitch,
-    bool ten_bit) {
-    constexpr std::size_t kMaximumPendingDebugCaptures = 8u;
-    reap_debug_capture_writers(false);
-    if (debug_ppm_writers_.size() >= kMaximumPendingDebugCaptures) {
-        std::cerr << '[' << tag << "] skipped=writer-queue-full path="
-                  << path << '\n';
-        return;
-    }
-    if (source == nullptr || width == 0u || height == 0u ||
-        row_pitch < width * 4u) {
-        throw std::runtime_error("invalid mapped debug PPM capture");
-    }
-    const std::size_t source_row_bytes =
-        static_cast<std::size_t>(width) * 4u;
-    if (height > std::numeric_limits<std::size_t>::max() / source_row_bytes) {
-        throw std::runtime_error("debug PPM capture size overflow");
-    }
-    std::vector<std::uint8_t> rgba(
-        source_row_bytes * static_cast<std::size_t>(height));
-    if (ten_bit) {
-        ten_bit_to_rgba8(source, rgba.data(), width, height, row_pitch, static_cast<unsigned>(source_row_bytes));
-    } else {
-        for (unsigned y = 0u; y < height; ++y) {
-            std::memcpy(
-                rgba.data() + static_cast<std::size_t>(y) * source_row_bytes,
-                source + static_cast<std::size_t>(y) * row_pitch,
-                source_row_bytes);
-        }
-    }
-
-    DebugPpmWriter writer{};
-    writer.tag = tag;
-    writer.path = path;
-    writer.completion = std::async(
-        std::launch::async,
-        [path, width, height, rgba = std::move(rgba)]() {
-            FILE* capture = nullptr;
-            if (fopen_s(&capture, path.c_str(), "wb") != 0 ||
-                capture == nullptr) {
-                throw std::runtime_error("could not open output file");
-            }
-            const auto close_capture = [&capture]() noexcept {
-                if (capture != nullptr) {
-                    std::fclose(capture);
-                    capture = nullptr;
-                }
-            };
-            try {
-                if (std::fprintf(capture, "P6\n%u %u\n255\n", width, height) <
-                    0) {
-                    throw std::runtime_error("could not write PPM header");
-                }
-                std::vector<std::uint8_t> rgb(
-                    static_cast<std::size_t>(width) * 3u);
-                for (unsigned y = 0u; y < height; ++y) {
-                    const auto* source_row = rgba.data() +
-                        static_cast<std::size_t>(y) *
-                            static_cast<std::size_t>(width) * 4u;
-                    for (unsigned x = 0u; x < width; ++x) {
-                        rgb[x * 3u + 0u] = source_row[x * 4u + 0u];
-                        rgb[x * 3u + 1u] = source_row[x * 4u + 1u];
-                        rgb[x * 3u + 2u] = source_row[x * 4u + 2u];
-                    }
-                    if (std::fwrite(rgb.data(), 1u, rgb.size(), capture) !=
-                        rgb.size()) {
-                        throw std::runtime_error("could not write PPM pixels");
-                    }
-                }
-                if (std::fclose(capture) != 0) {
-                    capture = nullptr;
-                    throw std::runtime_error("could not finalize output file");
-                }
-                capture = nullptr;
-            } catch (...) {
-                close_capture();
-                throw;
-            }
-        });
-    debug_ppm_writers_.push_back(std::move(writer));
-}
-
-bool RendererD3D12::debug_copy_scene_to_readback() {
-    // The scene target as it is: the 10-bit one (R10G10B10A2), or the wide one (RGBA16F, a traced scene's),
-    // whose halves debug_log_readback turns into the 10-bit target's words.
-    resolve_scene(false);
-    debug_log_readback();
-    if (readback_pending_) {
-        std::cerr << "[scene-dump] skipped=prior-readback-pending path="
-                  << next_scene_capture_path_ << '\n';
-        return false;
-    }
-    const UINT w = frame_.width;
-    const UINT h = frame_.height;
-    // 8 or 4 bytes a pixel from the target's own format (as the Vulkan side): any other is not read.
-    const DXGI_FORMAT format = scene_color_->GetDesc().Format;
-    const bool wide = format == kSceneHdrColorFormat;
-    if (!wide && format != kSceneColorFormat) {
-        std::cerr << "[scene-dump] skipped=scene-format-not-read format=" << static_cast<unsigned>(format)
-                  << " path=" << next_scene_capture_path_ << '\n';
-        return false;
-    }
-    const UINT row_pitch =
-        (w * (wide ? 8u : 4u) + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) &
-        ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
-
-    if (readback_buf_ && readback_buf_->GetDesc().Width < static_cast<UINT64>(row_pitch) * h) {
-        readback_buf_.Reset();  // made for the 10-bit target or a smaller frame: no copy is pending (checked above)
-    }
-    if (!readback_buf_) {
-        D3D12_HEAP_PROPERTIES hp{};
-        hp.Type = D3D12_HEAP_TYPE_READBACK;
-        D3D12_RESOURCE_DESC rd{};
-        rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
-        rd.Width            = static_cast<UINT64>(row_pitch) * h;
-        rd.Height           = 1;
-        rd.DepthOrArraySize = 1;
-        rd.MipLevels        = 1;
-        rd.SampleDesc.Count = 1;
-        rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (FAILED(device_->CreateCommittedResource(
-                &hp, D3D12_HEAP_FLAG_NONE, &rd,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                nullptr, IID_PPV_ARGS(&readback_buf_)))) {
-            std::cerr << "[scene-dump] skipped=readback-allocation-failed path="
-                      << next_scene_capture_path_ << '\n';
-            return false;
-        }
-    }
-
-    BarriersD3D12 uses{command_list_.Get()};
-    uses.texture(scene_color_.Get(), gpu::Use::ColorWrite, gpu::Use::CopySource);
-    uses.issue();
-
-    D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
-    src.pResource = scene_color_.Get();
-    src.Type      = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst.pResource = readback_buf_.Get();
-    dst.Type      = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint.Footprint.Format   = wide ? kSceneHdrColorFormat : kSceneColorFormat;
-    dst.PlacedFootprint.Footprint.Width    = w;
-    dst.PlacedFootprint.Footprint.Height   = h;
-    dst.PlacedFootprint.Footprint.Depth    = 1;
-    dst.PlacedFootprint.Footprint.RowPitch = row_pitch;
-    command_list_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-
-    uses.undo();
-    readback_pending_ = true;
-    readback_wide_ = wide;
-    readback_fence_value_ = 0u;
-    readback_capture_path_ = next_scene_capture_path_;
-    return true;
-}
-
-void RendererD3D12::debug_log_readback() {
-    reap_debug_capture_writers(false);
-    if (!readback_pending_ || !readback_buf_) {
-        return;
-    }
-    if (readback_fence_value_ == 0u ||
-        completed_fence_value() < readback_fence_value_) {
-        return;
-    }
-    readback_pending_ = false;
-    readback_fence_value_ = 0u;
-
-    const UINT w = frame_.width;
-    const UINT h = frame_.height;
-    const UINT copied_pitch =
-        (w * (readback_wide_ ? 8u : 4u) + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) &
-        ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
-
-    void* mapped = nullptr;
-    D3D12_RANGE range{0, static_cast<SIZE_T>(copied_pitch) * h};
-    if (FAILED(readback_buf_->Map(0, &range, &mapped))) {
-        readback_capture_path_.clear();
-        return;
-    }
-    bool mapped_active = true;
-    const D3D12_RANGE no_write{0, 0};
-    const ScopeExit unmap_readback([&]() noexcept {
-        if (mapped_active) readback_buf_->Unmap(0, &no_write);
-    });
-    std::uint64_t nonblack = 0, alpha_hits = 0, rs = 0, gs = 0, bs = 0;
-    std::uint8_t rmax = 0, gmax = 0, bmax = 0, amax = 0;
-    // The wide target's halves as the 10-bit target's words; the rest reads words either way.
-    std::vector<std::uint8_t> words;
-    const auto* base = static_cast<const std::uint8_t*>(mapped);
-    UINT row_pitch = copied_pitch;
-    if (readback_wide_) {
-        row_pitch = w * 4u;
-        words.resize(static_cast<std::size_t>(row_pitch) * h);
-        half4_to_ten_bit(base, words.data(), w, h, copied_pitch, row_pitch);
-        base = words.data();
-    }
-    for (UINT y = 0; y < h; y += 4) {           // sample every 4th row/col
-        const std::uint8_t* row = base + static_cast<std::size_t>(y) * row_pitch;
-        for (UINT x = 0; x < w; x += 4) {
-            std::uint32_t word = 0u;
-            std::memcpy(&word, row + x * 4u, 4u);
-            const auto r = static_cast<std::uint8_t>((word & 1023u) >> 2u);
-            const auto g = static_cast<std::uint8_t>((word >> 10u & 1023u) >> 2u);
-            const auto bl = static_cast<std::uint8_t>((word >> 20u & 1023u) >> 2u);
-            const auto a = static_cast<std::uint8_t>((word >> 30u) * 85u);
-            rs += r; gs += g; bs += bl;
-            rmax = std::max(rmax, r); gmax = std::max(gmax, g);
-            bmax = std::max(bmax, bl); amax = std::max(amax, a);
-            if (r > 8 || g > 8 || bl > 8) ++nonblack;
-            if (a > 8) ++alpha_hits;
-        }
-    }
-    const std::uint64_t samples =
-        (static_cast<std::uint64_t>((h + 3) / 4)) * ((w + 3) / 4);
-
-    if (!readback_capture_path_.empty()) {
-        queue_debug_ppm_capture(
-            "scene-dump",
-            readback_capture_path_,
-            base,
-            w,
-            h,
-            row_pitch,
-            true);
-    }
-
-    readback_buf_->Unmap(0, &no_write);
-    mapped_active = false;
-    readback_capture_path_.clear();
-    std::cerr << "[scene-dump] nonblack=" << nonblack << "/" << samples
-              << " alpha=" << alpha_hits
-              << " mean=(" << rs / samples << "," << gs / samples << ","
-              << bs / samples << ") max=("
-              << static_cast<unsigned>(rmax) << ","
-              << static_cast<unsigned>(gmax) << ","
-              << static_cast<unsigned>(bmax) << ","
-              << static_cast<unsigned>(amax) << ")\n";
 }
 
 bool RendererD3D12::present(
@@ -7131,25 +6620,10 @@ bool RendererD3D12::present(
             "present requested without a valid display picture blit source");
     }
     const DisplayTexture* source = frame;
+    debug_log_backbuffer_readback();
     if (capture_backbuffer) {
-        if (selected_display_readback_pending_ && selected_display_readback_fence_ != 0u) {
-            wait_for_fence_value(selected_display_readback_fence_);
-        }
-        if (backbuffer_readback_pending_ && backbuffer_readback_fence_value_ != 0u) {
-            wait_for_fence_value(backbuffer_readback_fence_value_);
-        }
-        debug_log_backbuffer_readback();
-        debug_log_selected_display_readback();
-        if (backbuffer_readback_pending_ || selected_display_readback_pending_ ||
-            next_backbuffer_capture_path_.empty()) {
-            std::cerr << "[backbuffer-dump] skipped="
-                      << (next_backbuffer_capture_path_.empty()
-                              ? "no-output-path" : "prior-readback-pending")
-                      << " path=" << next_backbuffer_capture_path_ << '\n';
-            capture_backbuffer = false;
-        } else {
-            capture_backbuffer = debug_copy_selected_display_to_readback(*source);
-        }
+        // Each capture has its own readback (P-323): one still in flight neither waits nor drops this one.
+        capture_backbuffer = debug_copy_selected_display_to_readback(*source);
     }
 
     const auto ultrawide =
@@ -7243,7 +6717,7 @@ bool RendererD3D12::present(
         sd.ViewDimension             = D3D12_SRV_DIMENSION_TEXTURE2D;
         sd.Shader4ComponentMapping   = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         sd.Texture2D.MipLevels       = 1;
-        device_->CreateShaderResourceView(source->texture.Get(), &sd, tbl.cpu);
+        srv_ring_.write_view(tbl.cpu, source->texture.Get(), sd);
         command_list_->SetGraphicsRootSignature(s_blit_root_sig.Get());
         command_list_->SetPipelineState(blit_pipeline_.Get());
         srv_ring_.bind(command_list_.Get());
@@ -7270,36 +6744,12 @@ bool RendererD3D12::present(
         }
     }
     if (capture_backbuffer) {
-        if (backbuffer_readback_pending_) {
-            throw std::runtime_error(
-                "backbuffer capture requested while a prior readback is pending");
-        }
         const UINT w = host_window::backbuffer_width;
         const UINT h = host_window::backbuffer_height;
         const UINT row_pitch =
             (w * 4u + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) &
             ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
-        const UINT64 required_bytes = static_cast<UINT64>(row_pitch) * h;
-        if (!backbuffer_readback_buf_ ||
-            backbuffer_readback_buf_->GetDesc().Width < required_bytes) {
-            backbuffer_readback_buf_.Reset();
-            D3D12_HEAP_PROPERTIES hp{};
-            hp.Type = D3D12_HEAP_TYPE_READBACK;
-            D3D12_RESOURCE_DESC rd{};
-            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            rd.Width = required_bytes;
-            rd.Height = 1;
-            rd.DepthOrArraySize = 1;
-            rd.MipLevels = 1;
-            rd.SampleDesc.Count = 1;
-            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            d3d_check(
-                device_->CreateCommittedResource(
-                    &hp, D3D12_HEAP_FLAG_NONE, &rd,
-                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                    IID_PPV_ARGS(&backbuffer_readback_buf_)),
-                "Create backbuffer readback");
-        }
+        CaptureReadback readback = capture_readback(static_cast<UINT64>(row_pitch) * h, L"backbuffer capture");
 
         BarriersD3D12 capture{command_list_.Get()};
         capture.texture(capture_from, gpu::Use::ColorWrite, gpu::Use::CopySource);
@@ -7308,7 +6758,7 @@ bool RendererD3D12::present(
         D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
         src.pResource = capture_from;
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        dst.pResource = backbuffer_readback_buf_.Get();
+        dst.pResource = readback.buffer.Get();
         dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         dst.PlacedFootprint.Footprint.Format = kBackbufferFormat;
         dst.PlacedFootprint.Footprint.Width = w;
@@ -7319,27 +6769,41 @@ bool RendererD3D12::present(
             &dst, 0, 0, 0, &src, nullptr);
 
         capture.undo();
-        backbuffer_readback_pending_ = true;
-        backbuffer_readback_fence_value_ = 0u;
-        backbuffer_readback_width_ = w;
-        backbuffer_readback_height_ = h;
-        backbuffer_readback_row_pitch_ = row_pitch;
-        backbuffer_readback_capture_path_ = next_backbuffer_capture_path_;
+        // A resize after this copy is recorded leaves its own footprint with it.
+        captures_.recorded({std::move(readback), 0u, next_backbuffer_capture_path_, w, h, row_pitch, Captures::Form::Rgba8});
     }
 
     back.undo();
     return capture_backbuffer;
 }
 
+RendererD3D12::CaptureReadback RendererD3D12::capture_readback(UINT64 bytes, const wchar_t* name) {
+    CaptureReadback readback =
+        captures_.spare([bytes](const CaptureReadback& kept) { return kept.buffer->GetDesc().Width >= bytes; });
+    if (readback.buffer) {
+        return readback;
+    }
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = bytes;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    d3d_check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&readback.buffer)),
+              "Create capture readback");
+    (void)readback.buffer->SetName(name);
+    return readback;
+}
+
 // Captures the presented display picture itself, in the same command list (and fence) as the
 // final blit. The source is held until the copy completes; nothing waits here.
 bool RendererD3D12::debug_copy_selected_display_to_readback(const DisplayTexture& source) {
-    debug_log_selected_display_readback();
-    if (selected_display_readback_pending_ || next_backbuffer_capture_path_.empty()) {
-        std::cerr << "[selected-display-capture] skipped="
-                  << (next_backbuffer_capture_path_.empty()
-                          ? "no-output-path" : "prior-readback-pending")
-                  << " path=" << next_backbuffer_capture_path_ << '\n';
+    if (next_backbuffer_capture_path_.empty()) {
         return false;
     }
     const auto desc = source.texture->GetDesc();
@@ -7352,34 +6816,16 @@ bool RendererD3D12::debug_copy_selected_display_to_readback(const DisplayTexture
         throw std::runtime_error("selected display picture capture has inconsistent extent/format");
     }
     const UINT pitch = (source.width * (wide ? 8u : 4u) + 255u) & ~255u;
-    const UINT64 bytes = static_cast<UINT64>(pitch) * source.height;
-    if (!selected_display_readback_buf_ || selected_display_readback_buf_->GetDesc().Width < bytes) {
-        selected_display_readback_buf_.Reset();
-        D3D12_HEAP_PROPERTIES heap{};
-        heap.Type = D3D12_HEAP_TYPE_READBACK;
-        D3D12_RESOURCE_DESC buffer{};
-        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        buffer.Width = bytes;
-        buffer.Height = 1;
-        buffer.DepthOrArraySize = 1;
-        buffer.MipLevels = 1;
-        buffer.SampleDesc.Count = 1;
-        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        d3d_check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
-            &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-            IID_PPV_ARGS(&selected_display_readback_buf_)), "Create selected display picture readback");
-    }
+    CaptureReadback readback = capture_readback(static_cast<UINT64>(pitch) * source.height, L"display picture capture");
     BarriersD3D12 uses{command_list_.Get()};
     uses.texture(source.texture.Get(), gpu::Use::PixelRead, gpu::Use::CopySource);
     uses.issue();
     D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
     src.pResource = source.texture.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst.pResource = selected_display_readback_buf_.Get();
+    dst.pResource = readback.buffer.Get();
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst.PlacedFootprint.Footprint.Format = desc.Format;
-    selected_display_readback_ten_bit_ = desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM || wide;
-    selected_display_readback_wide_ = wide;
     dst.PlacedFootprint.Footprint.Width = source.width;
     dst.PlacedFootprint.Footprint.Height = source.height;
     dst.PlacedFootprint.Footprint.Depth = 1;
@@ -7388,114 +6834,27 @@ bool RendererD3D12::debug_copy_selected_display_to_readback(const DisplayTexture
     const D3D12_BOX picture{0u, 0u, 0u, source.width, source.height, 1u};
     command_list_->CopyTextureRegion(&dst, 0, 0, 0, &src, &picture);
     uses.undo();
-    selected_display_readback_source_ = source.texture;
-    selected_display_readback_width_ = source.width;
-    selected_display_readback_height_ = source.height;
-    selected_display_readback_pitch_ = pitch;
-    selected_display_readback_path_ = next_backbuffer_capture_path_ + ".display.ppm";
-    selected_display_readback_fence_ = 0u;
-    selected_display_readback_pending_ = true;
-    std::cerr << "[selected-display-capture] slot=" << source.slot
-              << " resource=0x" << std::hex << reinterpret_cast<std::uintptr_t>(source.texture.Get())
-              << std::dec << " serial=" << source.picture_number << " stamp=" << source.frame_stamp
-              << " extent=" << source.width << 'x' << source.height
-              << " path=" << selected_display_readback_path_ << '\n';
+    readback.held = source.texture;
+    captures_.recorded({std::move(readback), 0u, next_backbuffer_capture_path_ + ".display.ppm", source.width, source.height,
+                        pitch, wide ? Captures::Form::Half : desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM
+                                                                 ? Captures::Form::TenBit
+                                                                 : Captures::Form::Rgba8});
     return true;
 }
 
-void RendererD3D12::debug_log_selected_display_readback() {
-    if (!selected_display_readback_pending_ || selected_display_readback_fence_ == 0u ||
-        completed_fence_value() < selected_display_readback_fence_) return;
-    const SIZE_T bytes = static_cast<SIZE_T>(selected_display_readback_pitch_) *
-        selected_display_readback_height_;
-    void* mapped = nullptr;
-    const D3D12_RANGE range{0, bytes};
-    d3d_check(selected_display_readback_buf_->Map(0, &range, &mapped), "Map selected display picture readback");
-    try {
-        const auto* base = static_cast<const std::uint8_t*>(mapped);
-        unsigned pitch = selected_display_readback_pitch_;
-        // An RGBA16F picture's halves as the 10-bit format's words (the capture's range ends at 1, as the SDR view).
-        std::vector<std::uint8_t> words;
-        if (selected_display_readback_wide_) {
-            pitch = selected_display_readback_width_ * 4u;
-            words.resize(static_cast<std::size_t>(pitch) * selected_display_readback_height_);
-            half4_to_ten_bit(base, words.data(), selected_display_readback_width_, selected_display_readback_height_,
-                             selected_display_readback_pitch_, pitch);
-            base = words.data();
-        }
-        queue_debug_ppm_capture("selected-display-dump", selected_display_readback_path_, base,
-            selected_display_readback_width_, selected_display_readback_height_, pitch,
-            selected_display_readback_ten_bit_);
-    } catch (...) {
-        const D3D12_RANGE no_write{0, 0};
-        selected_display_readback_buf_->Unmap(0, &no_write);
-        throw;
-    }
-    const D3D12_RANGE no_write{0, 0};
-    selected_display_readback_buf_->Unmap(0, &no_write);
-    selected_display_readback_pending_ = false;
-    selected_display_readback_fence_ = 0u;
-    selected_display_readback_source_.Reset();
-    selected_display_readback_path_.clear();
-}
-
 void RendererD3D12::debug_log_backbuffer_readback() {
-    reap_debug_capture_writers(false);
-    if (!backbuffer_readback_pending_ || !backbuffer_readback_buf_) {
-        return;
-    }
-    if (backbuffer_readback_fence_value_ == 0u ||
-        completed_fence_value() < backbuffer_readback_fence_value_) {
-        return;
-    }
-    backbuffer_readback_pending_ = false;
-    backbuffer_readback_fence_value_ = 0u;
-
-    // A resize may have completed after this copy was recorded. Decode using
-    // the captured footprint rather than the current swap-chain extent.
-    const UINT w = backbuffer_readback_width_;
-    const UINT h = backbuffer_readback_height_;
-    const UINT row_pitch = backbuffer_readback_row_pitch_;
-    if (w == 0u || h == 0u || row_pitch == 0u) {
-        throw std::runtime_error(
-            "pending backbuffer readback has no captured footprint");
-    }
-    const SIZE_T byte_count = static_cast<SIZE_T>(row_pitch) * h;
-    void* mapped = nullptr;
-    const D3D12_RANGE read_range{0, byte_count};
-    if (FAILED(
-            backbuffer_readback_buf_->Map(
-                0, &read_range, &mapped))) {
-        backbuffer_readback_capture_path_.clear();
-        backbuffer_readback_width_ = 0;
-        backbuffer_readback_height_ = 0;
-        backbuffer_readback_row_pitch_ = 0;
-        return;
-    }
-
-    bool mapped_active = true;
-    const D3D12_RANGE no_write{0, 0};
-    const ScopeExit unmap_readback([&]() noexcept {
-        if (mapped_active) backbuffer_readback_buf_->Unmap(0, &no_write);
+    captures_.finished(completed_fence_value(), [](Captures::Capture& capture) {
+        capture.readback.held.Reset();
+        const unsigned width = capture.width;
+        const unsigned height = capture.height;
+        const D3D12_RANGE range{0, static_cast<SIZE_T>(capture.pitch) * height};
+        void* mapped = nullptr;
+        d3d_check(capture.readback.buffer->Map(0, &range, &mapped), "Map capture readback");
+        const D3D12_RANGE no_write{0, 0};
+        const ScopeExit unmap([&]() noexcept { capture.readback.buffer->Unmap(0, &no_write); });
+        write_capture_rows(std::move(capture.path), static_cast<const std::uint8_t*>(mapped), width, height,
+                           capture.pitch, capture.form);
     });
-    const auto* base = static_cast<const std::uint8_t*>(mapped);
-    if (!backbuffer_readback_capture_path_.empty()) {
-        queue_debug_ppm_capture(
-            "backbuffer-dump",
-            backbuffer_readback_capture_path_,
-            base,
-            w,
-            h,
-            row_pitch);
-    }
-
-    backbuffer_readback_capture_path_.clear();
-    backbuffer_readback_width_ = 0;
-    backbuffer_readback_height_ = 0;
-    backbuffer_readback_row_pitch_ = 0;
-
-    backbuffer_readback_buf_->Unmap(0, &no_write);
-    mapped_active = false;
 }
 
 }  // namespace galaxy::render

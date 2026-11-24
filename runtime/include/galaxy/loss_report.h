@@ -1,12 +1,14 @@
 // What the game asked for and the player did not get: a draw with no material or pipeline, a texture drawn blank, a sound read
-// past its memory. Never silent: each kind is logged the first time, every count at exit, and tools/verify/losscheck.py fails a
-// run where any is above zero.
+// past its memory. Never silent: each kind is logged the first time, every count at exit, and the test harness
+// (luma_test.py, "nothing the game asked for was lost") fails a run where any is above zero.
 #pragma once
 
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+
+#include "galaxy/whole_lines.h"
 
 namespace galaxy::loss {
 
@@ -35,13 +37,15 @@ inline void filled(Kind kind) noexcept {
     counters[static_cast<unsigned>(kind)].fetch_sub(1u, std::memory_order_relaxed);
 }
 
+// One line, written in one call: the harness reads it whole.
 inline void report() noexcept {
-    std::fprintf(stderr, "[loss]");
+    whole_lines::Line line;
+    line.add("[loss]");
     for (unsigned i = 0; i < counters.size(); ++i) {
-        std::fprintf(stderr, " %s=%llu", name(static_cast<Kind>(i)),
-                     static_cast<unsigned long long>(counters[i].load(std::memory_order_relaxed)));
+        line.add(" %s=%llu", name(static_cast<Kind>(i)),
+                 static_cast<unsigned long long>(counters[i].load(std::memory_order_relaxed)));
     }
-    std::fprintf(stderr, "\n");
+    line.write(stderr);
 }
 
 }  // namespace galaxy::loss

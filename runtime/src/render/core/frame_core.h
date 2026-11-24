@@ -13,6 +13,8 @@
 #include "galaxy/render/renderer_common.h"
 #include "render/core/compose.h"
 #include "render/core/gpu_encoder.h"
+#include "render/core/texture_lists.h"
+#include "render/core/walk_plan.h"
 
 #include <nebula_frame_list.h>
 #include <nebula_game_api.h>
@@ -68,50 +70,13 @@ struct GpuMesh {
     gpu::Address further = 0u;
     gpu::Address indices = 0u;
     gpu::Address refined_indices = 0u;
-    gpu::Address gains = 0u;  // vertex 0's de-light gain word in stream 3 (NEBULA_MESH_GAIN; 0 none)
     std::uint32_t vertex_count = 0u, refined_vertex_count = 0u;
     std::uint32_t index_count = 0u, refined_index_count = 0u;
     std::uint32_t site_stride = 0u;     // nonzero: one stream at `positions`
     std::uint32_t further_stride = 0u;
     std::uint32_t single_matrix = NEBULA_MODEL_NONE;
-    std::uint32_t glow_shape_first = 0u, glow_shape_count = 0u;  // among its model's glow_shapes
     std::uint8_t index_bytes = 4u;
     std::uint8_t billboard = 0u;  // NebulaModelMesh.billboard: 1 a billboard, 2 a Y billboard (it turns to the eye)
-    // What a ray reads of the mesh's material (nebula_model.h NebulaModelHit): its class and flags, what it shows with
-    // no light, its colour under full light, and its numbers.
-    std::uint8_t hit_class = 0u, hit_flags = 0u;
-    float hit_emission[3]{}, hit_base[3]{0.5f, 0.5f, 0.5f};
-    float hit_roughness = 0.45f, hit_metal = 0.0f, hit_transmission = 0.0f;
-    float hit_environment = 0.0f;  // how much of its look a painted reflection carries
-    float glow[4]{};  // the light it gives: colour, and its strength (0: none)
-    std::uint8_t glow_source = 0u;  // NebulaModelHit.glow_source: where the glow's colour comes from as it animates
-    std::uint8_t glow_rule = 0u;    // its bits 5-7: why it glows (hit_record.rs GLOW_*; 2 a hot body by name)
-    std::uint8_t hit_env_map = 0xFFu;
-    float hit_ior = 1.5f, hit_thickness = 0.0f;
-    float hit_env_tint[3]{};
-    float hit_body = -1.0f, hit_shine = -1.0f, hit_tint_keep = -1.0f;  // the review's; below 0: the class's own
-    float hit_through = 0.0f;  // the share of the sun its far side takes (NebulaModelHit.through / 255)
-    // The live colour of glow_source: its row among the material's form 0 rows (vertex rows first; 0xFFFF
-    // none), how many rows that form has, and the row's cooked colour, which the live one is measured against.
-    std::uint16_t glow_row = 0xFFFFu;
-    std::uint16_t glow_row_count = 0u;
-    float glow_cooked[3]{};
-    // Map 0's coordinate (the water's ripple): the first of its two rows (u, v) among the material's own
-    // form's rows (vertex rows first; 0xFFFF none: no stage samples map 0 through a coordinate made from a uv set by a
-    // matrix), the uv set it reads, and that form's row count (a draw's rows are the form's where they agree).
-    std::uint16_t map0_row = 0xFFFFu;
-    std::uint16_t map0_form_rows = 0u;
-    std::uint8_t map0_uv = 0u;
-    // Map 1's the same way (water moves by both of its maps), in the same form; map1_slot its place in the
-    // item's texture table (the form's second map).
-    std::uint16_t map1_row = 0xFFFFu;
-    std::uint8_t map1_uv = 0u;
-    std::uint8_t map1_slot = 0xFFu;
-    float hit_alpha = 0.5f;  // an alpha-tested material: the alpha from which it is there
-    // Its paint as one light (nebula_model.h NebulaModelPaintLight; the Physical style): the share b / (a + b)
-    // (0: it stays painted) and the light's direction in the model's space, octahedral.
-    float paint_share = 0.0f;
-    std::int16_t paint_direction[2]{};
     float min[3]{}, max[3]{};
     std::uint32_t object_slots_first = 0u, object_slots_count = 0u;
     std::uint32_t arena = 0u;
@@ -128,7 +93,6 @@ struct GpuModel {
     std::vector<float> inverse_binds;  // 12 per joint
     std::vector<NebulaModelJoint> joints;
     std::vector<ao::ObjectSlot> object_slots;
-    std::vector<NebulaModelGlowShape> glow_shapes;  // its glowing meshes' light shapes, model space
     ModelTables tables{};
     std::uint32_t first_mesh = 0u, mesh_count = 0u;
     std::uint32_t arena = 0u;
@@ -145,13 +109,16 @@ struct TextureTable {
     std::vector<std::uint32_t> sampler_slots;
     gpu::Address lists = 0u;
     std::uint32_t list_first = 0u;
+    // Its list in core::TextureLists and the pairs written there: written again only when the pairs change.
+    TextureLists::Place list_place{};
+    std::vector<std::uint32_t> list_pairs;
     bool clamp_logged = false;  // a bound table drew fewer maps than the list names (told once)
     std::uint64_t key = 0u;
     gpu::Table textures{};
     gpu::Table samplers{};
     std::uint64_t textures_revision = ~0ull;
     std::uint32_t samplers_generation = 0u;
-    float samplers_mip_lines = 0.0f, samplers_scene_bias = 0.0f;
+    std::uint32_t map_bias = 0u;  // a bound table's maps' SamplerFrameBias (gpu::DrawRoot::map_bias)
     bool has_target = false;
     std::uint64_t walk_stamp = 0u;
     std::uint64_t pictures_moved = 0u;  // RenderCore::pictures_moved_ when its target's pictures were named
@@ -186,32 +153,14 @@ struct ViewRows {
     float motion[4];
     float raster[4];
     float sky_up[3];          // the player's up in eye space (unit), else the view's up
-    std::uint32_t view_flags; // bit 0 sky up known, bit 1 enhanced, bit 2 wide target, bit 3 traced light (`traced`), bit 4 shown
+    std::uint32_t view_flags; // bit 0 sky up known, bit 1 enhanced, bit 2 wide target
     float scale[4];
-    float traced[4];  // with view_flags bit 3: the light image's place among the textures, the added light's, the mirror's,
-                      // the facing picture's
-    float stage_a[4]; // with view_flags bit 3: the stage's ambient colour A (rgb), w kShadowTint (program.hlsli)
-    float stage_k[4]; // with view_flags bit 3: the stage's key colour K (rgb)
-    float volume[3][4];  // with view_flags bit 3, the scene's view (the light volume: program.hlsli traced_air): the
-                         // depth's eye terms (rt_eye_z), the viewport it spans, its picture's and sampler's places and 1
-    float transmit[4];  // with view_flags bit 3, the scene's view: x picture 6's place (T, rt_pass_transmit), y 1
-                        // where the pass drew this walk
-    float blend_guide[4];  // with view_flags bit 3, the scene's view (program.hlsli traced_by_air,
-                           // traced_mirror_own): x the guide blended draws compare with, y 1 the second layer's
-                           // (picture 9), 2 the opaque layer's (picture 8), 0 none
-    float look[4];  // with view_flags bit 3: the painted composite's look (program.hlsli traced_painted; RenderCore
-                    // rt_look_): kForm, the sun's height over the player's up (at least 0.5), kDebake, kAmbientLook
-    float dev[2][4];  // with view_flags bit 3: the programs' development tunables (rt_dev.h from BaseFloor): [0] the
-                      // values, [1] 1 where the run gave one
-    float relight[4][4];  // with view_flags bit 3: the relight's view constants (program.hlsli view_relight):
-                          // lin(A) and luma(held), sky' E, key sun_strength E, held / luma(held)
+    // The level biases the programs add for a map's SamplerFrameBias: x the scene's, y the lines'; z, w unused.
+    float map_bias[4];
 };
 // The cbuffer's packing: view_sky_up and view_flags share one 16-byte row.
 static_assert(offsetof(ViewRows, sky_up) == 128 && offsetof(ViewRows, view_flags) == 140 &&
-              offsetof(ViewRows, scale) == 144 && offsetof(ViewRows, traced) == 160 && offsetof(ViewRows, stage_a) == 176 && offsetof(ViewRows, stage_k) == 192 &&
-              offsetof(ViewRows, volume) == 208 &&
-              offsetof(ViewRows, transmit) == 256 && offsetof(ViewRows, blend_guide) == 272 && offsetof(ViewRows, look) == 288 &&
-              offsetof(ViewRows, dev) == 304 && offsetof(ViewRows, relight) == 336 && sizeof(ViewRows) == 400);
+              offsetof(ViewRows, scale) == 144 && offsetof(ViewRows, map_bias) == 160 && sizeof(ViewRows) == 176);
 
 // Everything one list needs that lasts as long as the list.
 struct ListData {
@@ -234,26 +183,13 @@ struct ListData {
     std::vector<std::uint32_t> item_before;
     bool motion_ready = false;
     bool coverage_counted = false;  // --diagnostics present-stats: its items counted in RenderCore::coverage_
-    // The list's screen probes are asked once, on its first real walk: a frame between lists (`between`) draws the scene at
-    // t < 1, not the camera the game's points were made with.
-    bool probes_done = false;
-    [[nodiscard]] bool probes_due(bool between) const noexcept { return !probes_done && !between; }
     std::vector<EyeMotion> eye_motions;        // an eye-space block's joints, in `joint_motion`'s place
 
-    // Target passes drawn before the list's other passes (plan_early_targets): passes [first, end), and the
-    // SCENE_BEGIN they sit after in the list, or none.
-    struct EarlyTargets {
-        std::uint32_t first = 0u, end = 0u, scene = NEBULA_NONE32;
-    };
+    // The walk's plans (render/core/walk_plan.h), made at the list's first walk: target passes drawn before the list's
+    // other passes, and clears of the scene's depth that nothing after them in the list reads or writes.
+    using EarlyTargets = core::EarlyTargets;
     bool targets_planned = false;
     std::vector<EarlyTargets> early_targets;
-    // Probes asked right after an earlier pass (plan_early_probes), in list order; `after` a SCENE_END: asked as the
-    // scene ends, before walk_scene_end trades the targets.
-    struct EarlyProbe {
-        std::uint32_t after = 0u, probe = 0u;
-    };
-    std::vector<EarlyProbe> early_probes;
-    // Clears of the scene's depth that nothing after them in the list reads or writes (plan_late_depth_clears).
     std::vector<std::uint32_t> late_depth_clears;
 
     // Read once from the list.
@@ -301,14 +237,6 @@ public:
     // more than once, with them named), then wait for `submitted_fence` of that call to complete (reclaim).
     void apply(RegistryOps& ops, std::uint64_t submitted_fence);
     void reclaim(std::uint64_t completed_fence);
-    // The meshes apply has retired since the last call (render thread): no list names them again, and their vertices
-    // go once the GPU is past the work submitted so far, so nothing recorded from here on may read them.
-    // Kept only while `tell_retired_meshes(true)`.
-    [[nodiscard]] std::vector<std::uint32_t> take_retired_meshes() noexcept { return std::exchange(retired_meshes_, {}); }
-    void tell_retired_meshes(bool on) noexcept {
-        tell_retired_meshes_ = on;
-        retired_meshes_.clear();
-    }
     // Tables naming a freed texture go; their descriptor tables join `retired`.
     void forget_textures(std::span<const std::uint32_t> freed, std::vector<gpu::Table>& retired);
     // Render thread, every kTableSweepFrames: the one rule for a table's life. A table no walk has named for kTableIdleFrames
@@ -327,6 +255,12 @@ public:
         std::uint64_t retirements = 0u;  // retire_idle_tables's releases since the start
     };
     [[nodiscard]] TableCounts table_counts() const noexcept;
+    // The texture lists of tables dropped or retired since the last call (RenderCore gives them up to its
+    // core::TextureLists at the renderer's fence).
+    void take_released_lists(std::vector<TextureLists::Place>& out) {
+        out.swap(released_lists_);
+        released_lists_.clear();
+    }
 
     [[nodiscard]] const GpuMesh& mesh(std::uint32_t id) const noexcept { return meshes_[id]; }
     [[nodiscard]] const GpuModel& model(std::uint32_t id) const noexcept { return models_[id]; }
@@ -394,6 +328,7 @@ private:
     struct LiveModel {
         const void* file = nullptr;  // valid until model_free
         std::uint32_t first_mesh = 0u;
+        NebulaModelView view{};  // its arrays' places and counts, from the section table at model_register
     };
     struct LiveMesh {
         std::unique_ptr<std::byte[]> bytes;
@@ -425,8 +360,6 @@ private:
     std::vector<Retired> retired_;
     // The frees the list walking now came with (render thread).
     std::vector<std::uint32_t> held_freed_models_, held_freed_meshes_;
-    std::vector<std::uint32_t> retired_meshes_;
-    bool tell_retired_meshes_ = false;
 
     // Written under lock_ by services.
     RegistryOps incoming_;
@@ -441,6 +374,7 @@ private:
     std::vector<std::unique_ptr<TextureTable>> tables_;
     TextureTable no_table_;
     std::uint64_t table_retirements_ = 0u;
+    std::vector<TextureLists::Place> released_lists_;
 
     std::uint32_t next_model_ = 1u, next_mesh_ = 1u, next_slot_ = 0u, next_table_ = 1u;
     // Every pipeline the game registered, with its inputs (the entries' copies, in registration order).

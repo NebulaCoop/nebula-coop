@@ -3,10 +3,16 @@
 # the cache paths below; the game module is native/CMakeLists.txt.
 cmake_minimum_required(VERSION 3.22)
 project(NebulaSDL LANGUAGES C CXX)
+# What the host computes for the game (a stick's position above all) is the same bits on every CPU: no multiply and
+# add is fused into one rounding. Clang fuses them by default on CPUs with a fused multiply-add (arm64, and x86-64 at
+# AVX2): a tablet's stick then differed from a computer's by one ulp, and its replay from the computer's (N-1064). The
+# game module is built the same way (native/CMakeLists.txt). MSVC fuses none at /fp:precise without /fp:contract.
+add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-ffp-contract=off>)
 # The game's version, from the main project's file.
 file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/../../CMakeLists.txt" nebula_project_line REGEX "^project\\(Nebula VERSION ")
 string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+" nebula_version "${nebula_project_line}")
-add_compile_definitions(NEBULA_VERSION="${nebula_version}")
+include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/nebula_options.cmake")
+add_compile_definitions(NEBULA_VERSION="${nebula_version}${NEBULA_VERSION_SUFFIX}")
 # Settings > ADVANCED without dev mode: test builds only (the main project's NEBULA_TEST_TOOLS).
 option(NEBULA_TEST_TOOLS "Show the testing tools in Settings without dev mode (test builds, never a release)" OFF)
 if(NEBULA_TEST_TOOLS)
@@ -96,8 +102,6 @@ else()
     add_executable(galaxy_utility_spirv IMPORTED)
     set_target_properties(galaxy_utility_spirv PROPERTIES IMPORTED_LOCATION "${NEBULA_HOST_TOOLS}/galaxy_utility_spirv${CMAKE_HOST_EXECUTABLE_SUFFIX}")
 endif()
-# NEBULA_RAY_TRACING (cmake/rt_shaders.cmake) decides the programs' traced forms too.
-include("${nebula_root}/cmake/rt_shaders.cmake")
 include("${nebula_root}/cmake/native_materials.cmake")
 galaxy_program_blob(galaxy_programs_spirv spirv)
 set(galaxy_utility_spirv_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/utility_spirv")
@@ -113,6 +117,7 @@ set(rt "${nebula_root}/runtime/src")
 add_library(galaxy_render_vk STATIC
     ${rt}/render/render_api.cpp
     ${rt}/render/render_config.cpp
+    ${rt}/render/device_memory.cpp
     ${rt}/render/renderer_choice.cpp
     ${rt}/ui/native_settings.cpp
     ${rt}/ui/launcher.cpp
@@ -136,20 +141,15 @@ add_library(galaxy_render_vk STATIC
     ${rt}/render/frame_pass.cpp
     ${rt}/render/post_process_settings.cpp
     ${rt}/render/render_core.cpp
+    ${rt}/render/frame_schedule.cpp
+    ${rt}/render/gpu_pass_times.cpp
     ${rt}/render/affine.cpp
     ${rt}/render/core/compose.cpp
     ${rt}/render/core/draw_walker.cpp
-    ${rt}/render/core/rt_walk.cpp
-    ${rt}/render/core/rt_bounce.cpp
-    ${rt}/render/core/rt_pass_indirect.cpp
-    ${rt}/render/core/rt_pass_reflect.cpp
-    ${rt}/render/core/rt_pass_transmit.cpp
-    ${rt}/render/core/rt_pass_volume.cpp
     ${rt}/render/core/pairing.cpp
     ${rt}/render/core/pipelines.cpp
     ${rt}/render/core/program_table.cpp
     ${rt}/render/core/registries.cpp
-    ${rt}/render/core/world_lights.cpp
     ${rt}/render/core/pipelines_vk.cpp
     ${rt}/render/core/encoder_vk.cpp
     ${rt}/render/galaxy_select.cpp
@@ -160,14 +160,10 @@ add_library(galaxy_render_vk STATIC
     ${rt}/benchmark_results.cpp
     ${rt}/strict_json.cpp
     ${rt}/render/frame_interpolation.cpp
-    ${rt}/render/rt_materials.cpp
-    ${rt}/render/rt_caps.cpp
-    ${rt}/render/rt/rt_shaders.cpp
-    ${rt}/render/vk/rt_backend_vk.cpp
-    ${rt}/render/rt/rt_geometry.cpp
-    ${rt}/render/rt/rt_scene.cpp
     ${rt}/frame_telemetry.cpp
     ${rt}/perf_hint.cpp
+    ${rt}/pacing.cpp
+    ${rt}/pacing_recorder.cpp
     ${rt}/render/vk/vk_context.cpp
     ${rt}/render/vk/device_quirks_vk.cpp
     ${rt}/render/vk/vk_libraries.cpp
@@ -286,17 +282,6 @@ set_property(SOURCE ${rt}/save_transfer.cpp APPEND PROPERTY INCLUDE_DIRECTORIES 
 target_include_directories(galaxy_render_vk PUBLIC "${nebula_root}/runtime/src")
 target_include_directories(galaxy_render_vk PUBLIC "${nebula_root}/runtime/include")
 target_include_directories(galaxy_render_vk PRIVATE "${nebula_root}/third_party/smaa" "${nebula_root}/native/include" "${galaxy_utility_spirv_dir}")
-# The tracer's SPIR-V, with NEBULA_RAY_TRACING where a dxc that writes it is named (cmake/rt_shaders.cmake).
-set(galaxy_dxc_spirv "")
-if(NEBULA_RAY_TRACING)
-    galaxy_find_dxc_spirv(galaxy_dxc_spirv)
-endif()
-if(galaxy_dxc_spirv)
-    galaxy_rt_shaders(galaxy_rt_spirv spirv "${galaxy_dxc_spirv}")
-    target_sources(galaxy_render_vk PRIVATE "${galaxy_rt_spirv}")
-    target_include_directories(galaxy_render_vk PRIVATE "${galaxy_rt_shader_dir}")
-    target_compile_definitions(galaxy_render_vk PRIVATE GALAXY_RT_SPIRV=1)
-endif()
 # vk_mem_alloc.h leaves pointer nullability unannotated.
 target_compile_options(galaxy_render_vk PRIVATE -Wno-nullability-completeness)
 target_link_libraries(galaxy_render_vk PUBLIC nebula_vulkan_deps)
@@ -345,6 +330,7 @@ endif()
 set(host_sources
     "${nebula_root}/native/host/host_main.cpp"
     "${nebula_root}/runtime/src/hidden_start.cpp"
+    "${nebula_root}/runtime/src/whole_lines.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/host_window_sdl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/luma_system_sdl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/audio_device_sdl.cpp"

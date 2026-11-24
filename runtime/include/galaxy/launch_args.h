@@ -26,28 +26,20 @@ enum Diagnostic : unsigned {
     kDiagnoseSceneLoads = 1u << 10u,     // scene-loads: each scene change's phases and placed objects
     kDiagnoseFileReads = 1u << 11u,      // file-reads: each read and map of the game's files, with its frame
     kDiagnosePipelines = 1u << 12u,      // pipelines: the pipelines the run created (pipelines-<process>.txt)
-    kDiagnoseRtInputs = 1u << 13u,       // rt-inputs: what ray tracing reads of each frame list, checked and counted
-    kDiagnoseRtView = 1u << 14u,         // rt-view: the tracer's scene drawn over the game's, each instance its own colour
-    kDiagnoseRtCheck = 1u << 15u,        // rt-check: the tracer's scene against the depth the game drew, coloured and counted
-    kDiagnoseDeviceFaults = 1u << 16u,   // device-faults: a lost device's breadcrumbs and the driver's fault data
-    kDiagnoseTelemetry = 1u << 17u,      // telemetry: frame counts in shared memory each second (tools/telemetry)
-    kDiagnoseRtLight = 1u << 18u,        // rt-light: the light pass's shares as the scene's colours (sun red, ground green, lamp blue)
-    kDiagnoseRtAdded = 1u << 19u,        // rt-added: the scene under its emitters alone (no sun, no sky): where each light source lights
-    kDiagnoseRtReference = 1u << 20u,    // rt-reference: the reference path tracer's signals in place of the real-time passes'
-    kDiagnoseRtSignals = 1u << 21u,      // rt-signals: each kept picture's lighting signals as pictures of their own (signal_*.ppm)
-    kDiagnoseRtMotion = 1u << 22u,       // rt-motion: where each pixel's point was the frame before, as colours (across red, down green, unknown blue)
-    kDiagnoseRtNoGeometry = 1u << 24u,   // rt-no-geometry: a test: the Vulkan device is made as one without geometry shaders
-    kDiagnoseRtToggle = 1u << 23u,       // rt-toggle: ray tracing switched off and on every 90 frames (the setting changed while the game runs)
-    kDiagnoseRtNoMicromaps = 1u << 25u,  // rt-no-micromaps: a test: no opacity micromaps (alpha-tested surfaces asked at every hit)
-    kDiagnoseProgramsDrawn = 1u << 26u,  // programs-drawn: each program pair a draw asks for, once (a stage compiles only those)
-    kDiagnoseRtAbsent = 1u << 27u,       // rt-absent: a test: the device is taken as one without ray tracing
-    kDiagnoseRingStress = 1u << 28u,     // ring-stress: the upload rings made again every kRingStressFrames frames (a test
+    kDiagnoseDeviceFaults = 1u << 13u,   // device-faults: a lost device's breadcrumbs and the driver's fault data
+    kDiagnoseTelemetry = 1u << 14u,      // telemetry: frame counts in shared memory each second (tools/telemetry)
+    kDiagnoseProgramsDrawn = 1u << 15u,  // programs-drawn: each program pair a draw asks for, once (a stage compiles only those)
+    kDiagnoseRingStress = 1u << 16u,     // ring-stress: the upload rings made again every kRingStressFrames frames (a test
                                          // of their retirement: the old rings must outlive every frame that reads them)
-    kDiagnoseResolutionSteps = 1u << 29u,  // resolution-steps: dynamic resolution on, walking every step its floor allows,
+    kDiagnoseResolutionSteps = 1u << 17u,  // resolution-steps: dynamic resolution on, walking every step its floor allows,
                                            // each held kResolutionStepsPictures scene pictures (a test of every pass at
                                            // every step, on a GPU that never needs one)
-    kDiagnoseHdrHighlights = 1u << 30u,  // hdr-highlights: with HDR output, captures show the light past the paper white
+    kDiagnoseHdrHighlights = 1u << 18u,  // hdr-highlights: with HDR output, captures show the light past the paper white
                                          // (HdrPattern::Highlights) in place of the SDR picture
+    kDiagnoseFramePlans = 1u << 19u,     // frame-plans: every 60th frame list's shape and the walk's plans of it
+                                         // (frame-plans-<pid>.txt; walk_plan_tests' fixtures, ledger P-044)
+    kDiagnoseConstantsWatch = 1u << 20u,  // constants-watch: Direct3D 11 checks a compute read of its constant ring once
+                                          // a frame and prints "[constants] watch" on a wrong read (ledger P-332)
 };
 
 // The names --diagnostics takes, each one item or a set. "1" is the launcher's recording.
@@ -71,24 +63,14 @@ inline constexpr DiagnosticName kDiagnosticNames[] = {
     {"scene-loads", kDiagnoseSceneLoads},
     {"file-reads", kDiagnoseFileReads},
     {"pipelines", kDiagnosePipelines},
-    {"rt-inputs", kDiagnoseRtInputs},
-    {"rt-view", kDiagnoseRtView},
-    {"rt-check", kDiagnoseRtCheck},
     {"device-faults", kDiagnoseDeviceFaults},
     {"telemetry", kDiagnoseTelemetry},
-    {"rt-light", kDiagnoseRtLight},
-    {"rt-added", kDiagnoseRtAdded},
-    {"rt-reference", kDiagnoseRtReference},
-    {"rt-signals", kDiagnoseRtSignals},
-    {"rt-motion", kDiagnoseRtMotion},
-    {"rt-no-geometry", kDiagnoseRtNoGeometry},
-    {"rt-toggle", kDiagnoseRtToggle},
-    {"rt-no-micromaps", kDiagnoseRtNoMicromaps},
     {"programs-drawn", kDiagnoseProgramsDrawn},
-    {"rt-absent", kDiagnoseRtAbsent},
     {"ring-stress", kDiagnoseRingStress},
     {"resolution-steps", kDiagnoseResolutionSteps},
     {"hdr-highlights", kDiagnoseHdrHighlights},
+    {"frame-plans", kDiagnoseFramePlans},
+    {"constants-watch", kDiagnoseConstantsWatch},
     {"frames", kDiagnoseFrames},
     {"gpu", kDiagnoseGpuPasses},
     {"threads", kDiagnoseThreadCpu | kDiagnoseProfile},
@@ -136,7 +118,18 @@ struct LaunchArgs {
     // Started with its window hidden (Windows: STARTUPINFO's SW_HIDE, as a test starts it; elsewhere --hidden 1): no
     // window, dialog or Discord status, and no keyboard, mouse, controller motor or Wii Remote of the player's.
     bool started_hidden = false;
+    // --no-focus 1 (a test's visible run, Windows; every platform accepts it and ignores it elsewhere): the game window never asks for
+    // the keyboard focus (shown without activating, no foreground, active or focus call), and the game runs as it does with the focus:
+    // the window never counts as "not in front" (no pause or mute on focus loss, no background rendering, the fine timer held).
+    bool no_focus = false;
     bool timed = false;                 // --seconds over 0: a run that ends by itself, a test's
+    // --start-check N: the program's start without the game's files (host_main.cpp run_start_check): the window and the
+    // renderer, which may take a software adapter when no graphics card runs it, then N frames drawn and shown.
+    unsigned start_check = 0u;
+    // --software-device 1: the renderer takes only a software device (Direct3D 12 and 11: Microsoft's software adapter; Vulkan: a device of
+    // the processor type); where there is none, the game ends at its start (renderer_choice.h adapter_allowed). A test's run on a computer
+    // with no graphics card slot to spare. Without it a software adapter is taken only by the start check.
+    bool software_device = false;
     unsigned gpu_start_retry = 0u;      // --gpu-start-retry: starts so far that found no graphics memory free
     unsigned started_again = 0u;        // --started-again: starts this run made again before this one
     // --start-again-of <id>-<time> (Windows): the process this start takes over from, by its id and creation time.
@@ -183,7 +176,8 @@ inline constexpr unsigned kResolutionStepsPictures = 120u;
 // A player's own start: shown, not timed, and with no host extension (a test driver's). Only it may choose settings for
 // the player (the first start's measured height).
 [[nodiscard]] inline bool ordinary_start() noexcept {
-    return !g_launch_args.started_hidden && !g_launch_args.timed && g_launch_args.extensions.empty();
+    return !g_launch_args.started_hidden && !g_launch_args.timed && g_launch_args.start_check == 0u &&
+           g_launch_args.extensions.empty();
 }
 
 // Whether this run records any of `what` (Diagnostic bits).

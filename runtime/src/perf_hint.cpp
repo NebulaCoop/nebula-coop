@@ -2,6 +2,9 @@
 #include "galaxy/perf_hint.h"
 #include "galaxy/game_step.h"
 
+#include <atomic>
+#include <mutex>
+
 #if defined(_WIN32)
 #include "galaxy/windows_power.h"
 
@@ -21,6 +24,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <mutex>
 #include <vector>
 #endif
@@ -34,6 +38,48 @@
 #endif
 
 namespace galaxy::host {
+
+namespace {
+
+// The frame threads' work processor time (WorkCpu), on every platform: a fixed table, so a thread marking its own work never
+// meets a list that grows under it. Threads are added from the threads themselves, at their start.
+constexpr std::size_t kWorkSlots = 8;
+struct WorkSlot {
+    const char* name = nullptr;
+    WorkCpu work;
+};
+WorkSlot g_work[kWorkSlots];
+std::atomic<std::size_t> g_work_count{0};
+std::mutex g_work_mutex;
+thread_local int t_work = -1;  // the calling thread's slot; -1: not a frame thread
+
+void work_register(const char* name) noexcept {
+    std::lock_guard<std::mutex> lock(g_work_mutex);
+    const std::size_t n = g_work_count.load(std::memory_order_relaxed);
+    if (n >= kWorkSlots || t_work >= 0) return;
+    g_work[n].name = name;
+    t_work = static_cast<int>(n);
+    g_work_count.store(n + 1, std::memory_order_release);
+}
+
+// The calling frame thread's mark of work (on) or of waiting, with its own processor clock; nothing where the clock is not known.
+void work_mark(bool on) noexcept {
+    if (t_work < 0) return;
+    std::uint64_t units = 0;
+    if (!thread_cpu_units(units)) return;
+    g_work[static_cast<std::size_t>(t_work)].work.mark(units, on);
+}
+
+}  // namespace
+
+std::size_t perf_hint_work_cpu(galaxy::ThreadCpuSample* out, std::size_t capacity) noexcept {
+    if (!process_cpu_known()) return 0;
+    const std::size_t n = std::min(capacity, g_work_count.load(std::memory_order_acquire));
+    for (std::size_t i = 0; i < n; ++i) {
+        out[i] = {g_work[i].name, g_work[i].work.total()};
+    }
+    return n;
+}
 
 #if !defined(_WIN32)
 
@@ -49,13 +95,23 @@ using ThreadClock = clockid_t;
 struct FrameThread {
     ThreadClock clock;
     std::int64_t cpu_ns;
+    const char* name;
+    std::int64_t last_ns = -1;  // its CPU time in the window the last perf_hint_frame_done closed
+    BusyWindow busy{};          // its work's wall time (perf_hint_busy)
 #if defined(__ANDROID__)
-    std::int32_t tid;
+    std::int32_t tid = 0;
 #endif
 };
 
 std::mutex g_mutex;
 std::vector<FrameThread> g_threads;
+// The calling thread's place in g_threads; -1: not a frame thread.
+thread_local int t_index = -1;
+
+std::int64_t steady_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 #if defined(__APPLE__)
 std::int64_t cpu_time(ThreadClock thread) {
@@ -143,7 +199,8 @@ void report(std::int64_t work_ns) {
 
 }  // namespace
 
-void perf_hint_add_current_thread() noexcept {
+void perf_hint_add_current_thread(const char* name) noexcept {
+    work_register(name);
 #if defined(__APPLE__)
     // The frame's threads are what the player waits on: the system's highest class for them, so their timers are not
     // gathered with others' (a frame's wake-up a few milliseconds late is a picture a display refresh late) and, on
@@ -157,12 +214,23 @@ void perf_hint_add_current_thread() noexcept {
     }
 #endif
     std::lock_guard<std::mutex> lock(g_mutex);
+    FrameThread thread{clock, cpu_time(clock), name};
 #if defined(__ANDROID__)
-    g_threads.push_back({clock, cpu_time(clock), static_cast<std::int32_t>(gettid())});
+    thread.tid = static_cast<std::int32_t>(gettid());
     g_session_stale = true;  // made again with every thread at the next report
-#else
-    g_threads.push_back({clock, cpu_time(clock)});
 #endif
+    t_index = static_cast<int>(g_threads.size());
+    g_threads.push_back(thread);
+}
+
+void perf_hint_busy(bool on) noexcept {
+    work_mark(on);
+    if (t_index < 0) {
+        return;
+    }
+    const std::int64_t now = steady_ns();
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_threads[static_cast<std::size_t>(t_index)].busy.mark(now, on);
 }
 
 void perf_hint_set_target(std::int64_t target_ns) noexcept {
@@ -184,14 +252,18 @@ void perf_hint_set_target(std::int64_t target_ns) noexcept {
 }
 
 std::int64_t perf_hint_frame_done() noexcept {
+    work_mark(true);
+    const std::int64_t wall = steady_ns();
     std::lock_guard<std::mutex> lock(g_mutex);
+    if (t_index >= 0) {
+        g_threads[static_cast<std::size_t>(t_index)].busy.mark(wall, true);
+    }
     std::int64_t work = 0;
     for (FrameThread& thread : g_threads) {
         const std::int64_t now = cpu_time(thread.clock);
-        if (now >= 0 && thread.cpu_ns >= 0 && now > thread.cpu_ns) {
-            work = std::max(work, now - thread.cpu_ns);
-        }
+        thread.last_ns = now >= 0 && thread.cpu_ns >= 0 ? std::max<std::int64_t>(now - thread.cpu_ns, 0) : -1;
         thread.cpu_ns = now;
+        work = std::max(work, thread.busy.close(wall));
     }
 #if defined(__ANDROID__)
     if (!g_threads.empty()) {
@@ -201,17 +273,37 @@ std::int64_t perf_hint_frame_done() noexcept {
     return work;
 }
 
+std::size_t perf_hint_last_work(ThreadWork* out, std::size_t capacity) noexcept {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const std::size_t n = std::min(capacity, g_threads.size());
+    for (std::size_t i = 0; i < n; ++i) {
+        out[i] = {g_threads[i].name, g_threads[i].last_ns};
+    }
+    return n;
+}
+
 #else
 
 namespace {
 std::atomic<bool> g_on_battery{false};
 }  // namespace
 
-void perf_hint_add_current_thread() noexcept {}
+void perf_hint_add_current_thread(const char* name) noexcept {
+    work_register(name);
+}
 
 void perf_hint_set_target(std::int64_t) noexcept {}
 
+void perf_hint_busy(bool on) noexcept {
+    work_mark(on);
+}
+
+std::size_t perf_hint_last_work(ThreadWork*, std::size_t) noexcept {
+    return 0;
+}
+
 std::int64_t perf_hint_frame_done() noexcept {
+    work_mark(true);
     // Every two seconds (by the clock, not by the game's frame count): the power state is looked at, a change said once.
     static std::atomic<std::int64_t> next_look{0};
     const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(

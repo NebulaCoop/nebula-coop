@@ -1,9 +1,9 @@
-"""The game's compiled program set. build_programs.py CONTENT WORK [--write]
+"""The game's compiled program set. build_programs.py DISC WORK [--write]
 
-Asks the importer for every program text (`nebula-import programs`), compiles each once in its base form and groups them by
+DISC is a disc image or an emulator's extraction, as `nebula-import import` takes. Asks the importer for every program text
+(`nebula-import programs`), compiles each once in its base form and groups them by
 compiled instructions and stage signature: each group is one program. --write puts one text per group in
 runtime/src/render/programs/ and table.tsv there, which maps every text's hash to its program. Fails if two programs in that folder compile the same, so the set can't grow a duplicate."""
-import hashlib
 import os
 import re
 import subprocess
@@ -31,17 +31,6 @@ def compile_one(job):
     return None
 
 
-# programs.rs shared_taps: TAP_DEFINE, the taps' declarations and each TAP(name, sample).
-TAP_DEFINE = "#if NATIVE_TRACED || NATIVE_PREPASS\n#define TAP(name, sample) (sample)\n#else\n#define TAP(name, sample) name\n#endif\n"
-TAP_DECLARATIONS = re.compile(r"#if !\(NATIVE_TRACED \|\| NATIVE_PREPASS\)\n(?:    const float4 tap\d+ = [^\n]*\n)+#endif\n")
-TAP_USE = re.compile(r"TAP\(tap\d+, (TEX\((\d+)\)\.Sample\(SAMP\(\2\), i\.uv\d+(?: / float2\([0-9., ]*\))?\))\)")
-
-
-def untapped(text):
-    """A text with shared taps as the generator wrote it before (each stage's own sample)."""
-    return TAP_USE.sub(r"\1", TAP_DECLARATIONS.sub("", text.replace(TAP_DEFINE, "")))
-
-
 def key_of(path):
     """Stage signatures and instructions; not the reflection, the hashes or the metadata numbers."""
     text = open(path, encoding="utf-8", errors="replace").read()
@@ -65,12 +54,12 @@ def key_of(path):
 
 
 def main():
-    content, work = sys.argv[1], sys.argv[2]
+    disc, work = sys.argv[1], sys.argv[2]
     write = "--write" in sys.argv[3:]
     texts = os.path.join(work, "texts")
     ll = os.path.join(work, "ll")
     os.makedirs(ll, exist_ok=True)
-    subprocess.run([IMPORT, "programs", content, texts], check=True)
+    subprocess.run([IMPORT, "programs", disc, texts], check=True)
     names = sorted(n[:-5] for n in os.listdir(texts) if n.endswith(".hlsl"))
     jobs = [(os.path.join(texts, n + ".hlsl"), os.path.join(ll, n + ".ll"), n[0]) for n in names]
     with ThreadPoolExecutor(int(os.environ.get("JOBS", "4"))) as pool:
@@ -80,43 +69,20 @@ def main():
     if failed:
         print(len(failed), "failed of", len(jobs))
         return 1
-    # A text with shared taps is grouped as the same text without them would be (its forms other than the raster ones
-    # compile that text), and named by that text for the choice of a group's program (the first name): a group keeps
-    # the program it had, with taps or without, and so its ray-tracing forms.
-    tapped = {}
-    named = {}
-    for n in names:
-        with open(os.path.join(texts, n + ".hlsl"), encoding="utf-8", errors="replace", newline="") as f:
-            text = f.read().replace("\r\n", "\n")
-        if "#define TAP(" in text:
-            plain = os.path.join(ll, n + ".untapped.hlsl")
-            old = untapped(text)
-            if not os.path.exists(plain) or open(plain, encoding="utf-8", newline="").read() != old:
-                with open(plain, "w", encoding="utf-8", newline="") as f:
-                    f.write(old)
-            tapped[n] = (plain, os.path.join(ll, n + ".untapped.ll"), n[0])
-            # programs.rs text_hash: the first 64 bits of the SHA-1, little-endian.
-            digest = hashlib.sha1(old.encode()).digest()
-            named[n] = n[0] + "%016x" % int.from_bytes(digest[:8], "little")
-    with ThreadPoolExecutor(int(os.environ.get("JOBS", "4"))) as pool:
-        failed = [r for r in pool.map(compile_one, tapped.values()) if r]
-    if failed:
-        print("FAILED", failed[0])
-        return 1
     groups = {}
     for n in names:
-        # A text whose base form leaves out what other forms keep (programs.rs stage_lines: an alpha test only ray
-        # tracing's and the per-sample forms keep) stays its own program, so those forms stay its own.
+        # A text whose base form leaves out what its per-sample form keeps (programs.rs alpha_test_lines: an alpha test
+        # its own references always pass) stays its own program, so that form stays its own.
         with open(os.path.join(texts, n + ".hlsl"), encoding="utf-8", errors="replace") as f:
             text = f.read()
-        own = n if "#if NATIVE_TRACED || NATIVE_PREPASS || NATIVE_SAMPLE" in text else None
-        listing = tapped[n][1] if n in tapped else os.path.join(ll, n + ".ll")
+        own = n if "#if NATIVE_SAMPLE" in text else None
+        listing = os.path.join(ll, n + ".ll")
         groups.setdefault((n[0], key_of(listing), own), []).append(n)
     vertex = sum(1 for k in groups if k[0] == "v")
     pixel = sum(1 for k in groups if k[0] == "p")
     group_of = {}
     def program(members):
-        return min(members, key=lambda m: named.get(m, m))
+        return min(members)
 
     for (stage, _, _), members in groups.items():
         for m in members:

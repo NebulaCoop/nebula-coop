@@ -1,4 +1,5 @@
 #include "Game/Util/StarPointerUtil.hpp"
+#include "Game/LiveActor/AllLiveActorGroup.hpp"
 #include "Game/LiveActor/LiveActor.hpp"
 #include "Game/Map/CollisionParts.hpp"
 #include "Game/MapObj/StarPieceDirector.hpp"
@@ -18,9 +19,12 @@
 #include "Game/Util/DemoUtil.hpp"
 #include "Game/Util/PlayerInputUtil.hpp"
 #include "Game/Util/JointUtil.hpp"
+#include "Game/Util/LiveActorUtil.hpp"
+#include "Game/Util/MapUtil.hpp"
 #include "Game/Util/MathUtil.hpp"
 #include "Game/Util/ObjUtil.hpp"
 #include "Game/Util/PlayerUtil.hpp"
+#include "Game/Util/ScenePointRay.hpp"
 #include "Game/Util/ScreenUtil.hpp"
 #include "Game/Util/SingletonHolder.hpp"
 #include "Game/System/NebulaFrameClock.hpp"
@@ -564,6 +568,47 @@ namespace MR {
         return &::getStarPointerController(channel)->mWorldPos;
     }
 
+    void calcScenePointUnderScreen(Vec3f* pWorldPos, const Vec2f& rScreenPos, MtxPtr pViewMtx, Mtx44Ptr pProjMtx) {
+        // The view-space direction through the point at a depth of 1, so a target's sphere and its circle on the
+        // screen (StarPointerTarget::calcScreenPositionFromView) agree.
+        Proj3f proj;
+        proj.setInline(pProjMtx);
+        const Vec3f viewDir = ScenePointRay::calcViewDir(rScreenPos.x, rScreenPos.y, MR::getScreenWidth(), MR::getScreenHeight(),
+                                                         proj.mMtx[0][0], proj.mMtx[0][2], proj.mMtx[1][1], proj.mMtx[1][2]);
+
+        // The nearest drawn target's sphere along the ray.
+        f32 nearest = MR::getFarZ();
+        const AllLiveActorGroup* pGroup = MR::getAllLiveActorGroup();
+        for (s32 i = 0; i < pGroup->getPointerTargetNum(); i++) {
+            const LiveActor* pActor = pGroup->getPointerTarget(i);
+            if (MR::isDead(pActor) || MR::isClipped(pActor) || MR::isHiddenModel(pActor)) {
+                continue;
+            }
+
+            const StarPointerTarget* pTarget = pActor->mStarPointerTarget;
+            Vec3f worldPos, viewPos;
+            pTarget->calcPosition(&worldPos);
+            NebulaMtxMultVec(pViewMtx, &worldPos, &viewPos);
+            f32 depth;
+            if (ScenePointRay::calcDepthToSphere(viewDir, viewPos, pTarget->mRadius3d, &depth) && depth < nearest) {
+                nearest = depth;
+            }
+        }
+
+        // The map's collision, up to that depth.
+        Mtx invView;
+        NebulaMtxInverse(pViewMtx, invView);
+        const Vec3f camPos(invView[0][3], invView[1][3], invView[2][3]);
+        Vec3f segment(viewDir.x * nearest, viewDir.y * nearest, viewDir.z * nearest);
+        NebulaMtxMultVecSR(invView, &segment, &segment);
+        if (MR::getFirstPolyOnLineToMap(pWorldPos, nullptr, camPos, segment)) {
+            return;
+        }
+
+        pWorldPos->set(camPos);
+        pWorldPos->add(segment);
+    }
+
     void calcStarPointerWorldPointingPos(Vec3f* pPos, const Vec3f& rPos, s32 channel) {
         f32 camZ = MR::calcCameraDistanceZ(rPos);
         MR::calcWorldPositionFromScreen(pPos, ::getStarPointerController(channel)->mPastInfo.mPos, camZ);
@@ -941,13 +986,6 @@ namespace MR {
 
     bool isStarPointer1PInvalid2PValidMode() {
         return ::getStarPointerOnOffController()->mMode == StarPointerMode_1PInvalid2PValid;
-    }
-
-    void setStarPointerDrawSyncToken() {
-        StarPointerDirector* director = ::getStarPointerDirector();
-        if (director->getStarPointerLayout(PLAYER_1)->mIsPointerValid || director->getStarPointerLayout(PLAYER_2)->mIsPointerValid) {
-            ::getStarPointerDirector()->mPeekZ->setDrawSyncToken();
-        }
     }
 
 };  // namespace MR

@@ -103,7 +103,8 @@ bool is_minimized() noexcept {
 }
 
 bool is_background() noexcept {
-    return s_background.load(std::memory_order_relaxed);
+    // A window started with --no-focus is never "not in front": the game runs as it does with the focus (launch_args.h).
+    return !galaxy::launch_args().no_focus && s_background.load(std::memory_order_relaxed);
 }
 
 namespace {
@@ -478,8 +479,7 @@ RECT windowed_rect_on_monitor(const MonitorInfo& monitor, unsigned width,
     const long frame_h = frame.bottom - frame.top;
     const long work_w = monitor.work_area.right - monitor.work_area.left;
     const long work_h = monitor.work_area.bottom - monitor.work_area.top;
-    const long client_w = std::clamp<long>(static_cast<long>(width), 320, std::max(320L, work_w - frame_w));
-    const long client_h = std::clamp<long>(static_cast<long>(height), 240, std::max(240L, work_h - frame_h));
+    const auto [client_w, client_h] = windowed_client_size(work_w, work_h, frame_w, frame_h, width, height);
     const long outer_w = client_w + frame_w;
     const long outer_h = client_h + frame_h;
     const long left = monitor.work_area.left + std::max(0L, (work_w - outer_w) / 2);
@@ -589,16 +589,18 @@ OpenedWindow open_game_window(WindowOwner& owner, int window_width, int window_h
             return {};
         }
         // Files dropped on the window import (WM_DROPFILES).
+        // --no-focus 1 (a test's visible run): shown without activating, never the foreground window (launch_args.h no_focus).
+        const bool no_focus = !hidden_window && galaxy::launch_args().no_focus;
         const DWORD ex_style =
             hidden_window ? (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
-                          : (WS_EX_APPWINDOW | WS_EX_ACCEPTFILES);
+                          : (WS_EX_APPWINDOW | WS_EX_ACCEPTFILES | (no_focus ? WS_EX_NOACTIVATE : 0u));
         // A second game's window says which it is: "Nebula (2)".
         const unsigned instance = galaxy::game_instance();
         const std::wstring title = instance > 1u ? L"Nebula (" + std::to_wstring(instance) + L")" : std::wstring(L"Nebula");
         opened.window = owner.start({
             kWindowClass, title, window_style, ex_style,
             window_x, window_y, static_cast<int>(outer_width),
-            static_cast<int>(outer_height), !hidden_window, !hidden_window});
+            static_cast<int>(outer_height), !hidden_window, !hidden_window, no_focus});
         if (opened.window == nullptr) {
             std::cerr << "[Renderer] CreateWindow failed\n";
             return {};
@@ -633,6 +635,14 @@ void close_game_window(WindowOwner& owner) noexcept {
 
 void show_window(NativeWindow window) noexcept {
     (void)PostMessageW(window, kUncloakMessage, 0, 0);
+}
+
+bool window_unseen(NativeWindow window) noexcept {
+    if (window == nullptr || !IsWindowVisible(window) || IsIconic(window)) {
+        return true;
+    }
+    DWORD cloaked = 0;
+    return SUCCEEDED(DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked != 0;
 }
 
 bool present_grid(std::int64_t&, std::int64_t&, std::int64_t&, std::int64_t&) noexcept {
@@ -1074,7 +1084,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if (msg == WM_ACTIVATEAPP) {
         // The 1 ms timer only while in front: it costs a laptop's battery for every program.
-        galaxy::host::hold_high_resolution_timer(wp != FALSE);
+        galaxy::host::hold_high_resolution_timer(wp != FALSE || galaxy::launch_args().no_focus);
         // What the game does without focus is the host's to decide (runtime_settings focus_loss): it is woken to look.
         s_background.store(wp == FALSE, std::memory_order_relaxed);
         wake_main_thread();
@@ -1160,9 +1170,21 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return msg == WM_QUERYENDSESSION ? TRUE : 0;
     }
     if (msg == WM_CLOSE) {
+        // Closing asks the game to end; it does not end the window. The window outlives the swap chain and surface made
+        // for it: it is destroyed by close_game_window after the renderer has let both go, or with the process (as the
+        // SDL hosts do). Destroyed here, under frames still in flight, a Vulkan queue could wait for good on an image
+        // the presentation engine never hands back, and the frames' probes and pictures were lost (ledger P-322). The
+        // player sees it go at once: it is hidden, and the input it held is let go.
         save_native_settings_now();
         host_window::quit_request.store(true, std::memory_order_release);
-        DestroyWindow(hwnd);
+        wake_main_thread();
+        raw_mouse_detach(hwnd);
+        invalidate_pointer_focus_once();
+        clear_pointer_buttons();
+        host_window::pointer_hwnd.store(0u, std::memory_order_release);
+        s_system_menu_active.store(false, std::memory_order_release);
+        host_window::move_size_active.store(false, std::memory_order_release);
+        ShowWindow(hwnd, SW_HIDE);
         return 0;
     }
     if (msg == WM_DESTROY) {
@@ -1825,6 +1847,11 @@ unsigned touch_pointer_state() noexcept {
 void note_touch_target(std::uint32_t) noexcept {}
 
 bool touch_target_at(float, float) noexcept {
+    return false;
+}
+
+// Windows gives a touch screen's fingers to the window as the mouse: the menus take them as one.
+bool menu_finger(MenuFinger&) noexcept {
     return false;
 }
 

@@ -49,17 +49,19 @@ extern std::atomic<bool> quit_request;
 extern std::atomic<std::uint64_t> pending_resize_extent;
 // Set by the overlay when Match Output is switched on, so the render thread derives the scale for the current window.
 // The window's drawing surface is withdrawn (Android: the activity out of sight, or a fold moving it to the other
-// display). The platform sets surface_withdrawn and then takes surface_use, which the renderer holds from acquiring a
+// display; never on Windows, where closing hides the window and close_game_window destroys it after the renderer let its
+// swap chain and surface go). The platform sets surface_withdrawn and then takes surface_use, which the renderer holds from acquiring a
 // swap-chain image until it is presented, so once the platform holds it no present uses the surface. The renderer
 // drops its swap chain and surface at its next frame, presents nothing until surface_withdrawn is cleared, then
-// recreates both. Windows never withdraws its window's surface.
+// recreates both.
 extern std::atomic<bool> surface_withdrawn;
 extern std::timed_mutex surface_use;
 
 // Saves changed settings; false (kept dirty for a retry) when a file could not be written.
 bool flush_native_settings_if_dirty();
-// Takes a config.ini that Nebula Settings changed while the game runs.
-void poll_render_config_file();
+// Starts the watch for a config.ini that Nebula Settings changes while the game runs (on the settings' own thread;
+// the caller only starts it, once).
+void watch_render_config_file();
 // A hidden start (launch_args.h started_hidden): the window is never shown.
 [[nodiscard]] bool hidden_window_mode_enabled();
 
@@ -75,6 +77,10 @@ struct OpenedWindow {
 void close_game_window(WindowOwner& owner) noexcept;
 // The window's first picture is presented: the player sees the window from now (open_game_window). Any thread.
 void show_window(NativeWindow window) noexcept;
+// A shown window the player cannot see now: hidden, minimised or cloaked (Windows), hidden or minimised (SDL), not
+// visible on any screen (macOS). The Vulkan and Metal renderers skip acquiring and presenting while it holds, as
+// Direct3D does on DXGI_STATUS_OCCLUDED; they ask at most every 100 ms. Any thread.
+[[nodiscard]] bool window_unseen(NativeWindow window) noexcept;
 // The refresh rate of the display the window is on, or 0 when unknown.
 [[nodiscard]] double display_refresh_hz(NativeWindow window) noexcept;
 // The display's vblanks: the latest and the interval between them, on galaxy::qpc_now()'s clock (Windows: timed on
@@ -93,6 +99,10 @@ void set_state_wake(void* event) noexcept;
 void native_settings_present();
 // Opens the settings menu on that page (a tab's number), its first row chosen.
 void open_native_settings(unsigned page);
+// The settings menu on MODS, whose question then asks about the first mod that is on with code the player hasn't
+// answered for (one imported outside the game: Android's launcher, the mods folder). False, and nothing opens, when
+// none waits.
+bool open_native_settings_for_waiting_code();
 // The settings menu on SYSTEM with the benchmark's results window for `result` (a result file, or the results folder
 // for its newest): the start after a benchmark.
 void open_native_settings_results(const std::filesystem::path& result);
@@ -158,7 +168,6 @@ void start_again(Restart kind);
 // Ends the game as the window's close does (the settings' Update on Windows, once Nebula Setup has started).
 void quit_game() noexcept;
 
-extern std::atomic<bool> ray_tracing_offered;  // the RAY TRACING row is offered
 extern std::atomic<bool> rtx_adapter;          // the session's GPU is an NVIDIA RTX (DLSS)
 [[nodiscard]] float upscaler_render_fraction(const RenderConfig& render, unsigned output_width, unsigned output_height);
 void save_native_settings_now();

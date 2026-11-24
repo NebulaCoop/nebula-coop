@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // RendererD3D11's scene target (renderer_d3d11.h): its sets and passes, clears, resolves, the target passes and the
-// pictures draws sample, copies of the frame, the output and wide scenes, where the renderer's parts meet the frame,
-// screen probes and the test captures.
+// pictures draws sample, copies of the frame, the output and wide scenes, where the renderer's parts meet the frame
+// and the test captures.
 //
 // Direct3D 11 has no render passes: the scene pass is the scene target bound with its draws recorded (gpu::Encoder),
 // replayed when it ends or the renderer draws in it (flush_draws). Every call here that reads or writes a target itself
@@ -19,6 +19,7 @@
 #include <nebula_frame_list.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -60,41 +61,6 @@ bool ensure_staging(d3d11::ComPtr<ID3D11Texture2D>& staging, unsigned width, uns
     desc.Usage = D3D11_USAGE_STAGING;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     return SUCCEEDED(d3d11::Context::get().device()->CreateTexture2D(&desc, nullptr, &staging));
-}
-
-// The staging copy's pixels as RGBA8 rows (a 10-bit picture converted), or empty when it cannot be read.
-std::vector<std::uint8_t> read_staging(ID3D11DeviceContext1* context, ID3D11Texture2D* staging, unsigned width, unsigned height) {
-    std::vector<std::uint8_t> rgba;
-    D3D11_TEXTURE2D_DESC desc{};
-    staging->GetDesc(&desc);
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (FAILED(context->Map(staging, 0u, D3D11_MAP_READ, 0u, &mapped))) {
-        return rgba;
-    }
-    rgba.resize(static_cast<std::size_t>(width) * height * 4u);
-    const auto* rows = static_cast<const std::uint8_t*>(mapped.pData);
-    if (desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
-        ten_bit_to_rgba8(rows, rgba.data(), width, height, mapped.RowPitch, width * 4u);
-    } else {
-        for (unsigned y = 0; y < height; ++y) {
-            std::memcpy(rgba.data() + static_cast<std::size_t>(y) * width * 4u, rows + static_cast<std::size_t>(y) * mapped.RowPitch,
-                        static_cast<std::size_t>(width) * 4u);
-        }
-    }
-    context->Unmap(staging, 0u);
-    return rgba;
-}
-
-// RGBA8 rows written as a binary PPM off the render thread, by the writer finish_pictures waits for
-// (renderer_common.h).
-void write_rgba_ppm_async(std::string path, const std::vector<std::uint8_t>& rgba, unsigned width, unsigned height) {
-    std::vector<std::uint8_t> rgb(static_cast<std::size_t>(width) * height * 3u);
-    for (std::size_t i = 0, n = rgb.size() / 3u; i < n; ++i) {
-        rgb[i * 3u] = rgba[i * 4u];
-        rgb[i * 3u + 1u] = rgba[i * 4u + 1u];
-        rgb[i * 3u + 2u] = rgba[i * 4u + 2u];
-    }
-    write_ppm_async(std::move(path), std::move(rgb), width, height);
 }
 
 }  // namespace
@@ -601,7 +567,17 @@ bool RendererD3D11::publish_picture(std::uint64_t key, std::uint32_t width, std:
             picture.sampled =
                 d3d11::Context::get().create_texture(whole.width, whole.height, 1u, whole.format, kTargetBinds, "picture channels");
             if (!picture.sampled) {
-                throw std::runtime_error("a picture's channel copy could not be made");
+                // Not published this time (P-062): the next publish tries again; a removed device is a device loss.
+                if (gpu::device_removed(d3d11::Context::get().device())) {
+                    allocation_failed("a picture's channel copy");
+                }
+                drop_picture(picture, textures);
+                pictures_.erase(key);
+                static std::atomic<unsigned> reported{0u};
+                if (reported.fetch_add(1u, std::memory_order_relaxed) < 8u) {
+                    std::cerr << "[picture] a channel copy " << width << 'x' << height << " could not be made; not published\n";
+                }
+                return false;
             }
         }
         conversion_draw(whole.view.Get(), *picture.sampled, whole.width, whole.height, channels, 0.0f, 0.0f, 1.0f, 1.0f);
@@ -714,13 +690,14 @@ void RendererD3D11::begin_scene_rectangle() {
                                      ::galaxy::diagnosing(::galaxy::kDiagnoseResolutionSteps));
         scene_rectangle_ = dynamic_resolution_.update(cfg.dynamic_resolution && dynamic_resolution_offered(), scene_extent_,
                                                       kResolutionSixteenths[kResolutionStepCount - 1u],
-                                                      native_scene_gpu_ema_ms_, resolution_budget_ms(rate, display_refresh_hz_));
+                                                      frame_gpu_.scene_ema_ms(), resolution_budget_ms(rate, display_refresh_hz_));
         if (::galaxy::diagnosing(::galaxy::kDiagnoseResolutionSteps | ::galaxy::kDiagnosePresentStats) &&
             dynamic_resolution_.sixteenths() != before) {
-            std::fprintf(stderr, "[dynres] frame %llu: %u/16, %ux%u of %ux%u (floor %u/16)\n",
+            // With the samplers made so far, so what a step adds shows.
+            std::fprintf(stderr, "[dynres] frame %llu: %u/16, %ux%u of %ux%u (floor %u/16), samplers %zu\n",
                          static_cast<unsigned long long>(frame_index_), dynamic_resolution_.sixteenths(),
                          scene_rectangle_.width, scene_rectangle_.height, scene_extent_.width, scene_extent_.height,
-                         dynamic_resolution_.lowest_sixteenths());
+                         dynamic_resolution_.lowest_sixteenths(), samplers_.size());
         }
     }
     if (!(scene_rectangle_.width <= frame_extent_.width && scene_rectangle_.height <= frame_extent_.height) ||
@@ -842,7 +819,7 @@ gpu::TextureRef RendererD3D11::swap_scene_color(gpu::TextureRef fresh) {
         fresh = d3d11::Context::get().create_texture(picture.width, picture.height, 1u, picture.format, kTargetBinds,
                                                      "scene target color");
         if (!fresh) {
-            throw std::runtime_error("scene target colour unavailable");
+            allocation_failed("the scene target colour");
         }
     }
     gpu::TextureRef handed = std::move(scene_.color);
@@ -1113,7 +1090,7 @@ bool RendererD3D11::begin_wide_scene(bool wanted, const SceneClearValues* initia
     return true;
 }
 
-void RendererD3D11::end_wide_scene(unsigned) {
+void RendererD3D11::end_wide_scene() {
     if (!scene_.wide) {
         return;
     }
@@ -1156,103 +1133,6 @@ void RendererD3D11::end_wide_scene(unsigned) {
     bind_scene();
 }
 
-// ---- screen probes ----
-
-bool RendererD3D11::record_screen_probes(std::size_t slot, std::span<const ScreenProbe> probes, bool) {
-    if (slot >= probe_slots_.size()) {
-        probe_slots_.resize(slot + 1u);
-    }
-    ProbeSlot& out = probe_slots_[slot];
-    if (out.fence != 0u || probes.empty() || !scene_.depth) {
-        return false;
-    }
-    const auto count = static_cast<std::uint32_t>(probes.size());
-    ID3D11Device1* const device = d3d11::Context::get().device();
-    if (out.capacity < count) {
-        out = ProbeSlot{};
-        D3D11_BUFFER_DESC desc{};
-        desc.ByteWidth = count * sizeof(ScreenProbePixel);
-        desc.Usage = D3D11_USAGE_DYNAMIC;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-        desc.StructureByteStride = sizeof(ScreenProbePixel);
-        bool made = SUCCEEDED(device->CreateBuffer(&desc, nullptr, &out.points)) &&
-                    SUCCEEDED(device->CreateShaderResourceView(out.points.Get(), nullptr, &out.points_view));
-        desc.ByteWidth = count * sizeof(float);
-        desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-        desc.CPUAccessFlags = 0u;
-        desc.StructureByteStride = sizeof(float);
-        made = made && SUCCEEDED(device->CreateBuffer(&desc, nullptr, &out.values)) &&
-               SUCCEEDED(device->CreateUnorderedAccessView(out.values.Get(), nullptr, &out.values_view));
-        desc.Usage = D3D11_USAGE_STAGING;
-        desc.BindFlags = 0u;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        desc.MiscFlags = 0u;
-        desc.StructureByteStride = 0u;
-        made = made && SUCCEEDED(device->CreateBuffer(&desc, nullptr, &out.readback));
-        if (!made) {
-            out = ProbeSlot{};
-            throw std::runtime_error("the screen probe buffers could not be made");
-        }
-        out.capacity = count;
-    }
-    ID3D11DeviceContext1* const ctx = context();
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (FAILED(ctx->Map(out.points.Get(), 0u, D3D11_MAP_WRITE_DISCARD, 0u, &mapped))) {
-        return false;
-    }
-    for (std::uint32_t i = 0; i < count; ++i) {
-        const ScreenProbePixel pixel = screen_probe_pixel(probes[i], scene_map_);
-        std::memcpy(static_cast<std::uint8_t*>(mapped.pData) + i * sizeof(ScreenProbePixel), &pixel, sizeof(pixel));
-    }
-    ctx->Unmap(out.points.Get(), 0u);
-
-    end_scene_pass();
-    resolve_scene_depth();  // depth alone
-    if (SUCCEEDED(ctx->Map(utility_constants_.Get(), 0u, D3D11_MAP_WRITE_DISCARD, 0u, &mapped))) {
-        std::memcpy(mapped.pData, &count, sizeof(count));
-        ctx->Unmap(utility_constants_.Get(), 0u);
-    }
-    ID3D11Buffer* const constants = utility_constants_.Get();
-    ID3D11ShaderResourceView* const views[2] = {scene_.depth->view.Get(), out.points_view.Get()};
-    ID3D11UnorderedAccessView* const values = out.values_view.Get();
-    ctx->CSSetShader(probe_cs_.Get(), nullptr, 0u);
-    ctx->CSSetConstantBuffers(0u, 1u, &constants);
-    ctx->CSSetShaderResources(0u, 2u, views);
-    ctx->CSSetUnorderedAccessViews(0u, 1u, &values, nullptr);
-    ctx->Dispatch((count + kScreenProbeGroup - 1u) / kScreenProbeGroup, 1u, 1u);
-    ID3D11ShaderResourceView* const no_views[2] = {};
-    ID3D11UnorderedAccessView* const no_values = nullptr;
-    ctx->CSSetShaderResources(0u, 2u, no_views);
-    ctx->CSSetUnorderedAccessViews(0u, 1u, &no_values, nullptr);
-    const D3D11_BOX box{0u, 0u, 0u, count * static_cast<UINT>(sizeof(float)), 1u, 1u};
-    ctx->CopySubresourceRegion(out.readback.Get(), 0u, 0u, 0u, 0u, out.values.Get(), 0u, &box);
-    out.count = count;
-    out.fence = kProbesInFrame;  // fenced at end_frame
-    return true;
-}
-
-const float* RendererD3D11::screen_probes_finished(std::size_t slot) {
-    if (slot >= probe_slots_.size()) {
-        return nullptr;
-    }
-    ProbeSlot& out = probe_slots_[slot];
-    if (out.fence == 0u || out.fence == kProbesInFrame || completed_fence_value() < out.fence) {
-        return nullptr;
-    }
-    out.fence = 0u;
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (FAILED(context()->Map(out.readback.Get(), 0u, D3D11_MAP_READ, 0u, &mapped))) {
-        return nullptr;
-    }
-    const auto* values = static_cast<const float*>(mapped.pData);
-    out.answers.assign(values, values + out.count);
-    context()->Unmap(out.readback.Get(), 0u);
-    return out.answers.data();
-}
-
 // ---- test captures ----
 
 void RendererD3D11::finish_pictures() {
@@ -1260,65 +1140,32 @@ void RendererD3D11::finish_pictures() {
     if (context.ready()) {
         // A copy recorded since the last frame's end is fenced here, as that end would have fenced it.
         const std::uint64_t fence = context.signal();
-        if (scene_capture_.staging && scene_capture_.fence == 0u && !scene_capture_pending_path_.empty()) {
-            scene_capture_.fence = fence;
-        }
-        if (backbuffer_capture_.staging && backbuffer_capture_.fence == 0u && !backbuffer_capture_pending_path_.empty()) {
-            backbuffer_capture_.fence = fence;
-        }
-        if (display_capture_.staging && display_capture_.fence == 0u && !display_capture_pending_path_.empty()) {
-            display_capture_.fence = fence;
-        }
+        captures_.submitted(fence);
         (void)context.wait(fence);
     }
-    debug_log_readback();
-    debug_log_backbuffer_readback();  // the display picture's too
+    debug_log_backbuffer_readback();
     wait_picture_files();
 }
 
-void RendererD3D11::set_debug_capture_paths(std::string scene_ppm_path, std::string backbuffer_ppm_path) {
-    scene_capture_path_ = std::move(scene_ppm_path);
+void RendererD3D11::set_debug_capture_paths(std::string backbuffer_ppm_path) {
     backbuffer_capture_path_ = std::move(backbuffer_ppm_path);
 }
 
-bool RendererD3D11::debug_copy_scene_to_readback() {
-    debug_log_readback();
-    if (scene_capture_path_.empty() || !scene_capture_pending_path_.empty() || !scene_.color ||
-        scene_.color->format != draw_layout_.scene_color) {
-        return false;
+d3d11::ComPtr<ID3D11Texture2D> RendererD3D11::capture_staging(unsigned width, unsigned height, DXGI_FORMAT format) {
+    d3d11::ComPtr<ID3D11Texture2D> staging = captures_.spare([&](const d3d11::ComPtr<ID3D11Texture2D>& kept) {
+        D3D11_TEXTURE2D_DESC had{};
+        kept->GetDesc(&had);
+        return had.Width == width && had.Height == height && had.Format == format;
+    });
+    if (!staging && !ensure_staging(staging, width, height, format)) {
+        std::cerr << "[capture] no readback for the " << width << 'x' << height << " picture: the picture is not written\n";
+        return {};
     }
-    const unsigned w = std::min(scene_map_.width, scene_.color->width);
-    const unsigned h = std::min(scene_map_.height, scene_.color->height);
-    end_scene_pass();
-    resolve_scene_color();
-    if (!ensure_staging(scene_capture_.staging, w, h, scene_.color->format)) {
-        return false;
-    }
-    const D3D11_BOX box{0u, 0u, 0u, w, h, 1u};
-    context()->CopySubresourceRegion(scene_capture_.staging.Get(), 0u, 0u, 0u, 0u, scene_.color->texture.Get(), 0u, &box);
-    scene_capture_.fence = 0u;
-    scene_capture_pending_path_ = scene_capture_path_;
-    scene_capture_width_ = w;
-    scene_capture_height_ = h;
-    return true;
-}
-
-void RendererD3D11::debug_log_readback() {
-    if (scene_capture_pending_path_.empty() || scene_capture_.fence == 0u || completed_fence_value() < scene_capture_.fence) {
-        return;
-    }
-    const std::vector<std::uint8_t> rgba =
-        read_staging(context(), scene_capture_.staging.Get(), scene_capture_width_, scene_capture_height_);
-    if (!rgba.empty()) {
-        write_rgba_ppm_async(std::move(scene_capture_pending_path_), rgba, scene_capture_width_, scene_capture_height_);
-    }
-    scene_capture_pending_path_.clear();
-    scene_capture_.fence = 0u;
+    return staging;
 }
 
 bool RendererD3D11::debug_copy_selected_display_to_readback(const DisplayTexture& source) {
-    if (backbuffer_capture_path_.empty() || !display_capture_pending_path_.empty() || !source.texture || source.width == 0u ||
-        source.height == 0u) {
+    if (backbuffer_capture_path_.empty() || !source.texture || source.width == 0u || source.height == 0u) {
         return false;
     }
     const d3d11::Texture& texture = *source.texture;
@@ -1327,45 +1174,29 @@ bool RendererD3D11::debug_copy_selected_display_to_readback(const DisplayTexture
         texture.width < source.width || texture.height < source.height || texture.samples != 1u) {
         return false;
     }
-    if (!ensure_staging(display_capture_.staging, source.width, source.height, texture.format)) {
+    d3d11::ComPtr<ID3D11Texture2D> staging = capture_staging(source.width, source.height, texture.format);
+    if (!staging) {
         return false;
     }
     end_scene_pass();
     const D3D11_BOX box{0u, 0u, 0u, source.width, source.height, 1u};
-    context()->CopySubresourceRegion(display_capture_.staging.Get(), 0u, 0u, 0u, 0u, texture.texture.Get(), 0u, &box);
-    display_capture_.fence = 0u;
-    display_capture_pending_path_ = backbuffer_capture_path_ + ".display.ppm";
-    display_capture_width_ = source.width;
-    display_capture_height_ = source.height;
+    context()->CopySubresourceRegion(staging.Get(), 0u, 0u, 0u, 0u, texture.texture.Get(), 0u, &box);
+    captures_.recorded({std::move(staging), 0u, backbuffer_capture_path_ + ".display.ppm", source.width, source.height, 0u,
+                        texture.format == DXGI_FORMAT_R10G10B10A2_UNORM ? Captures::Form::TenBit : Captures::Form::Rgba8});
     return true;
 }
 
-void RendererD3D11::debug_log_display_readback() {
-    if (display_capture_pending_path_.empty() || display_capture_.fence == 0u || completed_fence_value() < display_capture_.fence) {
-        return;
-    }
-    const std::vector<std::uint8_t> rgba =
-        read_staging(context(), display_capture_.staging.Get(), display_capture_width_, display_capture_height_);
-    if (!rgba.empty()) {
-        write_rgba_ppm_async(std::move(display_capture_pending_path_), rgba, display_capture_width_, display_capture_height_);
-    }
-    display_capture_pending_path_.clear();
-    display_capture_.fence = 0u;
-}
-
 void RendererD3D11::debug_log_backbuffer_readback() {
-    debug_log_display_readback();
-    if (backbuffer_capture_pending_path_.empty() || backbuffer_capture_.fence == 0u ||
-        completed_fence_value() < backbuffer_capture_.fence) {
-        return;
-    }
-    const std::vector<std::uint8_t> rgba =
-        read_staging(context(), backbuffer_capture_.staging.Get(), backbuffer_capture_width_, backbuffer_capture_height_);
-    if (!rgba.empty()) {
-        write_rgba_ppm_async(std::move(backbuffer_capture_pending_path_), rgba, backbuffer_capture_width_, backbuffer_capture_height_);
-    }
-    backbuffer_capture_pending_path_.clear();
-    backbuffer_capture_.fence = 0u;
+    captures_.finished(completed_fence_value(), [this](Captures::Capture& capture) {
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(context()->Map(capture.readback.Get(), 0u, D3D11_MAP_READ, 0u, &mapped))) {
+            std::cerr << "[capture] the picture's copy could not be read: " << capture.path << '\n';
+            return;
+        }
+        write_capture_rows(std::move(capture.path), static_cast<const std::uint8_t*>(mapped.pData), capture.width,
+                           capture.height, mapped.RowPitch, capture.form);
+        context()->Unmap(capture.readback.Get(), 0u);
+    });
 }
 
 }  // namespace galaxy::render

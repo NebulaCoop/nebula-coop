@@ -9,7 +9,7 @@
 #include <algorithm>
 #include <volk.h>
 
-#include "galaxy/render/rt_caps.h"
+#include "galaxy/render/video_memory_reading.h"
 #include "galaxy/render/vk/device_quirks_vk.h"
 #include "galaxy/render/vk/shader_compile_vk.h"
 
@@ -106,12 +106,11 @@ public:
     // `chosen_gpu`: the GPU chosen in Nebula Settings (RenderConfig::gpu, gpu_identity), taken first when present.
     // A discrete GPU comes first otherwise. `validation` (--gpu-validation) loads the
     // Khronos validation layer when present. `create_surface`, when given, makes the window's surface once the
-    // instance exists (returned in `surface`); the device chosen then presents to it. `ray_tracing`: the device is made
-    // with what the tracer needs, where it has it (rt_caps()).
+    // instance exists (returned in `surface`); the device chosen then presents to it.
     bool initialize(const std::string& chosen_gpu, bool validation,
                     std::vector<const char*> instance_extensions,
                     const std::function<VkSurfaceKHR(VkInstance)>& create_surface = {},
-                    VkSurfaceKHR* surface = nullptr, bool ray_tracing = false);
+                    VkSurfaceKHR* surface = nullptr);
     void shutdown() noexcept;
     [[nodiscard]] bool bc_textures() const noexcept { return bc_textures_; }
     [[nodiscard]] bool astc_textures() const noexcept { return astc_textures_; }
@@ -183,6 +182,9 @@ public:
     [[nodiscard]] bool display_timing() const noexcept { return display_timing_; }
     // VK_KHR_present_wait with VK_KHR_present_id, enabled: vkWaitForPresentKHR waits until a presented frame is on the screen.
     [[nodiscard]] bool present_wait() const noexcept { return present_wait_; }
+    // VK_EXT_present_timing with present id 2 and present wait 2 (and surface capabilities 2 on the instance), enabled:
+    // a swap chain made for it reports when each present reached the display (renderer_vk.cpp report_present_times).
+    [[nodiscard]] bool present_timing() const noexcept { return present_timing_; }
     // VK_EXT_swapchain_colorspace on the instance (the surface can list HDR10 formats) and VK_EXT_hdr_metadata on the device
     // (vkSetHdrMetadataEXT), each where it is here.
     [[nodiscard]] bool swapchain_colorspace() const noexcept { return swapchain_colorspace_; }
@@ -205,9 +207,6 @@ public:
     // Test only (GALAXY_TEST_DEVICE_LOST): the next submission reports VK_ERROR_DEVICE_LOST without reaching the driver, as a
     // lost device would; no API removes a Vulkan device. The fault report is skipped (the device is not lost).
     void simulate_device_loss() noexcept { simulated_loss_.store(true, std::memory_order_release); }
-    // What the device reports for ray tracing (acceleration structures, ray queries, device addresses on Vulkan 1.2),
-    // and whether it was made with them: `enabled` only when initialize was asked to and the device has it all.
-    [[nodiscard]] const RtCaps& rt_caps() const noexcept { return rt_caps_; }
     // VK_EXT_device_fault was enabled (the device has the extension and its feature).
     [[nodiscard]] bool device_fault() const noexcept { return device_fault_; }
     // After VK_ERROR_DEVICE_LOST (`where` names the call): what vkGetDeviceFaultInfoEXT knows, to the log, once per device.
@@ -336,12 +335,12 @@ private:
     bool bc_textures_ = false;
     bool astc_textures_ = false;
     bool memory_budget_ = false;
-    // device_memory_budget's last read of the driver's figures (VK_EXT_memory_budget): at most every 100 ms; render thread.
-    mutable std::int64_t memory_read_ms_ = 0;
-    mutable std::uint64_t memory_usage_ = 0u;
-    mutable std::uint64_t memory_budget_bytes_ = 0u;
+    // device_memory_budget's read of the driver's figures (VK_EXT_memory_budget; video_memory_reading.h); render thread.
+    mutable galaxy::render::VideoMemoryReading memory_reading_;
     bool display_timing_ = false;  // VK_GOOGLE_display_timing
     bool present_wait_ = false;             // VK_KHR_present_wait and present_id, enabled
+    bool present_timing_ = false;           // VK_EXT_present_timing, present_id2 and present_wait2, enabled
+    bool surface_capabilities2_ = false;    // VK_KHR_get_surface_capabilities2 on the instance
     bool pipeline_libraries_ = false;       // VK_EXT_graphics_pipeline_library, enabled, fast linking
     bool present_mode_switching_ = false;   // swapchain maintenance 1, enabled
     bool surface_maintenance_ = false;      // the instance has the surface extension of that kind (decided in initialize)
@@ -350,7 +349,6 @@ private:
     bool hdr_metadata_ = false;             // VK_EXT_hdr_metadata, enabled on the device
     bool host_image_copy_ = false;      // VK_EXT_host_image_copy, enabled, with the layout the textures rest in
     bool device_mapped_memory_ = false; // see device_mapped_memory()
-    RtCaps rt_caps_{};
     bool device_fault_ = false;         // VK_EXT_device_fault, enabled
     bool device_fault_binary_ = false;  // and its vendor binary feature (--diagnostics device-faults)
     std::atomic<bool> fault_reported_{false};

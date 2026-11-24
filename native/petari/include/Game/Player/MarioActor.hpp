@@ -21,6 +21,7 @@ class FireMarioBall;
 class Clip;
 class Model;
 class ModelData;
+struct ModelTexture;
 class PlayerModel;
 class SoundAudible;
 class GameTexture;
@@ -68,6 +69,11 @@ enum PlayerMode {
 extern bool gIsLuigi;  // set by MarioActor::init2 from MR::isPlayerLuigi
 class NebulaPaletteSkin;
 extern s32 gPlayerCharacter;  // set with it: the character played (NebulaCharacters), Mario's or Luigi's or a mod's
+
+// MarioActor::mModHidden's bits (player.set_drawn; luma_player.h LUMA_PLAYER_DRAWN_*).
+const u8 kModHiddenBody = 1;
+const u8 kModHiddenShadow = 2;
+const u8 kModHiddenAttached = 4;
 
 class MarioActor : public LiveActor {
 public:
@@ -695,7 +701,10 @@ public:
     u8 mHiddenByDemo;  // hidden (isAllHidden, the shadow, the silhouette) (?)
     bool mHidden;  // the model is hidden (init2, the black hole)
     bool mMorphHidden;  // the model is hidden during the morph
-    bool mModHidden;  // a plugin hid the model (show_model): no model, shadow or silhouette; he still moves and plays effects
+    // What a mod does not draw of him (player.set_drawn): kModHiddenBody, kModHiddenShadow; kModHiddenAttached is
+    // LumaCore's note that it hid his attachments (the Bee's fur and wings, what he carries, the Rainbow's glow). He
+    // still moves, animates and plays effects; his reflection stays.
+    u8 mModHidden;
     Vec3f mThrowProbePos;  // the throw vector's probe point (updateThrowVector)
     f32 mTakingWobble;  // the taken item's wobble phase
     FixedPosition* mTakingFixedPos;  // the hand point the taken item follows
@@ -809,7 +818,7 @@ public:
     IceStep** mIceSteps;  // the ice form's steps, reused in turn
     u16 mIceStepIndex;  // the next ice step
     FireMarioBall* mFireBalls[3];  // the fire form's balls
-    ResTIMG** mSwapTextures;  // the model's textures (swapTextureInit)
+    const ModelTexture** mSwapTextures;  // the model's textures (swapTextureInit)
     u8 mEyeLidReset;  // the eyelid came from the eye resource: the blink restarts (updateBlink)
     u16 mEyeLidFrame;  // the eyelid texture's frame (swapTexture EyeLid_v)
     const void** mSwapImages;  // the swap textures' images by slot

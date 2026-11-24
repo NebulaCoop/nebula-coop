@@ -206,6 +206,17 @@ VkPipeline AmbientOcclusionVk::apply_pipeline(VkRenderPass pass, unsigned sample
     return made.pipelines[kind];
 }
 
+void AmbientOcclusionVk::prepare_pipelines(const std::array<VkRenderPass, 4>& passes,
+                                           const std::array<VkRenderPass, 4>& wide_passes) {
+    for (unsigned samples_log2 = 0u; samples_log2 < 4u; ++samples_log2) {
+        for (const VkRenderPass pass : {passes[samples_log2], wide_passes[samples_log2]}) {
+            if (pass != VK_NULL_HANDLE) {
+                (void)apply_pipeline(pass, samples_log2);
+            }
+        }
+    }
+}
+
 VkPipeline AmbientOcclusionVk::graphics_pipeline(VkRenderPass pass, unsigned samples_log2, unsigned shader) const {
     const bool multiply = shader != kUpsamplePs;
     const VkDevice device = Context::get().device();
@@ -369,7 +380,7 @@ void AmbientOcclusionVk::draw(VkCommandBuffer commands, VkPipeline pipeline, VkD
 }
 
 bool AmbientOcclusionVk::prepare(VkCommandBuffer commands, const Texture& depth, VkImageLayout depth_layout,
-                                 unsigned part_width, unsigned part_height, unsigned lowest_sixteenths, const RtView& view,
+                                 unsigned part_width, unsigned part_height, unsigned lowest_sixteenths, const SceneView& view,
                                  bool ssao, std::span<const ao::ObjectOccluder> objects, UploadRing& ring,
                                  const SetAllocator& allocate, const StageMarker& mark) {
     if (!ready_) {

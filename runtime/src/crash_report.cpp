@@ -31,7 +31,7 @@ std::int64_t now_ms() noexcept {
 void copy(char* out, std::size_t size, std::string_view text) noexcept {
     if (size == 0u) return;
     const std::size_t n = std::min(size - 1u, text.size());
-    std::memcpy(out, text.data(), n);
+    if (n != 0u) std::memcpy(out, text.data(), n);  // an empty view's data() may be null, which memcpy may not take
     out[n] = '\0';
 }
 
@@ -131,6 +131,11 @@ bool is_gpu_lost(const char* text) noexcept {
     return text != nullptr && gpu_lost(text);
 }
 
+std::string gpu_allocation_failure(std::string_view what, bool device_removed) {
+    return device_removed ? "the graphics device was lost while making " + std::string(what)
+                          : std::string(what) + " could not be made: out of memory";
+}
+
 Report classify(const Facts& facts) noexcept {
     Report r;
     const std::string_view text = facts.text;
@@ -154,8 +159,8 @@ Report classify(const Facts& facts) noexcept {
     }
     if (running && gpu_lost(text)) {
         set(r, "NEB-G01", "The graphics card stopped responding",
-            "Update the graphics driver. If it happens again, turn off ray tracing and frame generation or lower the "
-            "internal resolution.");
+            "Update the graphics driver. If it happens again, turn off frame generation or lower the internal "
+            "resolution.");
         put(r.detail, sizeof(r.detail), "The graphics driver reset the graphics card while the game was running.");
         return r;
     }
@@ -230,8 +235,16 @@ Report classify(const Facts& facts) noexcept {
         break;
     case Facts::Kind::Startup:
         if (text.starts_with("cannot load the game module") || text.starts_with("the game module")) {
-            set(r, "NEB-S03", "Nebula's files do not match",
-                "Install Nebula again, or update it, so that all of its files come from one version.");
+            // The host says which (game_module.h load_failure): the file is not there, or the system refused it.
+            if (has(text, ": the file is not there")) {
+                set(r, "NEB-S03", "A part of Nebula is missing", "Install Nebula again, so that all of its files are there.");
+            } else if (has(text, ": the system refused it")) {
+                set(r, "NEB-S03", "The system refused a part of Nebula",
+                    "Install Nebula again from the original download. If it happens again, report it with the report file.");
+            } else {
+                set(r, "NEB-S03", "Nebula's files do not match",
+                    "Install Nebula again, or update it, so that all of its files come from one version.");
+            }
         } else if (text.starts_with("cannot open") || text.starts_with("cannot map")) {
             set(r, "NEB-S01", "The game content was not found",
                 "Open Nebula Setup and choose Repair.");

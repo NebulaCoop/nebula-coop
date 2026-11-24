@@ -1,4 +1,5 @@
 #include "Game/System/LumaLoader.hpp"
+#include "Game/System/LumaNeeds.hpp"
 
 #include "Game/NameObj/NameObj.hpp"
 #include "Game/System/LumaCore.hpp"
@@ -147,6 +148,9 @@ struct LumaMod {
     // The mods it imported functions from (kind 6), each once, in bind order: told `dependent_gone` when it goes.
     LumaMod** uses;
     u32 useCount;
+    // Every mod it needs, directly or through others, sorted (LumaNeeds.hpp): made when its imports are bound.
+    LumaMod** needsAll;
+    u32 needsAllCount;
     // How it ended (reload.md 3, the takeout.<id> fact) and where its code is now (keep and kept, reload.md 4).
     bool takenOut;      // taken out while the game runs (luma_take_out_request)
     bool startRefused;  // its start answered non-zero
@@ -445,6 +449,7 @@ namespace luma {
             {5, "Object.NoRow", {"found", nullptr}},
             {6, "Object.NotReadable", {"where", nullptr}},
             {7, "Object.Ambiguous", {"where", "found"}},
+            {8, "Call.NotNow", {"found", "need"}},
         };
         const u32 kCodeNoResult = 2;
         const u32 kCodeSkipRefused = 3;
@@ -452,6 +457,7 @@ namespace luma {
         const u32 kCodeObjectNoRow = 5;
         const u32 kCodeObjectNotReadable = 6;
         const u32 kCodeObjectAmbiguous = 7;
+        const u32 kCodeNotNow = 8;
 
         // The row a code says, into pId, and the names of its args (null: positional); false when the code is no row
         // (a bug in the reporting runtime). 100 to 899 are the services' (services/registry.md 12d).
@@ -1079,6 +1085,20 @@ namespace luma {
 
         void noResult(const Function* pFunction, const void* pOwner) { mended(pFunction, pOwner, kCodeNoResult); }
 
+        // A mod's call of a game function not made: a scene object it needs is not there now (luma_hook.h present,
+        // which checks only calls made while a mod's code runs on this thread). Said for that mod (once per function
+        // and need, then counted).
+        void notNow(const Function* pFunction, const char* pNeed) {
+            LumaMod* const pMod = luma::guard::current();
+            if (pMod == nullptr) {
+                return;
+            }
+            char found[256];
+            nebula_snprintf(found, sizeof(found), "%s %s", pFunction->name, pFunction->signature);
+            const char* const args[2] = {found, pNeed};
+            record(pMod, found, 0, kCodeNotNow, args, 2);
+        }
+
         // Classes (docs/modding/reference/lumascript/defining-classes.md).
         s32 apiDefineClass(const LumaMod* pMod, const LumaClassDef* pDef) {
             return refusedWhileGoing(pMod, "define_class") ? -1 : luma::classes::define(pMod, pDef);
@@ -1128,7 +1148,7 @@ namespace luma {
             sizeof(LumaCore), LUMA_API, apiLog, apiFunction, apiFunctionAt, apiHook, apiProceed, apiField, apiSizeOf, apiClassOf, apiIsA, apiService,
             apiGameThread, apiUnhook, apiAlloc, apiFree, apiReport, apiOwnClass, apiAsClass, apiMethod, apiOverrider, apiCallMethod,
             apiKeep, apiKept, apiDefineClass, apiClassData, apiNumber, apiSetNumber, apiTable, apiSetTable, apiMake,
-            apiAliasClass, apiPlacementOf, apiPlacedAt, apiMakeGravity,
+            apiAliasClass, apiPlacementOf, apiPlacedAt, apiMakeGravity, luma::guard::callMod,
         };
 
         // One import: its function (functions and hooks) or number (fields, sizes, classes). False: the game has none,
@@ -1401,6 +1421,7 @@ namespace luma {
             }
             ::free(pMod->granted);
             ::free(pMod->uses);
+            ::free(pMod->needsAll);
             ::free(pMod->hostId);
             ::free(pMod->hostFile);
             ::free(pMod->chosen);
@@ -1433,6 +1454,52 @@ namespace luma {
     }
     u32* modFaulted(LumaMod* pMod) { return &pMod->faulted; }
     u32* modCostSlot(LumaMod* pMod) { return &pMod->costSlot; }
+    const LumaModInfo* modInfo(const LumaMod* pMod) { return pMod->info; }
+
+    // Reads only (the guard's need walk may run in a fault handler that does not resume): the running mods, the waiting
+    // ones and the ones in their grace, whose code can still be on a stack.
+    LumaMod* modAt(uintptr_t pc) {
+        for (u32 i = 0; i < sModCount; i++) {
+            if (pc >= sMods[i]->codeBegin && pc < sMods[i]->codeEnd) {
+                return sMods[i];
+            }
+        }
+        for (u32 i = 0; i < sWaitingCount; i++) {
+            if (pc >= sWaiting[i]->codeBegin && pc < sWaiting[i]->codeEnd) {
+                return sWaiting[i];
+            }
+        }
+        for (LumaMod* pMod = sGone; pMod != nullptr; pMod = pMod->nextGone) {
+            if (pc >= pMod->codeBegin && pc < pMod->codeEnd) {
+                return pMod;
+            }
+        }
+        return nullptr;
+    }
+
+    bool modUses(const LumaMod* pUser, const LumaMod* pUsed) {
+        for (u32 i = 0; pUser != nullptr && i < pUser->useCount; i++) {
+            if (pUser->uses[i] == pUsed) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // By the set made at its bind (LumaNeeds.hpp): a binary search, whatever the shape of the need graph.
+    bool modUsesThrough(const LumaMod* pUser, const LumaMod* pUsed) {
+        return pUser != nullptr && luma::needs::has(pUser->needsAll, pUser->needsAllCount, pUsed);
+    }
+
+    const char* modExportAt(const LumaMod* pMod, uintptr_t function) {
+        const LumaModInfo* const pInfo = pMod->info;
+        for (u32 i = 0; function != 0 && pInfo != nullptr && pInfo->exports != nullptr && i < pInfo->export_count; i++) {
+            if (reinterpret_cast<uintptr_t>(pInfo->exports[i].address) == function && pInfo->exports[i].name != nullptr) {
+                return pInfo->exports[i].name;
+            }
+        }
+        return "";
+    }
 
     void frame() {
         luma::guard::frameEnd();
@@ -1474,8 +1541,33 @@ namespace luma {
                     }
                 }
                 pOther->useCount = kept;
+                pOther->needsAllCount = luma::needs::drop(pOther->needsAll, pOther->needsAllCount, pMod);
             }
             endMod(pMod);
+        }
+
+        // Every mod pMod needs, directly or through others: its `uses` and each one's set (each was bound before it).
+        // Fixed from here: a mod a waiting one needs that goes takes it out of the set (dropMod drops the waiting one).
+        void closeNeeds(LumaMod* pMod) {
+            u32 room = pMod->useCount;
+            for (u32 i = 0; i < pMod->useCount; i++) {
+                room += pMod->uses[i]->needsAllCount;
+            }
+            if (room == 0) {
+                return;
+            }
+            LumaMod** const pAll = static_cast<LumaMod**>(zeroed(room, sizeof(LumaMod*)));
+            if (pAll == nullptr) {
+                NEBULA_PANIC("LumaCore: no memory to keep which mods %s needs", pMod->name);
+            }
+            pMod->needsAllCount = luma::needs::close(
+                pMod->uses, pMod->useCount,
+                [](LumaMod* pUse, LumaMod* const** ppSet, u32* pCount) {
+                    *ppSet = pUse->needsAll;
+                    *pCount = pUse->needsAllCount;
+                },
+                pAll, room);
+            pMod->needsAll = pAll;
         }
 
         // A begun mod that waits for its start and will replace `pFunction` (its hooks are published only at its start):
@@ -1586,6 +1678,7 @@ namespace luma {
         (void)functionCount();
         gSkipRefused = skipRefused;
         gNoResult = noResult;
+        gNotNow = notNow;
         LumaMod* const pMod = new LumaMod();
         copyText(pMod->name, sizeof(pMod->name), pId != nullptr ? pId : "");
         copyText(pMod->file, sizeof(pMod->file), pFile != nullptr ? pFile : "");
@@ -1902,6 +1995,7 @@ namespace luma {
                 *static_cast<s32*>(rImport.slot) = found ? number : -1;
             }
         }
+        closeNeeds(pMod);
         luma::guard::measureForHarness();
         luma::services::modBegin(pMod, pMod->name, order, pMod->granted, pMod->grantedCount);
         if (covers(pInfo, offsetof(LumaModInfo, begin) + sizeof(pInfo->begin)) && pInfo->begin != nullptr) {

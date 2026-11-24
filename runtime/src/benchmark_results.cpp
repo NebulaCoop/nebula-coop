@@ -130,6 +130,9 @@ PartView part_of(const Value& run) {
     part.average_ms = number_at(frame_ms, "average");
     part.p99_ms = number_at(frame_ms, "p99");
     part.stutters = whole_at(summary, "stutters");
+    const Value* steps = summary != nullptr ? summary->find("game_steps") : nullptr;
+    part.steps_per_s = number_at(steps, "average_per_s");
+    part.steps_low_1 = number_at(steps, "low_1_per_s");
     part.limiter = text_at(summary, "limiter");
     part.display_limited = bool_at(summary, "display_limited");
     part.settings = settings_of(run.find("measured_with"));
@@ -145,6 +148,8 @@ PartView part_of(const Value& run) {
             stage.low_1_fps = number_at(&scene, "low_1_fps");
             stage.p99_ms = number_at(scene.find("frame_ms"), "p99");
             stage.stutters = whole_at(&scene, "stutters");
+            stage.steps_per_s = number_at(scene.find("game_steps"), "average_per_s");
+            stage.steps_low_1 = number_at(scene.find("game_steps"), "low_1_per_s");
             stage.settings_held = bool_at(&scene, "settings_held");
             stage.load_ms = number_at(scene.find("load"), "ms");
             stage.gpu_ms = average_of(scene.find("gpu_ms"));
@@ -218,7 +223,6 @@ bool parse_result(std::string_view text, ResultView& out) {
         for (const Value& run : runs->items) {
             const std::string part = text_at(&run, "part");
             if (part == "yours") out.yours = part_of(run);
-            if (part == "standard") out.standard = part_of(run);
             if (const Value* scenes = run.find("scenes"); scenes != nullptr) {
                 for (const Value& scene : scenes->items) {
                     out.gpu_memory_peak_mb = std::max(out.gpu_memory_peak_mb, whole_at(&scene, "gpu_memory_peak_mb"));

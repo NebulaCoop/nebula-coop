@@ -9,6 +9,7 @@
 #include <bit>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <iterator>
@@ -151,6 +152,7 @@ void Registries::initialize(gpu::Device* device, DeviceGate& gate) {
     models_.assign(1u, GpuModel{});
     tables_.clear();
     tables_.resize(1u);
+    released_lists_.clear();
     slot_page_ = {};
     slot_page_used_ = 0u;
     slot_page_capacity_ = 0u;
@@ -348,173 +350,50 @@ bool same_pipeline(const PipelineEntry& entry, const NebulaPipelineDesc& desc, c
     return true;
 }
 
+// A record section's entries, by the stride the file wrote (FRAME-MODEL 2.7.2: a field added at a record's end is
+// read past).
+template <class T>
+const T& entry(const void* file, std::uint32_t offset, std::uint32_t stride, std::uint32_t index) noexcept {
+    return *static_cast<const T*>(nebula_model_entry(file, offset, stride, index));
+}
+template <class T>
+void entries(const void* file, std::uint32_t offset, std::uint32_t stride, std::uint32_t count, std::vector<T>& out) {
+    out.resize(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        out[i] = entry<T>(file, offset, stride, i);
+    }
+}
+
 // What a model's file says, with no device involved.
-void read_model(const void* file, GpuModel& model, std::vector<GpuMesh>& meshes) {
+void read_model(const void* file, const NebulaModelView& view, GpuModel& model, std::vector<GpuMesh>& meshes) {
     const auto& header = *static_cast<const NebulaModelHeader*>(file);
-    if (header.draw_matrix_count != 0u) {
-        const auto* draw = at<NebulaModelDrawMatrix>(file, header.draw_matrices_at);
-        model.draw_matrices.assign(draw, draw + header.draw_matrix_count);
+    if (view.draw_matrix_count != 0u) {
+        entries(file, view.draw_matrices_at, view.draw_matrix_stride, view.draw_matrix_count, model.draw_matrices);
     }
-    if (header.envelope_count != 0u) {
-        const auto* envelopes = at<NebulaModelEnvelope>(file, header.envelopes_at);
-        model.envelopes.assign(envelopes, envelopes + header.envelope_count);
+    if (view.envelope_count != 0u) {
+        entries(file, view.envelopes_at, view.envelope_stride, view.envelope_count, model.envelopes);
     }
-    if (header.mix_count != 0u) {
-        const auto* mixes = at<NebulaModelMix>(file, header.mixes_at);
-        model.mixes.assign(mixes, mixes + header.mix_count);
+    if (view.mix_count != 0u) {
+        entries(file, view.mixes_at, view.mix_stride, view.mix_count, model.mixes);
     }
-    if (header.joint_count != 0u) {
-        const auto* joints = at<NebulaModelJoint>(file, header.joints_at);
-        model.joints.assign(joints, joints + header.joint_count);
-        if (header.envelope_count != 0u) {
-            const auto* binds = at<float>(file, header.inverse_binds_at);
-            model.inverse_binds.assign(binds, binds + 12u * header.joint_count);
+    if (view.joint_count != 0u) {
+        entries(file, view.joints_at, view.joint_stride, view.joint_count, model.joints);
+        if (view.envelope_count != 0u) {
+            const auto* binds = at<float>(file, view.inverse_binds_at);
+            model.inverse_binds.assign(binds, binds + 12u * view.inverse_bind_count);
         }
     }
-    model.tables.draw_matrix_count = header.draw_matrix_count;
-    model.tables.joint_count = header.joint_count;
+    model.tables.draw_matrix_count = view.draw_matrix_count;
+    model.tables.joint_count = view.joint_count;
     model.tables.has_billboard = (header.flags & NEBULA_MODEL_HAS_BILLBOARD) != 0u;
     model.tables.has_weighted = std::any_of(model.draw_matrices.begin(), model.draw_matrices.end(),
                                             [](const NebulaModelDrawMatrix& matrix) { return matrix.weighted != 0u; });
-    model.mesh_count = header.mesh_count;
+    model.mesh_count = view.mesh_count;
 
-    meshes.resize(header.mesh_count);
-    // Each glowing mesh's light shapes (version 10 on; the lights pass shades them).
-    model.glow_shapes.clear();
-    if (header.version >= 10u && header.glow_shapes_at != 0u) {
-        const auto* spans = at<NebulaModelGlowSpan>(file, header.glow_shapes_at);
-        const auto* shapes = reinterpret_cast<const NebulaModelGlowShape*>(spans + header.mesh_count);
-        std::uint32_t total = 0u;
-        for (std::uint32_t m = 0; m < header.mesh_count; ++m) {
-            total = std::max(total, spans[m].first + spans[m].count);
-        }
-        model.glow_shapes.assign(shapes, shapes + total);
-        for (std::uint32_t m = 0; m < header.mesh_count; ++m) {
-            meshes[m].glow_shape_first = spans[m].first;
-            meshes[m].glow_shape_count = spans[m].count;
-        }
-    }
-    const auto* file_meshes = at<NebulaModelMesh>(file, header.meshes_at);
-    const auto* hits = header.hits_at != 0u ? at<NebulaModelHit>(file, header.hits_at) : nullptr;
-    const auto* paint_lights = header.paint_lights_at != 0u ? at<NebulaModelPaintLight>(file, header.paint_lights_at) : nullptr;
-    for (std::uint32_t m = 0; m < header.mesh_count; ++m) {
-        const NebulaModelMesh& mesh = file_meshes[m];
+    meshes.resize(view.mesh_count);
+    for (std::uint32_t m = 0; m < view.mesh_count; ++m) {
+        const auto& mesh = entry<NebulaModelMesh>(file, view.meshes_at, view.mesh_stride, m);
         GpuMesh& gpu_mesh = meshes[m];
-        if (hits != nullptr && mesh.material < header.material_count) {
-            const NebulaModelHit& hit = hits[mesh.material];
-            const NebulaModelMaterial& material = at<NebulaModelMaterial>(file, header.materials_at)[mesh.material];
-            gpu_mesh.hit_class = hit.klass;
-            gpu_mesh.hit_flags = hit.flags;
-            std::copy_n(hit.emission, 3u, gpu_mesh.hit_emission);
-            std::copy_n(hit.base, 3u, gpu_mesh.hit_base);
-            gpu_mesh.hit_roughness = hit.roughness;
-            gpu_mesh.hit_metal = hit.metal;
-            gpu_mesh.hit_transmission = hit.transmission;
-            gpu_mesh.hit_environment = hit.environment_share;
-            std::copy_n(hit.glow, 4u, gpu_mesh.glow);
-            gpu_mesh.glow_source = static_cast<std::uint8_t>(hit.glow_source & 31u);  // bits 5-7: why it glows
-            gpu_mesh.glow_rule = static_cast<std::uint8_t>(hit.glow_source >> 5u);
-            gpu_mesh.hit_ior = hit.ior;
-            gpu_mesh.hit_thickness = hit.thickness;
-            std::copy_n(hit.env_tint, 3u, gpu_mesh.hit_env_tint);
-            gpu_mesh.hit_env_map = hit.env_map;
-            gpu_mesh.hit_body = hit.body;
-            gpu_mesh.hit_shine = hit.shine;
-            gpu_mesh.hit_tint_keep = hit.tint_keep;
-            gpu_mesh.hit_through = static_cast<float>(hit.through) / 255.0f;
-            // Where glow_source's colour sits among the rows of the material's own stages (the first form that
-            // replaces nothing), and its cooked value: registers r (code r) are signed, the others bytes, all /255
-            // as Material::fillRow fills them.
-            const std::uint32_t code = gpu_mesh.glow_source - 1u;
-            if (gpu_mesh.glow_source >= 1u && gpu_mesh.glow_source <= 9u && material.forms_at != 0u) {
-                const auto* forms = at<NebulaModelForm>(file, material.forms_at);
-                for (std::uint32_t f = 0; f < material.form_count; ++f) {
-                    const NebulaModelForm& form = forms[f];
-                    if (form.replace != 0u) {
-                        continue;
-                    }
-                    const auto* codes = at<std::uint32_t>(file, form.pixel_rows_at);
-                    for (std::uint32_t p = 0; p < form.pixel_row_count; ++p) {
-                        if (codes[p] == code && form.vertex_row_count + p < 0xFFFFu &&
-                            form.vertex_row_count + form.pixel_row_count < 0xFFFFu) {
-                            gpu_mesh.glow_row = static_cast<std::uint16_t>(form.vertex_row_count + p);
-                            gpu_mesh.glow_row_count = static_cast<std::uint16_t>(form.vertex_row_count + form.pixel_row_count);
-                            break;
-                        }
-                    }
-                    break;
-                }
-                for (unsigned c = 0; c < 3u; ++c) {
-                    const float value = code <= NEBULA_ROW_REGISTER + 2u ? static_cast<float>(material.registers[code][c])
-                                        : code < NEBULA_ROW_MATERIAL_COLOR
-                                            ? static_cast<float>(material.constants[code - NEBULA_ROW_CONSTANT][c])
-                                            : static_cast<float>(material.material_color[code - NEBULA_ROW_MATERIAL_COLOR][c]);
-                    gpu_mesh.glow_cooked[c] = value / 255.0f;
-                }
-            }
-            // Map 0's coordinate: the form's texture table's first map, the first stage that samples it,
-            // its coordinate when made from a uv set by a matrix (type 1, sources 4 to 19; not the form's normal
-            // coordinate), and that coordinate's u and v rows among the form's vertex rows.
-            if (material.forms_at != 0u && material.coords_at != 0u && hit.stages_at != 0u) {
-                const auto* forms = at<NebulaModelForm>(file, material.forms_at);
-                for (std::uint32_t f = 0; f < material.form_count; ++f) {
-                    const NebulaModelForm& form = forms[f];
-                    if (form.replace != 0u) {
-                        continue;
-                    }
-                    if (form.texture_count != 0u && form.vertex_row_count + form.pixel_row_count < 0xFFFFu) {
-                        // A map's coordinate rows: the first of its u and v rows among the form's vertex rows and the
-                        // uv set it reads, or none (map 0's and map 1's alike).
-                        const auto map_rows = [&](std::uint8_t map, std::uint16_t& row, std::uint8_t& uv) {
-                            const auto* stages = at<NebulaModelStage>(file, hit.stages_at);
-                            std::uint32_t coord = 0xFFu;
-                            for (std::uint32_t s = 0; s < hit.stage_count && coord == 0xFFu; ++s) {
-                                if (stages[s].map == map) {
-                                    coord = stages[s].coord;
-                                }
-                            }
-                            const bool normal_coord = (form.flags & 1u) != 0u && coord == 0u;
-                            if (coord >= material.coord_count || normal_coord) {
-                                return;
-                            }
-                            const NebulaModelCoord& c = at<NebulaModelCoord>(file, material.coords_at)[coord];
-                            if (c.type != 1u || c.source < 4u || c.source > 19u) {
-                                return;
-                            }
-                            const auto* codes = at<std::uint32_t>(file, form.vertex_rows_at);
-                            const std::uint32_t coord_code = NEBULA_ROW_COORD + 3u * coord;
-                            for (std::uint32_t r = 0; r + 1u < form.vertex_row_count; ++r) {
-                                if (codes[r] == coord_code && codes[r + 1u] == coord_code + 1u) {
-                                    row = static_cast<std::uint16_t>(r);
-                                    uv = static_cast<std::uint8_t>(c.source - 4u);
-                                    return;
-                                }
-                            }
-                        };
-                        const auto* maps = at<std::uint8_t>(file, form.textures_at);
-                        map_rows(maps[0], gpu_mesh.map0_row, gpu_mesh.map0_uv);
-                        if (gpu_mesh.map0_row != 0xFFFFu) {
-                            gpu_mesh.map0_form_rows = static_cast<std::uint16_t>(form.vertex_row_count + form.pixel_row_count);
-                        }
-                        if (form.texture_count >= 2u && maps[1] != maps[0]) {
-                            map_rows(maps[1], gpu_mesh.map1_row, gpu_mesh.map1_uv);
-                            if (gpu_mesh.map1_row != 0xFFFFu) {
-                                gpu_mesh.map1_slot = 1u;
-                            }
-                        }
-                    }
-                    break;
-                }
-            }
-            // The alpha test's first comparison, where it is "greater" or "greater or equal" (4, 6): its reference.
-            if (material.alpha_comp0 == 4u || material.alpha_comp0 == 6u) {
-                gpu_mesh.hit_alpha = std::max(static_cast<float>(material.alpha_ref0) / 255.0f, 1.0f / 255.0f);
-            }
-        }
-        if (paint_lights != nullptr) {
-            gpu_mesh.paint_share = paint_lights[m].share;
-            std::copy_n(paint_lights[m].direction, 2u, gpu_mesh.paint_direction);
-        }
         gpu_mesh.vertex_count = mesh.vertex_count;
         gpu_mesh.refined_vertex_count = mesh.refined_vertex_count;
         gpu_mesh.index_count = mesh.index_count;
@@ -533,17 +412,16 @@ void read_model(const void* file, GpuModel& model, std::vector<GpuMesh>& meshes)
 }  // namespace
 
 void Registries::place_model(std::uint32_t id, const LiveModel& live, GpuModel model, std::vector<GpuMesh>& meshes, const Placed& placed) {
-    const auto& header = *static_cast<const NebulaModelHeader*>(live.file);
-    const auto* file_meshes = at<NebulaModelMesh>(live.file, header.meshes_at);
+    const NebulaModelView& view = live.view;
     model.first_mesh = live.first_mesh;
     model.arena = placed.arena;
     model.arena_offset = placed.offset;
     model.arena_size = placed.size;
     const auto stream = [&](std::uint32_t offset) -> gpu::Address {
-        return offset != 0u ? placed.gpu + (offset - header.geometry_at) : gpu::Address{0u};
+        return offset != 0u ? placed.gpu + (offset - view.geometry_at) : gpu::Address{0u};
     };
-    for (std::uint32_t m = 0; m < header.mesh_count; ++m) {
-        const NebulaModelMesh& mesh = file_meshes[m];
+    for (std::uint32_t m = 0; m < view.mesh_count; ++m) {
+        const auto& mesh = entry<NebulaModelMesh>(live.file, view.meshes_at, view.mesh_stride, m);
         GpuMesh& gpu_mesh = meshes[m];
         gpu_mesh.positions = stream(mesh.positions_at);
         gpu_mesh.billboard = mesh.billboard;
@@ -552,10 +430,6 @@ void Registries::place_model(std::uint32_t id, const LiveModel& live, GpuModel m
         gpu_mesh.further = stream(mesh.further_at);
         gpu_mesh.indices = stream(mesh.indices_at);
         gpu_mesh.refined_indices = stream(mesh.refined_indices_at);
-        // Each vertex's last word of stream 3 is its de-light gain; a ray's hit reads it.
-        gpu_mesh.gains = (mesh.attributes & NEBULA_MESH_GAIN) != 0u && mesh.further_at != 0u && mesh.further_stride >= 4u
-                             ? stream(mesh.further_at) + (mesh.further_stride - 4u)
-                             : gpu::Address{0u};
         gpu_mesh.arena = placed.arena;
         gpu_mesh.model = id;
         incoming_.meshes.emplace_back(live.first_mesh + m, gpu_mesh);
@@ -566,30 +440,42 @@ void Registries::place_model(std::uint32_t id, const LiveModel& live, GpuModel m
 std::uint32_t Registries::model_register(const void* file, std::uint32_t* first_mesh) {
     return gate_->use([&] {
         const auto& header = *static_cast<const NebulaModelHeader*>(file);
+        NebulaModelView view{};
+        if (const NebulaModelCheck check = nebula_model_view(file, header.size, &view); check.fault != NEBULA_MODEL_FINE) {
+            // The game reads the same view first and stops a load it cannot read (ModelData.cpp): not reached by it.
+            char section[5];
+            nebula_model_section_text(check.what, section);
+            std::cerr << "[models] a model file the renderer cannot read (fault " << check.fault << ", " << section
+                      << "): not drawn\n";
+            if (first_mesh != nullptr) {
+                *first_mesh = 0u;
+            }
+            return std::uint32_t{0u};
+        }
         GpuModel model;
         std::vector<GpuMesh> meshes;
-        read_model(file, model, meshes);
+        read_model(file, view, model, meshes);
 
         Placed placed{};
         std::uint32_t id;
         {
             const std::lock_guard guard(lock_);
-            placed = header.geometry_size != 0u ? place(header.geometry_size) : Placed{};
+            placed = view.geometry_size != 0u ? place(view.geometry_size) : Placed{};
             if (!free_models_.empty()) {
                 id = free_models_.back();
                 free_models_.pop_back();
             } else {
                 id = next_model_++;
             }
-            const LiveModel live{file, take_mesh_ids(header.mesh_count)};
+            const LiveModel live{file, take_mesh_ids(view.mesh_count), view};
             live_models_[id] = live;
             place_model(id, live, std::move(model), meshes, placed);
             if (first_mesh != nullptr) {
                 *first_mesh = live.first_mesh;
             }
         }
-        if (header.geometry_size != 0u) {
-            fill(placed, at<std::byte>(file, header.geometry_at), header.geometry_size);
+        if (view.geometry_size != 0u) {
+            fill(placed, at<std::byte>(file, view.geometry_at), view.geometry_size);
         }
         return id;
     });
@@ -700,16 +586,17 @@ void Registries::restart(gpu::Device* device) {
     pipelines_.clear();
     tables_.clear();
     tables_.resize(1u);
+    released_lists_.clear();
 
     for (const auto& [id, live] : live_models_) {
-        const auto& header = *static_cast<const NebulaModelHeader*>(live.file);
+        const NebulaModelView& view = live.view;
         GpuModel model;
         std::vector<GpuMesh> meshes;
-        read_model(live.file, model, meshes);
-        const Placed placed = header.geometry_size != 0u ? place(header.geometry_size) : Placed{};
+        read_model(live.file, view, model, meshes);
+        const Placed placed = view.geometry_size != 0u ? place(view.geometry_size) : Placed{};
         place_model(id, live, std::move(model), meshes, placed);
-        if (header.geometry_size != 0u) {
-            fill(placed, at<std::byte>(live.file, header.geometry_at), header.geometry_size);
+        if (view.geometry_size != 0u) {
+            fill(placed, at<std::byte>(live.file, view.geometry_at), view.geometry_size);
         }
     }
     for (const auto& [id, live] : live_meshes_) {
@@ -896,16 +783,10 @@ void Registries::apply(RegistryOps& ops, std::uint64_t submitted_fence) {
         const GpuModel& model = models_[id];
         retired_.push_back({submitted_fence, model.arena, id, model.first_mesh, model.mesh_count, model.arena_size != 0u,
                             model.arena_offset, model.arena_size});
-        for (std::uint32_t m = 0; tell_retired_meshes_ && m < model.mesh_count; ++m) {
-            retired_meshes_.push_back(model.first_mesh + m);
-        }
     }
     for (const std::uint32_t id : held_freed_meshes_) {
         const GpuMesh& mesh = meshes_[id];
         retired_.push_back({submitted_fence, mesh.arena, 0u, id, 1u, mesh.arena_size != 0u, mesh.arena_offset, mesh.arena_size});
-        if (tell_retired_meshes_) {
-            retired_meshes_.push_back(id);
-        }
     }
     held_freed_models_ = std::move(ops.freed_models);
     held_freed_meshes_ = std::move(ops.freed_meshes);
@@ -997,6 +878,9 @@ void Registries::forget_textures(std::span<const std::uint32_t> freed, std::vect
     }
     for (const std::uint32_t id : dropped) {
         if (id < tables_.size() && tables_[id] != nullptr) {
+            if (tables_[id]->list_place.valid()) {
+                released_lists_.push_back(tables_[id]->list_place);
+            }
             if (!tables_[id]->has_target && tables_[id]->textures.ptr != 0u) {
                 retired.push_back(tables_[id]->textures);
             }
@@ -1017,6 +901,11 @@ void Registries::retire_idle_tables(std::uint64_t frame, std::vector<gpu::Table>
         }
         table->textures = {};
         table->samplers = {};
+        if (table->list_place.valid()) {
+            released_lists_.push_back(table->list_place);
+        }
+        table->list_place = {};
+        std::vector<std::uint32_t>().swap(table->list_pairs);
         table->lists = 0u;
         table->list_first = 0u;
         table->walk_stamp = ~0ull;

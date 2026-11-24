@@ -3,6 +3,7 @@
 // the gpu:: functions gpu_types.h declares for every back end.
 #include "galaxy/render/d3d11/d3d11_context.h"
 
+#include "galaxy/launch_args.h"
 #include "galaxy/render/render_config.h"
 #include "galaxy/render/renderer_choice.h"
 
@@ -109,7 +110,11 @@ bool Context::initialize(const std::string& chosen_gpu, bool debug_layer) {
     std::string refused;
     for (const ComPtr<IDXGIAdapter1>& adapter : adapters) {
         DXGI_ADAPTER_DESC1 desc{};
-        if (FAILED(adapter->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0u) {
+        // A software adapter is taken only by the start check (launch_args.h start_check), after every hardware one, or by
+        // --software-device, which takes no other (renderer_choice.h adapter_allowed).
+        if (FAILED(adapter->GetDesc1(&desc)) ||
+            !adapter_allowed((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0u, ::galaxy::launch_args().software_device,
+                             ::galaxy::launch_args().start_check != 0u)) {
             continue;
         }
         const std::string name = narrow(desc.Description);
@@ -158,13 +163,22 @@ bool Context::initialize(const std::string& chosen_gpu, bool debug_layer) {
         caps_.level = level;
         caps_.vendor = desc.VendorId;
         caps_.dedicated_bytes = desc.DedicatedVideoMemory;
-        caps_.unified_memory = desc.DedicatedVideoMemory < (std::uint64_t{512} << 20u);
+        caps_.unified_memory = unified_memory(desc.DedicatedVideoMemory);
+        caps_.no_overwrite_constants = options.MapNoOverwriteOnDynamicConstantBuffer != FALSE;
         // The debug layer's messages, read back each frame (report_messages): Direct3D 11 has no callback.
         if ((flags & D3D11_CREATE_DEVICE_DEBUG) != 0u && SUCCEEDED(device1.As(&info_queue_))) {
             info_queue_->SetMessageCountLimit(4096u);
         }
         std::cout << "[gpu] d3d11 debug-layer=" << (info_queue_ != nullptr ? 1 : 0) << '\n';
         break;
+    }
+    if (device_ == nullptr && ::galaxy::launch_args().software_device) {
+        // Said at the start, and no other renderer is tried in its place.
+        const std::string missing = software_device_missing_line(RendererKind::kD3D11);
+        std::cout << missing << '\n';
+        failure_ = missing.substr(std::string("[gpu] ").size());
+        factory_.Reset();
+        return false;
     }
     if (device_ == nullptr) {
         note_no_device();
@@ -210,6 +224,13 @@ bool Context::initialize(const std::string& chosen_gpu, bool debug_layer) {
         }
     }
     submitted_ = completed_ = 0u;
+    // The constant ring (d3d11_context.h): written in place where the device maps it NO_OVERWRITE.
+    ring_mapped_writes_ = caps_.no_overwrite_constants;
+    if (!make_constant_ring(kConstantRingBytes)) {
+        failure_ = "No constant buffer for the draws' constants";
+        shutdown();
+        return false;
+    }
     std::cout << "[gpu] Direct3D 11 on " << device_name_ << ", feature level " << level_name(caps_.level)
               << (fence_ != nullptr ? ", fence" : ", event queries") << (caps_.tearing ? ", tearing" : "") << '\n';
     return true;
@@ -221,6 +242,11 @@ void Context::shutdown() noexcept {
         immediate_->Flush();
     }
     report_messages();
+    ring_.Reset();
+    ring_bytes_ = 0u;
+    ring_written_ = ring_done_ = 0u;
+    ring_marks_.clear();
+    ring_copy_ = {};
     info_queue_.Reset();
     fence_queries_.clear();
     fence_.Reset();
@@ -504,18 +530,25 @@ Buffer::~Buffer() {
 
 void Context::upload_written() {
     std::lock_guard guard(buffers_mutex_);
-    std::vector<void*> pages;
+    std::vector<void*>& pages = written_pages_;
+    if (pages.size() < 4096u) {
+        pages.resize(4096u);
+    }
     for (Buffer* buffer : upload_buffers_) {
         bool any = false;
         for (const ComPtr<ID3D11Buffer>& made : buffer->gpu) {
             any = any || made != nullptr;
         }
-        pages.resize(std::max<std::size_t>(pages.size(), 4096u));
+        // No video-memory copy yet: nothing to bring up to date (Buffer::bound makes one from the whole system copy;
+        // pages written before it are then copied once more, the same bytes) (P-064).
+        if (!any) {
+            continue;
+        }
         ULONG_PTR count = pages.size();
         DWORD page_bytes = 4096u;
         // Every written page since the last call; read and reset in one call, so a write after it is seen next time.
         while (GetWriteWatch(WRITE_WATCH_FLAG_RESET, buffer->shadow, buffer->size, pages.data(), &count, &page_bytes) == 0u) {
-            if (any && count != 0u) {
+            if (count != 0u) {
                 // Runs of adjacent pages, each one UpdateSubresource1 into every video-memory buffer made.
                 std::size_t i = 0;
                 while (i < count) {
@@ -546,6 +579,142 @@ void Context::upload_written() {
             count = pages.size();
         }
     }
+}
+
+bool Context::make_constant_ring(std::size_t bytes) {
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = static_cast<UINT>(bytes);
+    desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    desc.Usage = ring_mapped_writes_ ? D3D11_USAGE_DYNAMIC : D3D11_USAGE_DEFAULT;
+    desc.CPUAccessFlags = ring_mapped_writes_ ? D3D11_CPU_ACCESS_WRITE : 0u;
+    ComPtr<ID3D11Buffer> ring;
+    if (FAILED(device_->CreateBuffer(&desc, nullptr, &ring))) {
+        return false;
+    }
+    // The old ring lives on while recorded commands or bindings name it (the runtime holds it until then): every
+    // place in the new one is free.
+    ring_ = std::move(ring);
+    ring_bytes_ = bytes;
+    ++ring_generation_;
+    ring_fresh_ = true;
+    ring_written_ = 0u;
+    ring_done_ = 0u;
+    ring_marks_.clear();
+    return true;
+}
+
+std::byte* Context::begin_constants(std::size_t bytes, ConstantPlace& place) {
+    place = {};
+    if (ring_ == nullptr || bytes == 0u) {
+        return nullptr;
+    }
+    const std::size_t size = (bytes + 255u) & ~std::size_t{255u};
+    while (size > ring_bytes_ / 4u) {
+        if (ring_bytes_ >= kConstantRingMostBytes || !make_constant_ring(ring_bytes_ * 2u)) {
+            return nullptr;
+        }
+    }
+    // The piece in one run: a tail too short for it stays unused this time round.
+    std::uint64_t start = ring_written_;
+    if (start % ring_bytes_ + size > ring_bytes_) {
+        start += ring_bytes_ - start % ring_bytes_;
+    }
+    // Last time round these bytes held pieces up to `needed`: the commands that read them must have run.
+    if (start + size > ring_bytes_) {
+        const std::uint64_t needed = start + size - ring_bytes_;
+        const auto retire = [this] {
+            const std::uint64_t completed = completed_value();
+            std::size_t passed = 0u;
+            for (; passed < ring_marks_.size() && ring_marks_[passed].fence <= completed; ++passed) {
+                ring_done_ = std::max(ring_done_, ring_marks_[passed].written);
+            }
+            ring_marks_.erase(ring_marks_.begin(), ring_marks_.begin() + static_cast<std::ptrdiff_t>(passed));
+        };
+        if (ring_done_ < needed) {
+            retire();
+        }
+        if (ring_done_ < needed) {
+            if (ring_bytes_ < kConstantRingMostBytes) {
+                // Commands still waiting read the whole ring: a larger one holds every frame in flight.
+                if (!make_constant_ring(ring_bytes_ * 2u)) {
+                    return nullptr;
+                }
+                start = 0u;
+            } else {
+                // The first mark past `needed`; its commands not yet submitted (this frame's own): submitted now.
+                std::uint64_t fence = submitted_ + 1u;
+                for (const RingMark& mark : ring_marks_) {
+                    if (mark.written >= needed) {
+                        fence = mark.fence;
+                        break;
+                    }
+                }
+                if (fence > submitted_) {
+                    fence = signal();
+                }
+                if (!wait(fence)) {
+                    return nullptr;
+                }
+                retire();
+                if (ring_done_ < needed) {
+                    return nullptr;
+                }
+            }
+        }
+    }
+    const std::size_t at = static_cast<std::size_t>(start % ring_bytes_);
+    std::byte* data = nullptr;
+    if (ring_mapped_writes_) {
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(immediate_->Map(ring_.Get(), 0u, ring_fresh_ ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0u,
+                                   &mapped))) {
+            return nullptr;
+        }
+        data = static_cast<std::byte*>(mapped.pData) + at;
+    } else {
+        ring_copy_.resize(size);
+        data = ring_copy_.data();
+    }
+    ring_fresh_ = false;
+    ring_piece_at_ = at;
+    ring_piece_bytes_ = size;
+    ring_written_ = start + size;
+    // The commands that read the piece are recorded from here until the next signal: its value covers them.
+    const std::uint64_t fence = submitted_ + 1u;
+    if (!ring_marks_.empty() && ring_marks_.back().fence == fence) {
+        ring_marks_.back().written = ring_written_;
+    } else {
+        ring_marks_.push_back({fence, ring_written_});
+    }
+    place.buffer = ring_.Get();
+    place.first = static_cast<UINT>(at / 16u);
+    place.count = static_cast<UINT>(size / 16u);
+    return data;
+}
+
+void Context::end_constants() {
+    if (ring_mapped_writes_) {
+        immediate_->Unmap(ring_.Get(), 0u);
+        return;
+    }
+    const D3D11_BOX box{static_cast<UINT>(ring_piece_at_), 0u, 0u, static_cast<UINT>(ring_piece_at_ + ring_piece_bytes_), 1u,
+                        1u};
+    immediate_->UpdateSubresource1(ring_.Get(), 0u, &box, ring_copy_.data(), 0u, 0u, D3D11_COPY_NO_OVERWRITE);
+}
+
+Context::ConstantPlace Context::put_constants(const void* data, std::size_t bytes) {
+    ConstantPlace place;
+    if (bytes > 65536u) {
+        return place;
+    }
+    std::byte* const at = begin_constants(bytes, place);
+    if (at == nullptr) {
+        return {};
+    }
+    std::memcpy(at, data, bytes);
+    std::memset(at + bytes, 0, static_cast<std::size_t>(place.count) * 16u - bytes);
+    end_constants();
+    return place;
 }
 
 std::uint64_t Context::register_address(Buffer* buffer) {

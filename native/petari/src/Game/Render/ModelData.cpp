@@ -55,11 +55,29 @@ u32 nebula_name_hash(const char* pName) {
 
 static ModelData* loadFile(void* pFile) {
     const NebulaModelHeader* pHeader = static_cast< const NebulaModelHeader* >(pFile);
-    if (pHeader->magic != NEBULA_MODEL_MAGIC || pHeader->version != NEBULA_MODEL_VERSION) {
-        NEBULA_PANIC("a model file the importer did not write");
-    }
     ModelData* pData = new ModelData();
     pData->mFile = pHeader;
+    // Its arrays by name, once (FRAME-MODEL 2.8): a model this reader cannot read stops the load, naming why.
+    const NebulaModelCheck check =
+        nebula_model_view(pFile, pHeader->magic == NEBULA_MODEL_MAGIC ? pHeader->size : 0u, &pData->mView);
+    if (check.fault != NEBULA_MODEL_FINE) {
+        char section[5];
+        nebula_model_section_text(check.what, section);
+        switch (check.fault) {
+        case NEBULA_MODEL_OTHER_VERSION:
+            NEBULA_PANIC("a model file of version %u; this build reads version %u", check.what, NEBULA_MODEL_VERSION);
+        case NEBULA_MODEL_MISSING_SECTION:
+            NEBULA_PANIC("a model file without its section %s", section);
+        case NEBULA_MODEL_UNKNOWN_REQUIRED:
+            NEBULA_PANIC("a model file needs section %s, which this build does not read", section);
+        case NEBULA_MODEL_BAD_SECTION:
+            NEBULA_PANIC("a model file whose section %s does not fit the file", section);
+        case NEBULA_MODEL_BAD_RANGE:
+            NEBULA_PANIC("a model file with a material part outside its section %s", section);
+        default:
+            NEBULA_PANIC("a model file the importer did not write");
+        }
+    }
 
     switch (pHeader->flags & 15) {
     case NEBULA_SCALE_SOFTIMAGE:
@@ -73,11 +91,10 @@ static ModelData* loadFile(void* pFile) {
         break;
     }
 
-    if (pHeader->joint_count != 0) {
-        pData->mJoints = new Joint[pHeader->joint_count];
-        const NebulaModelJoint* pFiles = reinterpret_cast< const NebulaModelJoint* >(pData->at(pHeader->joints_at));
-        for (u32 i = 0; i < pHeader->joint_count; i++) {
-            const NebulaModelJoint& rFile = pFiles[i];
+    if (pData->mView.joint_count != 0) {
+        pData->mJoints = new Joint[pData->mView.joint_count];
+        for (u32 i = 0; i < pData->mView.joint_count; i++) {
+            const NebulaModelJoint& rFile = pData->entry< NebulaModelJoint >(pData->mView.joints_at, pData->mView.joint_stride, i);
             Joint& rJoint = pData->mJoints[i];
             memset(static_cast< void* >(&rJoint), 0, sizeof(rJoint));
             rJoint.mFile = &rFile;
@@ -95,57 +112,46 @@ static ModelData* loadFile(void* pFile) {
             rJoint.mTransformInfo.mTranslate.z = rFile.translation[2];
         }
     }
-    if (pHeader->mesh_count != 0) {
-        pData->mMeshes = new Mesh[pHeader->mesh_count];
+    if (pData->mView.mesh_count != 0) {
+        pData->mMeshes = new Mesh[pData->mView.mesh_count];
     }
     pData->mTextureOwner = pData;
-    if (pHeader->texture_count != 0) {
-        pData->mTextures = new ResTIMG[pHeader->texture_count];
-        const NebulaModelTexture* pFiles = reinterpret_cast< const NebulaModelTexture* >(pData->at(pHeader->textures_at));
-        for (u32 i = 0; i < pHeader->texture_count; i++) {
-            const NebulaModelTexture& rFile = pFiles[i];
-            ResTIMG& rTexture = pData->mTextures[i];
-            memset(&rTexture, 0, sizeof(rTexture));
-            rTexture.mFormat = rFile.format;
+    if (pData->mView.texture_count != 0) {
+        pData->mTextures = new ModelTexture[pData->mView.texture_count];
+        for (u32 i = 0; i < pData->mView.texture_count; i++) {
+            const NebulaModelTexture& rFile = pData->entry< NebulaModelTexture >(pData->mView.textures_at, pData->mView.texture_stride, i);
+            ModelTexture& rTexture = pData->mTextures[i];
+            rTexture.mImage = pData->at(rFile.record_at);
+            rTexture.mId = RenderTexture::idOf(rTexture.mImage);
             rTexture.mWidth = rFile.width;
             rTexture.mHeight = rFile.height;
-            rTexture.mWrapS = rFile.wrap_s;
-            rTexture.mWrapT = rFile.wrap_t;
-            rTexture.mMipmap = rFile.mipmap;
-            rTexture.mMaxAnisotropy = rFile.anisotropy;
-            rTexture.mMinType = rFile.min_filter;
-            rTexture.mMagType = rFile.mag_filter;
-            rTexture.mMinLod = rFile.min_lod;
-            rTexture.mMaxLod = rFile.max_lod;
-            rTexture.mImageNum = rFile.levels;
-            rTexture.mLodBias = rFile.lod_bias;
-            rTexture.mImage = const_cast< u8* >(pData->at(rFile.record_at));
+            rTexture.mSampler = pData->entry< NebulaModelSampler >(pData->mView.samplers_at, pData->mView.sampler_stride, rFile.sampler);
         }
     }
-    if (pHeader->material_count != 0) {
-        pData->mMaterials = new Material[pHeader->material_count];
-        for (u32 i = 0; i < pHeader->material_count; i++) {
+    if (pData->mView.material_count != 0) {
+        pData->mMaterials = new Material[pData->mView.material_count];
+        for (u32 i = 0; i < pData->mView.material_count; i++) {
             pData->mMaterials[i].init(pData, i);
         }
     }
-    if (pHeader->mesh_count != 0) {
-        const NebulaModelMesh* pFiles = reinterpret_cast< const NebulaModelMesh* >(pData->at(pHeader->meshes_at));
-        for (u32 i = 0; i < pHeader->mesh_count; i++) {
+    if (pData->mView.mesh_count != 0) {
+        for (u32 i = 0; i < pData->mView.mesh_count; i++) {
+            const NebulaModelMesh& rFile = pData->entry< NebulaModelMesh >(pData->mView.meshes_at, pData->mView.mesh_stride, i);
             Mesh& rMesh = pData->mMeshes[i];
-            rMesh.mFile = &pFiles[i];
+            rMesh.mFile = &rFile;
             rMesh.mIndex = i;
             rMesh.mFlags = 0;
-            rMesh.mMaterial = pFiles[i].material != NEBULA_MODEL_NONE ? &pData->mMaterials[pFiles[i].material] : nullptr;
+            rMesh.mMaterial = rFile.material != NEBULA_MODEL_NONE ? &pData->mMaterials[rFile.material] : nullptr;
         }
     }
     // Each joint's materials, chained in the order its entries take them.
-    if (pHeader->joint_count != 0) {
-        const NebulaModelJoint* pFiles = reinterpret_cast< const NebulaModelJoint* >(pData->at(pHeader->joints_at));
-        const u32* pList = reinterpret_cast< const u32* >(pData->at(pHeader->joint_meshes_at));
-        for (u32 i = 0; i < pHeader->joint_count; i++) {
+    if (pData->mView.joint_count != 0) {
+        const u32* pList = reinterpret_cast< const u32* >(pData->at(pData->mView.joint_meshes_at));
+        for (u32 i = 0; i < pData->mView.joint_count; i++) {
+            const NebulaModelJoint& rFile = pData->entry< NebulaModelJoint >(pData->mView.joints_at, pData->mView.joint_stride, i);
             Material* pLast = nullptr;
-            for (u32 k = 0; k < pFiles[i].mesh_count; k++) {
-                Material* pMaterial = &pData->mMaterials[pList[pFiles[i].first_mesh + k]];
+            for (u32 k = 0; k < rFile.mesh_count; k++) {
+                Material* pMaterial = &pData->mMaterials[pList[rFile.first_mesh + k]];
                 if (pLast != nullptr) {
                     pLast->mNext = pMaterial;
                 } else {
@@ -159,7 +165,7 @@ static ModelData* loadFile(void* pFile) {
 }
 
 ModelData::ModelData()
-    : mFile(nullptr), mJoints(nullptr), mMaterials(nullptr), mMeshes(nullptr), mTextures(nullptr), mTextureOwner(nullptr),
+    : mFile(nullptr), mView{}, mJoints(nullptr), mMaterials(nullptr), mMeshes(nullptr), mTextures(nullptr), mTextureOwner(nullptr),
       mBasicMtxCalc(nullptr), mGpuModel(0), mTextureStamp(0), mResourceHash(0) {
 }
 
@@ -175,7 +181,7 @@ ModelData* ModelData::load(void* pFile) {
     const NebulaHostServices* pHost = nebula_host();
     u32 firstMesh = 0;
     pData->mGpuModel = pHost->model_register(pHost->user, pData->mFile, &firstMesh);
-    for (u32 i = 0; i < pData->mFile->mesh_count; i++) {
+    for (u32 i = 0; i < pData->mView.mesh_count; i++) {
         pData->mMeshes[i].mGpuMesh = firstMesh + i;
     }
     return pData;
@@ -186,11 +192,11 @@ ModelData* ModelData::loadMaterials(void* pFile) {
 }
 
 s32 ModelData::findJoint(const char* pName) const {
-    return findByHash(at(mFile->joints_at), mFile->joint_count, sizeof(NebulaModelJoint), offsetof(NebulaModelJoint, name_hash), pName);
+    return findByHash(at(mView.joints_at), mView.joint_count, mView.joint_stride, offsetof(NebulaModelJoint, name_hash), pName);
 }
 
 s32 ModelData::findMaterial(const char* pName) const {
-    return findByHash(at(mFile->materials_at), mFile->material_count, sizeof(NebulaModelMaterial), offsetof(NebulaModelMaterial, name_hash), pName);
+    return findByHash(at(mView.materials_at), mView.material_count, mView.material_stride, offsetof(NebulaModelMatl, name_hash), pName);
 }
 
 s32 ModelData::findTexture(const char* pName) const {
@@ -203,20 +209,30 @@ s32 ModelData::findTexture(const char* pName) const {
 }
 
 void ModelData::setTexture(u32 index, const ResTIMG& rTexture) {
-    ResTIMG& rOwn = mTextureOwner->mTextures[index];
-    rOwn = rTexture;
+    // A disc picture: its sampler from the console's codes until E3 step 4 cooks them (P-155).
+    ModelTexture& rOwn = mTextureOwner->mTextures[index];
     rOwn.mImage = rTexture.image();
+    rOwn.mId = 0;
+    rOwn.mWidth = rTexture.mWidth;
+    rOwn.mHeight = rTexture.mHeight;
+    rOwn.mSampler = nebula_sampler_from_codes(rTexture.mWrapS, rTexture.mWrapT, rTexture.mMinType, rTexture.mMagType,
+                                              rTexture.mMaxAnisotropy, rTexture.mMinLod, rTexture.mMaxLod, rTexture.mLodBias);
     mTextureOwner->mTextureStamp++;
 }
 
+u32 ModelData::getTextureId(u32 index) const {
+    const ModelTexture& rTexture = mTextureOwner->mTextures[index];
+    return rTexture.mId != 0 ? rTexture.mId : RenderTexture::idOf(rTexture.mImage);
+}
+
 void ModelData::show() {
-    for (u32 i = 0; i < mFile->mesh_count; i++) {
+    for (u32 i = 0; i < mView.mesh_count; i++) {
         mMeshes[i].show();
     }
 }
 
 void ModelData::hide() {
-    for (u32 i = 0; i < mFile->mesh_count; i++) {
+    for (u32 i = 0; i < mView.mesh_count; i++) {
         mMeshes[i].hide();
     }
 }
@@ -229,7 +245,7 @@ void ModelData::setResourceName(const char* pName) {
         }
     }
     mResourceHash = hashName(hashName(2166136261u, pBase, true), "/", false);
-    for (u32 i = 0; i < mFile->material_count; i++) {
+    for (u32 i = 0; i < mView.material_count; i++) {
         mMaterials[i].mSourceHash = hashName(mResourceHash, getMaterialName(i), false);
     }
 }

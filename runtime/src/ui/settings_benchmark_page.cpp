@@ -108,9 +108,9 @@ const char* renderer_name(const std::string& backend) {
     return "-";
 }
 
-// The part the summary and the time page read: the player's settings when they were measured, else the standard.
+// The part the summary and the time page read: the player's settings.
 const bench::PartView& main_part(const bench::ResultView& r) {
-    return r.yours.present || !r.standard.present ? r.yours : r.standard;
+    return r.yours;
 }
 
 BenchmarkPage summary_page(const bench::ResultView& r, const BenchmarkClock& clock) {
@@ -124,6 +124,11 @@ BenchmarkPage summary_page(const bench::ResultView& r, const BenchmarkClock& clo
         line(page.table, {"AVERAGE", fps(part.average_fps)});
         if (part.low_10_fps > 0.0) line(page.table, {"10% LOW", fps(part.low_10_fps)});
         line(page.table, {"1% LOW", fps(part.low_1_fps)});
+        // The game's own steps: interpolated pictures can hold the frame rate while the game falls behind.
+        if (part.steps_per_s > 0.0) {
+            line(page.table, {"GAME STEPS A SECOND", fixed(part.steps_per_s, 1u)});
+            line(page.table, {"GAME STEPS, 1% LOW", fixed(part.steps_low_1, 1u)});
+        }
         line(page.table, {"99TH PERCENTILE FRAME TIME", ms(part.p99_ms)});
         line(page.table, {"STUTTERS (OVER 25 MS)", std::to_string(part.stutters)});
         line(page.table, {"LIMITED BY", limiter_text(part.limiter)});
@@ -149,11 +154,9 @@ BenchmarkPage stages_page(const bench::ResultView& r) {
     BenchmarkPage page{"STAGES", {}, false};
     line(page.table, {"", left_heading("STAGE"), heading("AVERAGE"), heading("10% LOW"), heading("1% LOW"),
                       heading("99TH PERCENTILE")});
-    if (r.yours.present && !r.yours.stages.empty()) stage_lines(page.table, r.yours, "YOUR SETTINGS");
-    if (r.standard.present && !r.standard.stages.empty()) {
-        stage_lines(page.table, r.standard, "STANDARD SETTINGS (1920X1080, HIGH)");
-    }
-    if (!(r.yours.present && !r.yours.stages.empty()) && !(r.standard.present && !r.standard.stages.empty())) {
+    if (r.yours.present && !r.yours.stages.empty()) {
+        stage_lines(page.table, r.yours, "YOUR SETTINGS");
+    } else {
         line(page.table, {"", "NO STAGE WAS MEASURED"});
     }
     return page;

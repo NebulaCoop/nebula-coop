@@ -6,6 +6,7 @@
    not take is answered as failed, naming it, so the test ends as setup-failed instead of proving nothing. */
 #include <luma.h>
 #include <luma_harness.h>
+#include <luma_time.h>
 
 typedef struct Vec3 {
     float x, y, z;
@@ -14,6 +15,7 @@ typedef struct Vec3 {
 static const LumaCore* core;
 static const LumaMod* self;
 static const LumaHarness* harness;
+static const LumaTimeService* time_service; /* the world clock's rate (the plan's `rate` line) */
 
 /* The game's functions, by name and signature as the game's source writes them. */
 static const LumaFunction* change_stage;    /* void MR::requestChangeStageInGameMoving(const char *, s32) */
@@ -37,6 +39,8 @@ static const LumaFunction* flag_on;         /* void GameDataFunction::onGameEven
 static const LumaFunction* is_flag_on;      /* bool GameDataFunction::isOnGameEventFlag(const char *) */
 static const LumaFunction* set_value;       /* void GameDataFunction::setGameEventValue(const char *, u16) */
 static const LumaFunction* get_value;       /* u32 GameDataFunction::getGameEventValue(const char *) */
+static const LumaFunction* seed_given;      /* u32 GameDataFunction::getStarPieceNumGivingToTicoSeed(int) */
+static const LumaFunction* seed_give;       /* void GameDataFunction::addStarPieceGivingToTicoSeed(int, int) */
 static const LumaFunction* star_count;      /* s32 GameDataFunction::calcCurrentPowerStarNum() */
 static const LumaFunction* grand_count;     /* s32 GameDataFunction::calcGrandStarNum(const GameDataHolder *) */
 static const LumaFunction* game_data;       /* GameDataHolder *GameDataFunction::getCurrentGameDataHolder() */
@@ -67,6 +71,11 @@ static const LumaFunction* get_seed;        /* u32 MR::getFixedRandomSeed() */
 static int32_t field_name = -1;      /* NameObj.mName */
 static int32_t field_position = -1; /* LiveActor.mPosition */
 static int32_t field_gravity = -1;  /* LiveActor.mGravity */
+static int32_t field_rotation = -1; /* LiveActor.mRotation (the step hash) */
+static int32_t field_scale = -1;    /* LiveActor.mScale */
+static int32_t field_velocity = -1; /* LiveActor.mVelocity */
+static int32_t field_spine = -1;    /* LiveActor.mSpine */
+static int32_t field_spine_step = -1; /* Spine.mStep: the steps in the actor's present state */
 static int32_t field_is_mario = -1; /* GameDataHolder.mIsMario */
 static int32_t field_user = -1;     /* GameDataHolder.mUser */
 static int32_t field_handler = -1; /* SaveDataHandleSequence.mSaveDataHandler (optional: file copy) */
@@ -919,6 +928,30 @@ static void setup_save(const Words* w) {
         finish(back == (uint32_t)value, "save.values did not take");
         return;
     }
+    /* Star bits already given to a Hungry Luma's seed (the save's alms count), as feeding it on an earlier visit does. */
+    if (same(item, "save.tico_seed") && w->count == 4u) {
+        int good_value = 0;
+        const int64_t index = to_int(w->word[2], &good);
+        const int64_t want = to_int(w->word[3], &good_value);
+        if (!good || !good_value || index < 0 || index > 255 || want < 0 || want > 65535) {
+            finish(0, "save.tico_seeds: a seed is 0 to 255 and a count 0 to 65535");
+            return;
+        }
+        int32_t seed = (int32_t)index;
+        uint32_t have = 0;
+        call1(seed_given, &seed, &have);
+        int32_t more = (int32_t)(want - (int64_t)have);
+        void* args[] = {0, &seed, &more};
+        seed_give->invoke(args, 0);
+        call1(seed_given, &seed, &have);
+        Out key;
+        out_empty(&key);
+        put(&key, "setup.save.tico_seeds.");
+        put(&key, w->word[2]);
+        fact_int(key.text, have);
+        finish(have == (uint32_t)want, "save.tico_seeds did not take (a count above the seed's most is not stored)");
+        return;
+    }
     if ((same(item, "save.stars") || same(item, "save.grand_stars")) && w->count == 3u) {
         const int64_t want = to_int(w->word[2], &good);
         int32_t have = -1;
@@ -1353,6 +1386,140 @@ static void do_read(const Words* w) {
     finish(1, 0);
 }
 
+/* --- The step hash (tools/verify/step_hash.py) --------------------------------------------------------------------
+   With "hash on", after every step one fact hash.step = {"h":"<16 hex>","actors":N}: FNV-1a 64 over every live actor in
+   the order the game made them, each its name's bytes and its position, rotation, scale, velocity and gravity (the
+   floats' bits) and its spine's step. No addresses: two builds of the same game give the same hash, so a change to the
+   game's source that changes nothing the game does keeps every step's hash. "hash detail" writes one fact hash.actor
+   per actor at that step: its place in the order, its name, its own hash, its values and their bits (the 15 floats
+   in the hash's order, 8 hex digits each), so the first actor two runs differ in, and the value, can be named. */
+
+static int hashing;
+static int32_t hashed_frame = -1;
+/* A `rate` line was given: the hash is written after each world step (on_step_end), not once a frame, and each hash.step
+   fact says its step: the count of hashed steps from the first, so a run at a rate of 2 and a run at a rate of 1 are read
+   at equal world steps (tools/verify/step_hash.py). */
+static int rate_mode;
+static int64_t hashed_steps;
+
+static uint64_t fnv(uint64_t h, const void* bytes, uint32_t size) {
+    const unsigned char* const b = (const unsigned char*)bytes;
+    for (uint32_t i = 0; i < size; i++) {
+        h ^= b[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static uint64_t actor_hash(const char* actor) {
+    uint64_t h = 14695981039346656037ull;
+    const char* const name = *(const char* const*)(actor + field_name);
+    if (name != 0) {
+        h = fnv(h, name, length(name));
+    }
+    h = fnv(h, "", 1u); /* the name's end: "ab" + "c" is not "a" + "bc" */
+    h = fnv(h, actor + field_position, 12u);
+    h = fnv(h, actor + field_rotation, 12u);
+    h = fnv(h, actor + field_scale, 12u);
+    h = fnv(h, actor + field_velocity, 12u);
+    h = fnv(h, actor + field_gravity, 12u);
+    const char* const spine = *(const char* const*)(actor + field_spine);
+    const int32_t step = spine != 0 ? *(const int32_t*)(spine + field_spine_step) : -1;
+    return fnv(h, &step, 4u);
+}
+
+static void put_hex(Out* out, uint64_t value) {
+    char hex[17];
+    for (int i = 15; i >= 0; i--) {
+        hex[i] = "0123456789abcdef"[value & 15u];
+        value >>= 4u;
+    }
+    hex[16] = 0;
+    put_string(out, hex);
+}
+
+/* The bits of the floats the hash reads, position to gravity, as 120 hex digits. */
+static void put_bits(Out* out, const char* actor) {
+    const int32_t at[5] = {field_position, field_rotation, field_scale, field_velocity, field_gravity};
+    char hex[121];
+    uint32_t n = 0;
+    for (uint32_t f = 0; f < 5u; f++) {
+        for (uint32_t c = 0; c < 3u; c++) {
+            const char* const from = actor + at[f] + c * 4u;
+            uint32_t bits = (uint32_t)(unsigned char)from[0] | (uint32_t)(unsigned char)from[1] << 8u |
+                   (uint32_t)(unsigned char)from[2] << 16u | (uint32_t)(unsigned char)from[3] << 24u;
+            for (int i = 7; i >= 0; i--) {
+                hex[n + (uint32_t)i] = "0123456789abcdef"[bits & 15u];
+                bits >>= 4u;
+            }
+            n += 8u;
+        }
+    }
+    hex[n] = 0;
+    put_string(out, hex);
+}
+
+static void hash_step(int detail) {
+    uint64_t h = 14695981039346656037ull;
+    uint32_t actors = 0;
+    for (uint32_t i = 0; i < object_count; i++) {
+        const char* const actor = (const char*)objects[i];
+        if (actor == 0 || !object_is(actor, class_live_actor)) {
+            continue;
+        }
+        const uint64_t own = actor_hash(actor);
+        h = fnv(h, &own, 8u);
+        if (detail) {
+            static Out each;
+            out_empty(&each);
+            put(&each, "{\"i\":");
+            put_int(&each, actors);
+            put(&each, ",\"name\":");
+            const char* const name = *(const char* const*)(actor + field_name);
+            put_string(&each, name != 0 ? name : "");
+            put(&each, ",\"h\":");
+            put_hex(&each, own);
+            put(&each, ",\"pos\":");
+            put_vec(&each, (const Vec3*)(actor + field_position));
+            put(&each, ",\"rot\":");
+            put_vec(&each, (const Vec3*)(actor + field_rotation));
+            put(&each, ",\"scale\":");
+            put_vec(&each, (const Vec3*)(actor + field_scale));
+            put(&each, ",\"vel\":");
+            put_vec(&each, (const Vec3*)(actor + field_velocity));
+            put(&each, ",\"grav\":");
+            put_vec(&each, (const Vec3*)(actor + field_gravity));
+            put(&each, ",\"step\":");
+            const char* const spine = *(const char* const*)(actor + field_spine);
+            put_int(&each, spine != 0 ? *(const int32_t*)(spine + field_spine_step) : -1);
+            put(&each, ",\"bits\":");
+            put_bits(&each, actor);
+            put(&each, "}");
+            fact("hash.actor", &each);
+        }
+        actors++;
+    }
+    if (detail) {
+        return; /* the step's own hash comes after its lines (on_frame) */
+    }
+    static Out o;
+    out_empty(&o);
+    put(&o, "{\"h\":");
+    put_hex(&o, h);
+    put(&o, ",\"actors\":");
+    put_int(&o, actors);
+    if (rate_mode) {
+        put(&o, ",\"step\":");
+        put_int(&o, hashed_steps++);
+    }
+    put(&o, "}");
+    fact("hash.step", &o);
+    if (rate_mode) {
+        /* How many world steps are hashed, as a number a plan can wait for (a step's `after` reads numbers, not objects). */
+        fact_int("hash.steps", hashed_steps);
+    }
+}
+
 static void do_line(const char* line) {
     static Words w;
     split(&w, line, ' ');
@@ -1433,6 +1600,40 @@ static void do_line(const char* line) {
         do_read(&w);
         return;
     }
+    if (same(w.word[0], "hash") && w.count == 2u) {
+        if (same(w.word[1], "on")) {
+            hashing = 1;
+            finish(1, 0);
+        } else if (same(w.word[1], "detail")) {
+            hash_step(1);
+            finish(1, 0);
+        } else {
+            finish(0, "hash is on or detail");
+        }
+        return;
+    }
+    if (same(w.word[0], "rate") && w.count == 2u) {
+        /* The world clock's rate in thousandths, from the next frame (services/time.md set_rate); from here the step
+           hash is written after each world step. */
+        int good = 0;
+        const int64_t n = to_int(w.word[1], &good);
+        if (!good || n < (int64_t)LUMA_TIME_RATE_LEAST || n > (int64_t)LUMA_TIME_RATE_MOST) {
+            finish(0, "rate: a whole number from 1 to 16000");
+            return;
+        }
+        if (time_service == 0) {
+            finish(0, "rate: the game has no time service 1.0");
+            return;
+        }
+        if (time_service->set_rate(self, (uint32_t)n) != LUMA_OK) {
+            finish(0, "rate: the time service did not take it");
+            return;
+        }
+        rate_mode = 1;
+        fact_int("rate.set", n);
+        finish(1, 0);
+        return;
+    }
     finish(0, "not a line the game half knows");
 }
 
@@ -1470,6 +1671,23 @@ static int32_t on_frame(LumaCall* call, void* user) {
         }
         do_line(line);
     }
+    /* Once a step, after its lines: the state the step left. At a rate (rate_mode) each world step writes its own, in
+       on_step_end. */
+    if (hashing && !rate_mode && frame_now >= 0 && frame_now != hashed_frame) {
+        hashed_frame = frame_now;
+        hash_step(0);
+    }
+    return 0;
+}
+
+/* Before the animation of each world step (GameSystem::frameLoop: update, then calcAnim; a rate's extra steps and the
+   skip's too), where the hash of the one-step frame was always written: after the step's update and the plan's lines. */
+static int32_t on_step_end(LumaCall* call, void* user) {
+    (void)call;
+    (void)user;
+    if (hashing && rate_mode && frame_now >= 0) {
+        hash_step(0);
+    }
     return 0;
 }
 
@@ -1505,6 +1723,8 @@ static const LumaImport imports[] = {
     LUMA_FUNCTION(is_flag_on, "GameDataFunction::isOnGameEventFlag", "bool(const char *)"),
     LUMA_FUNCTION(set_value, "GameDataFunction::setGameEventValue", "void(const char *, u16)"),
     LUMA_FUNCTION(get_value, "GameDataFunction::getGameEventValue", "u32(const char *)"),
+    LUMA_FUNCTION(seed_given, "GameDataFunction::getStarPieceNumGivingToTicoSeed", "u32(int)"),
+    LUMA_FUNCTION(seed_give, "GameDataFunction::addStarPieceGivingToTicoSeed", "void(int, int)"),
     LUMA_FUNCTION(star_count, "GameDataFunction::calcCurrentPowerStarNum", "s32()"),
     LUMA_FUNCTION(grand_count, "GameDataFunction::calcGrandStarNum", "s32(const GameDataHolder *)"),
     LUMA_FUNCTION(game_data, "GameDataFunction::getCurrentGameDataHolder", "GameDataHolder *()"),
@@ -1526,6 +1746,11 @@ static const LumaImport imports[] = {
     LUMA_FIELD(field_name, "NameObj.mName", "const char *"),
     LUMA_FIELD(field_position, "LiveActor.mPosition", "Vec3f"),
     LUMA_FIELD(field_gravity, "LiveActor.mGravity", "Vec3f"),
+    LUMA_FIELD(field_rotation, "LiveActor.mRotation", "Vec3f"),
+    LUMA_FIELD(field_scale, "LiveActor.mScale", "Vec3f"),
+    LUMA_FIELD(field_velocity, "LiveActor.mVelocity", "Vec3f"),
+    LUMA_FIELD(field_spine, "LiveActor.mSpine", "Spine *"),
+    LUMA_FIELD(field_spine_step, "Spine.mStep", "s32"),
     /* Optional: a class outside the game's object tree may have no fields by name yet; the item
        that needs one then fails, naming it. */
     {LUMA_IMPORT_FIELD, LUMA_OPTIONAL, "GameDataHolder.mIsMario", "bool", &field_is_mario, 0, 0, 0},
@@ -1544,6 +1769,9 @@ static const LumaImport imports[] = {
     LUMA_FUNCTION(input_disabled, "MarioModule::isInputDisable", "bool() const"),
     LUMA_HOOK_ON("Mario::checkKeyLock", "void()", LUMA_AFTER, on_key_lock),
     LUMA_HOOK_ON("GameSystem::update", "void()", LUMA_AFTER, on_frame),
+    LUMA_HOOK_ON("GameSystem::calcAnim", "void()", LUMA_BEFORE, on_step_end),
+    /* Optional: only a test with a rate needs it; without it the line `rate` fails, naming the service. */
+    {LUMA_IMPORT_SERVICE, LUMA_OPTIONAL, LUMA_TIME_NAME, "1.0", &time_service, 0, 0, 0},
 };
 
 LUMA_MOD(imports, start, 0);

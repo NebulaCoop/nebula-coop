@@ -207,7 +207,115 @@ FfxResource ffx_image(const TemporalImage& image, const wchar_t* name, FfxResour
 VKAPI_ATTR void VKAPI_CALL no_label_begin(VkCommandBuffer, const VkDebugUtilsLabelEXT*) {}
 VKAPI_ATTR void VKAPI_CALL no_label_end(VkCommandBuffer) {}
 
+// A compute pipeline the device refuses is the one failure of context creation that names nothing (the SDK returns one error code
+// for all of them): the result and the subgroup size the stage asked for are logged here.
+PFN_vkCreateComputePipelines g_create_compute_pipelines = nullptr;
+
+VKAPI_ATTR VkResult VKAPI_CALL logged_create_compute_pipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
+                                                               const VkComputePipelineCreateInfo* infos,
+                                                               const VkAllocationCallbacks* allocator, VkPipeline* pipelines) {
+    const VkResult result = g_create_compute_pipelines(device, cache, count, infos, allocator, pipelines);
+    if (result != VK_SUCCESS) {
+        unsigned subgroup = 0u;
+        for (const auto* next = static_cast<const VkBaseInStructure*>(count != 0u ? infos[0].stage.pNext : nullptr); next != nullptr;
+             next = next->pNext) {
+            if (next->sType == VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT) {
+                subgroup = reinterpret_cast<const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT*>(next)->requiredSubgroupSize;
+            }
+        }
+        std::cerr << "[fsr3] vkCreateComputePipelines returned " << static_cast<int>(result) << " (the stage asked for subgroup size "
+                  << subgroup << ", 0 is none)\n";
+    }
+    return result;
+}
+
+// The same for the calls that make something: the backend names none of them when it gives up.
+#define NEBULA_FFX_LOGGED_CREATE(Name, InfoType, HandleType)                                                                       \
+    PFN_vk##Name g_##Name = nullptr;                                                                                              \
+    VKAPI_ATTR VkResult VKAPI_CALL logged_##Name(VkDevice device, const InfoType* info, const VkAllocationCallbacks* allocator, \
+                                                 HandleType* handle) {                                                           \
+        const VkResult result = g_##Name(device, info, allocator, handle);                                                      \
+        if (result != VK_SUCCESS) {                                                                                              \
+            std::cerr << "[fsr3] vk" #Name " returned " << static_cast<int>(result) << '\n';                                     \
+        }                                                                                                                        \
+        return result;                                                                                                           \
+    }
+NEBULA_FFX_LOGGED_CREATE(CreateBuffer, VkBufferCreateInfo, VkBuffer)
+NEBULA_FFX_LOGGED_CREATE(CreateImage, VkImageCreateInfo, VkImage)
+NEBULA_FFX_LOGGED_CREATE(CreateImageView, VkImageViewCreateInfo, VkImageView)
+NEBULA_FFX_LOGGED_CREATE(CreateSampler, VkSamplerCreateInfo, VkSampler)
+NEBULA_FFX_LOGGED_CREATE(CreateDescriptorPool, VkDescriptorPoolCreateInfo, VkDescriptorPool)
+NEBULA_FFX_LOGGED_CREATE(CreateDescriptorSetLayout, VkDescriptorSetLayoutCreateInfo, VkDescriptorSetLayout)
+NEBULA_FFX_LOGGED_CREATE(CreatePipelineLayout, VkPipelineLayoutCreateInfo, VkPipelineLayout)
+NEBULA_FFX_LOGGED_CREATE(CreateShaderModule, VkShaderModuleCreateInfo, VkShaderModule)
+NEBULA_FFX_LOGGED_CREATE(AllocateMemory, VkMemoryAllocateInfo, VkDeviceMemory)
+#undef NEBULA_FFX_LOGGED_CREATE
+
+PFN_vkAllocateDescriptorSets g_AllocateDescriptorSets = nullptr;
+VKAPI_ATTR VkResult VKAPI_CALL logged_AllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo* info, VkDescriptorSet* sets) {
+    const VkResult result = g_AllocateDescriptorSets(device, info, sets);
+    if (result != VK_SUCCESS) {
+        std::cerr << "[fsr3] vkAllocateDescriptorSets returned " << static_cast<int>(result) << '\n';
+    }
+    return result;
+}
+
+PFN_vkMapMemory g_MapMemory = nullptr;
+VKAPI_ATTR VkResult VKAPI_CALL logged_MapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags,
+                                                void** data) {
+    const VkResult result = g_MapMemory(device, memory, offset, size, flags, data);
+    if (result != VK_SUCCESS) {
+        std::cerr << "[fsr3] vkMapMemory returned " << static_cast<int>(result) << '\n';
+    }
+    return result;
+}
+
+PFN_vkBindBufferMemory g_BindBufferMemory = nullptr;
+VKAPI_ATTR VkResult VKAPI_CALL logged_BindBufferMemory(VkDevice device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset) {
+    const VkResult result = g_BindBufferMemory(device, buffer, memory, offset);
+    if (result != VK_SUCCESS) {
+        std::cerr << "[fsr3] vkBindBufferMemory returned " << static_cast<int>(result) << '\n';
+    }
+    return result;
+}
+
+PFN_vkBindImageMemory g_BindImageMemory = nullptr;
+VKAPI_ATTR VkResult VKAPI_CALL logged_BindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize offset) {
+    const VkResult result = g_BindImageMemory(device, image, memory, offset);
+    if (result != VK_SUCCESS) {
+        std::cerr << "[fsr3] vkBindImageMemory returned " << static_cast<int>(result) << '\n';
+    }
+    return result;
+}
+
+struct LoggedCall {
+    const char* name;
+    PFN_vkVoidFunction* real;
+    PFN_vkVoidFunction logged;
+};
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL ffx_device_proc(VkDevice device, const char* name) {
+#define NEBULA_FFX_LOGGED_ENTRY(Name) \
+    {"vk" #Name, reinterpret_cast<PFN_vkVoidFunction*>(&g_##Name), reinterpret_cast<PFN_vkVoidFunction>(logged_##Name)}
+    static const LoggedCall calls[] = {
+        NEBULA_FFX_LOGGED_ENTRY(CreateBuffer),         NEBULA_FFX_LOGGED_ENTRY(CreateImage),
+        NEBULA_FFX_LOGGED_ENTRY(CreateImageView),      NEBULA_FFX_LOGGED_ENTRY(CreateSampler),
+        NEBULA_FFX_LOGGED_ENTRY(CreateDescriptorPool), NEBULA_FFX_LOGGED_ENTRY(CreateDescriptorSetLayout),
+        NEBULA_FFX_LOGGED_ENTRY(CreatePipelineLayout), NEBULA_FFX_LOGGED_ENTRY(CreateShaderModule),
+        NEBULA_FFX_LOGGED_ENTRY(AllocateMemory),       NEBULA_FFX_LOGGED_ENTRY(AllocateDescriptorSets),
+        NEBULA_FFX_LOGGED_ENTRY(MapMemory),            NEBULA_FFX_LOGGED_ENTRY(BindBufferMemory),
+        NEBULA_FFX_LOGGED_ENTRY(BindImageMemory)};
+#undef NEBULA_FFX_LOGGED_ENTRY
+    for (const LoggedCall& call : calls) {
+        if (std::strcmp(name, call.name) == 0) {
+            *call.real = vkGetDeviceProcAddr(device, name);
+            return *call.real != nullptr ? call.logged : nullptr;
+        }
+    }
+    if (std::strcmp(name, "vkCreateComputePipelines") == 0) {
+        g_create_compute_pipelines = reinterpret_cast<PFN_vkCreateComputePipelines>(vkGetDeviceProcAddr(device, name));
+        return g_create_compute_pipelines != nullptr ? reinterpret_cast<PFN_vkVoidFunction>(logged_create_compute_pipelines) : nullptr;
+    }
     if (std::strcmp(name, "vkCmdBeginDebugUtilsLabelEXT") == 0) {
         return reinterpret_cast<PFN_vkVoidFunction>(no_label_begin);
     }
@@ -244,6 +352,7 @@ public:
         device_context_.vkDeviceProcAddr = ffx_device_proc;
         if (ffxGetInterfaceVK(&backend_, ffxGetDeviceVK(&device_context_), scratch_.data(), scratch_.size(), kContexts) !=
             FFX_OK) {
+            std::cerr << "[fsr3] the backend interface could not be made\n";
             return false;
         }
         FfxFsr3UpscalerContextDescription description{};
@@ -276,6 +385,8 @@ public:
             std::cerr << "[fsr3] shared resources failed: " << result << '\n';
             return false;
         }
+        std::cerr << "[fsr3] context made: render " << render_width << "x" << render_height << ", output " << output_width << "x"
+                  << output_height << '\n';
         return true;
     }
 

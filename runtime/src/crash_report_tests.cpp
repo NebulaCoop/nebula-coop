@@ -3,6 +3,7 @@
 // text carries the session's mods.
 
 #include "galaxy/crash_report.h"
+#include "galaxy/render/mtl/command_buffer_failure.h"
 
 #include <cstring>
 #include <iostream>
@@ -26,7 +27,37 @@ std::string code_of(const Facts& facts) { return classify(facts).code; }
 
 }  // namespace
 
+// P-062: a GPU allocation that fails inside a frame reads as a device loss when the device is gone, or as memory
+// run out; the old texts ("scene target colour unavailable") read as neither and ended the game as a renderer error.
+// P-008: every error a Metal command buffer ends in is a device loss, the render core's recovery answers it.
+void metal_command_buffer_failures() {
+    // MTLCommandBufferError: internal 1, timeout 2, page fault 3, access revoked 4, not permitted 7, out of memory 8,
+    // invalid resource 9, memoryless 10, device removed 11, stack overflow 12.
+    for (const long code : {1L, 2L, 3L, 4L, 7L, 8L, 9L, 10L, 11L, 12L}) {
+        const std::string text = galaxy::render::mtl::command_buffer_failure_text(true, code, "Internal error");
+        expect(galaxy::crash::is_gpu_lost(text.c_str()), "a Metal command buffer error is a device loss");
+    }
+    const std::string other = galaxy::render::mtl::command_buffer_failure_text(false, 5L, "");
+    expect(galaxy::crash::is_gpu_lost(other.c_str()) && other.find("no description") != std::string::npos,
+           "an error of another domain too, with no description");
+}
+
+void allocation_failures() {
+    const std::string removed = galaxy::crash::gpu_allocation_failure("the scene target colour", true);
+    expect(galaxy::crash::is_gpu_lost(removed.c_str()), "a removed device's failed allocation is a device loss");
+    const std::string memory = galaxy::crash::gpu_allocation_failure("the scene target colour", false);
+    expect(!galaxy::crash::is_gpu_lost(memory.c_str()), "memory run out is not a device loss");
+    Facts facts;
+    facts.kind = Facts::Kind::Exception;
+    facts.text = memory;
+    expect(code_of(facts) == "NEB-R01", "memory run out is reported as such");
+    facts.text = removed;
+    expect(code_of(facts) == "NEB-G01", "a device loss that could not be borne is reported as one");
+}
+
 int main() {
+    allocation_failures();
+    metal_command_buffer_failures();
     expect(galaxy::crash::translated("The game crashed", "EuGerman") == "Das Spiel ist abgest\xC3\xBCrzt", "a row in a language");
     expect(galaxy::crash::translated("The game crashed", "UsEnglish") == "The game crashed", "English is the words given");
     expect(galaxy::crash::translated("no such row", "EuGerman") == "no such row", "no row: the words given");
@@ -125,6 +156,22 @@ int main() {
     expect(startup("cannot open D:/Nebula/content/game.pak") == "NEB-S01", "missing content");
     expect(startup("D:/x/game.pak: boot.bin points past the partition") == "NEB-S02", "damaged content");
     expect(startup("cannot load the game module smg_game.dll") == "NEB-S03", "missing module");
+    {
+        // The two lines the host's load_failure writes (game_module.h, tested in mods_tests.cpp): each says its case.
+        Facts missing;
+        missing.kind = Facts::Kind::Startup;
+        missing.text = "cannot load the game module libsmg_game_plain.dylib: the file is not there (Contents/MacOS)";
+        const Report gone = classify(missing);
+        expect(std::string(gone.code) == "NEB-S03" && std::string(gone.title) == "A part of Nebula is missing",
+               "a module file that is not there");
+        Facts refused;
+        refused.kind = Facts::Kind::Startup;
+        refused.text = "cannot load the game module libsmg_game_plain.dylib: the system refused it: dlopen(x): code signature invalid";
+        const Report no = classify(refused);
+        expect(std::string(no.code) == "NEB-S03" && std::string(no.title) == "The system refused a part of Nebula" &&
+                   std::strstr(no.detail, "code signature invalid") != nullptr,
+               "a module file the system refused: the reason is in the detail");
+    }
     expect(startup("the game module's API version differs from the host's (15)") == "NEB-S03", "module version");
     expect(startup("the renderer did not start: no adapter") == "NEB-S04", "no renderer");
     expect(startup("the settings did not load: bad value") == "NEB-S05", "settings");

@@ -60,6 +60,7 @@ std::uint64_t available_physical_bytes() noexcept {
 }
 
 thread_local bool tl_out_of_memory = false;
+thread_local bool tl_device_lost = false;
 
 std::int64_t steady_ticks() noexcept {
     return std::chrono::steady_clock::now().time_since_epoch().count();
@@ -69,6 +70,10 @@ std::int64_t steady_ticks() noexcept {
 
 void note_pipeline_out_of_memory() noexcept {
     tl_out_of_memory = true;
+}
+
+void note_pipeline_device_lost() noexcept {
+    tl_device_lost = true;
 }
 
 void Pipelines::initialize(gpu::Device* device, RootLayout root, void* backend) {
@@ -108,6 +113,10 @@ void Pipelines::shutdown() noexcept {
         left_jobs_.clear();
     }
     wake_.notify_all();
+    // A worker in a job finishes it at the normal priority: the caller (a device restore, the end) waits for it (N-1072).
+    for (std::thread& thread : threads_) {
+        galaxy::host::raise_waited_thread(thread);
+    }
     for (std::thread& thread : threads_) {
         thread.join();
     }
@@ -120,22 +129,22 @@ void Pipelines::shutdown() noexcept {
     }
     destroy_all();
     save_targets(stored);
+    // What the driver refused belongs to this device: the next one is asked again (N-4024).
     refused_.clear();
+    refused_pairs_.clear();
+    memory_failed_.clear();
+    memory_wait_until_.store(0, std::memory_order_relaxed);
     for (auto& root : directories_) {
         if (Directory* directory = root.exchange(nullptr)) {
             for (auto& page : directory->pages) { delete page.load(); }
-            for (auto& page : directory->traced_pages) { delete page.load(); }
-            for (auto& page : directory->exchange_pages) { delete page.load(); }
             delete directory;
         }
     }
 }
 
 std::atomic<gpu::Pipeline*>* Pipelines::cell(std::uint64_t id, unsigned variant, unsigned aux) {
-    static_assert(kExchangeBit == kAuxExchange && kExchangeBit > kAuxTraced + 4u, "the exchange's aux bit");
     const std::uint32_t key = key_of(variant, aux);
-    const unsigned which = key / kKeys;
-    Page* page = page_of(id, which);
+    Page* page = page_of(id);
     if (page == nullptr) {
         const auto root = static_cast<std::size_t>(id >> (kPageBits + kDirectoryBits));
         if (root >= directories_.size()) { throw std::out_of_range("pipeline ID outside the native namespaces"); }
@@ -145,11 +154,11 @@ std::atomic<gpu::Pipeline*>* Pipelines::cell(std::uint64_t id, unsigned variant,
             directory = new Directory();
             directories_[root].store(directory, std::memory_order_release);
         }
-        auto& at = directory->set(which)[(id >> kPageBits) & (kDirectorySize - 1u)];
+        auto& at = directory->pages[(id >> kPageBits) & (kDirectorySize - 1u)];
         page = at.load(std::memory_order_acquire);
         if (page == nullptr) { page = new Page(); at.store(page, std::memory_order_release); }
     }
-    return &page->rows[id & kPageMask][key & (kKeys - 1u)];
+    return &page->rows[id & kPageMask][key];
 }
 
 gpu::Pipeline* Pipelines::publish(std::atomic<gpu::Pipeline*>& at, gpu::Pipeline* built) noexcept {
@@ -183,8 +192,11 @@ void Pipelines::refuse(std::uint64_t id, const PipelineEntry& entry, unsigned va
     }
 }
 
-void Pipelines::failed(std::uint64_t id, const PipelineEntry& entry, unsigned variant, unsigned aux, bool memory, const Job* job) {
-    if (memory) {
+void Pipelines::failed(std::uint64_t id, const PipelineEntry& entry, unsigned variant, unsigned aux, Failure why, const Job* job) {
+    if (why == Failure::device_lost) {
+        return;  // the device's loss, not the pipeline's: the renderer starts again on a new device
+    }
+    if (why == Failure::memory) {
         memory_failures_.fetch_add(1u, std::memory_order_relaxed);
         memory_wait_until_.store(steady_ticks() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                                                       std::chrono::milliseconds(kPipelineMemoryWaitMs)).count(),
@@ -214,11 +226,13 @@ void Pipelines::failed(std::uint64_t id, const PipelineEntry& entry, unsigned va
     refuse(id, entry, variant, aux);
 }
 
-gpu::Pipeline* Pipelines::build_noting(const PipelineEntry& entry, unsigned variant, unsigned aux, bool& memory) {
+gpu::Pipeline* Pipelines::build_noting(const PipelineEntry& entry, unsigned variant, unsigned aux, Failure& why) {
     tl_out_of_memory = false;
+    tl_device_lost = false;
     gpu::Pipeline* const built = build(entry, variant, aux);
-    memory = built == nullptr && tl_out_of_memory;
+    why = tl_device_lost ? Failure::device_lost : tl_out_of_memory ? Failure::memory : Failure::refused;
     tl_out_of_memory = false;
+    tl_device_lost = false;
     return built;
 }
 
@@ -257,12 +271,12 @@ gpu::Pipeline* Pipelines::create_now(std::uint64_t id, const PipelineEntry& entr
     // Where pipelines link from parts, the draw gets a quick link and a worker replaces it with the optimised one.
     gpu::Pipeline* built = build_fast(entry, variant, aux);
     const bool linked = built != nullptr;
-    bool memory = false;
+    Failure why = Failure::refused;
     if (built == nullptr) {
-        built = build_noting(entry, variant, aux, memory);
+        built = build_noting(entry, variant, aux, why);
     }
     if (built == nullptr) {
-        failed(id, entry, variant, aux, memory, nullptr);
+        failed(id, entry, variant, aux, why, nullptr);
         return nullptr;
     }
     if (!linked && target_form(variant, aux)) {
@@ -287,20 +301,6 @@ gpu::Pipeline* Pipelines::create_now(std::uint64_t id, const PipelineEntry& entr
     return published;
 }
 
-// Whether the tracer's prepass draws this entry: an opaque surface that writes depth through a test that passes an equal
-// depth (the pass after it finds its own depth there), and no stencil (its marks are the scene pass's).
-bool prepass_draws(std::uint32_t state) noexcept {
-    const std::uint32_t test = (state >> 11u) & 7u;  // the game's: 3 less or equal, 6 greater or equal, 7 always
-    return (state & NEBULA_STATE_COLOR_WRITE) != 0u && (state & 3u) == NEBULA_BLEND_REPLACE && (state & (1u << 10u)) != 0u &&
-           (state & (1u << 14u)) != 0u && test == 3u && ((state >> 20u) & 3u) == 0u && ((state >> 15u) & 3u) != NEBULA_CULL_ALL;
-}
-
-bool blended_prepass_draws(std::uint32_t state) noexcept {
-    return (state & NEBULA_STATE_COLOR_WRITE) != 0u && (state & 3u) == NEBULA_BLEND_ADD && ((state >> 2u) & 15u) == NEBULA_FACTOR_SRC_ALPHA &&
-           ((state >> 6u) & 15u) == NEBULA_FACTOR_INV_SRC_ALPHA && (state & (1u << 10u)) != 0u && ((state >> 20u) & 3u) == 0u &&
-           ((state >> 15u) & 3u) != NEBULA_CULL_ALL;
-}
-
 std::uint8_t scene_aux(std::uint32_t state, bool layer_window) noexcept {
     if ((state & NEBULA_STATE_COLOR_WRITE) == 0u) {
         return 0u;
@@ -316,95 +316,63 @@ std::uint8_t scene_aux(std::uint32_t state, bool layer_window) noexcept {
     return 2u;
 }
 
-bool added_prepass_draws(std::uint32_t state) noexcept {
-    // Added (dst one), or tinting what is behind and adding (dst source colour: the air bubble, the Undergrunt Gunner's
-    // capsule).
-    const std::uint32_t dst = (state >> 6u) & 15u;
-    return (state & NEBULA_STATE_COLOR_WRITE) != 0u && (state & 3u) == NEBULA_BLEND_ADD &&
-           (dst == NEBULA_FACTOR_ONE || dst == NEBULA_FACTOR_SRC_COLOR) && (state & (1u << 10u)) != 0u &&
-           ((state >> 20u) & 3u) == 0u && ((state >> 15u) & 3u) != NEBULA_CULL_ALL;
-}
-
 void Pipelines::prepare(const std::vector<Prepared>& entries, const std::vector<unsigned>& variants, bool motion, bool layer,
-                        bool one_pass, bool traced) {
+                        bool one_pass) {
+    // The start's settings, which the targets file keeps (decide_warm): the first list's targets and passes. Set before its
+    // jobs are queued, so the worker that takes one sees it.
+    if (start_settings_.load(std::memory_order_relaxed) == 0u) {
+        std::uint64_t settings = 14695981039346656037ull;
+        const auto add_word = [&settings](std::uint64_t word) {
+            for (unsigned b = 0; b < 8u; ++b) {
+                settings = (settings ^ ((word >> (8u * b)) & 0xFFu)) * 1099511628211ull;
+            }
+        };
+        for (const unsigned variant : variants) {
+            add_word(variant);
+        }
+        add_word((motion ? 1u : 0u) | (layer ? 2u : 0u) | (one_pass ? 4u : 0u));
+        std::uint64_t none = 0u;
+        (void)start_settings_.compare_exchange_strong(none, settings != 0u ? settings : 1u, std::memory_order_release);
+    }
     std::vector<Job> now;
     std::vector<Job> later;
     for (const Prepared& prepared : entries) {
         const std::uint32_t id = prepared.id;
         const PipelineEntry& entry = *prepared.entry;
         const auto add = [&](unsigned variant, unsigned aux) { now.push_back(Job{id, prepared.entry, variant, aux}); };
-        // The tracer's forms of a scene draw (no target, one sample): its prepass, and a lit program's traced forms under
-        // the aux the scene pass gives an opaque draw.
-        // An added state: its prepass and exchange forms, for the glass rows' shells among its draws.
-        const bool added = traced && added_prepass_draws(entry.desc.state);
-        const bool prepass = traced && (prepass_draws(entry.desc.state) || blended_prepass_draws(entry.desc.state) || added);
-        const bool lit = prepass && program_traced(entry.desc.pixel);
-        const bool blended = blended_prepass_draws(entry.desc.state) || added;
-        const unsigned exchange = added ? kAuxExchange : 0u;
         for (const unsigned variant : variants) {
             add(variant, 0u);
             const bool scene = (variant & kSceneVariantTarget) == 0u && (variant & kSceneVariantSamplesMask) == 0u;
-            if (scene && prepass) {
-                // The aux the scene pass gives it (draw_walker scene_aux): with motion written, an opaque draw the
-                // motion (1), a blended one the reactive mask (2; 3 in a layer window too), or with one pass for the
-                // scene the motion target left alone (4); without motion, none. The prepass runs the same vertex form.
-                const bool writes_motion = motion && !blended;
-                add(variant, writes_motion ? kAuxPrepassMotion : kAuxPrepass);
-                if (lit) {
-                    if (!motion || !blended) {
-                        add(variant, kAuxTraced | exchange | (writes_motion ? 1u : 0u));
-                    } else if (one_pass) {
-                        add(variant, kAuxTraced | exchange | 4u);
-                    } else {
-                        add(variant, kAuxTraced | exchange | 2u);
-                        if (layer) {
-                            add(variant, kAuxTraced | exchange | 3u);
-                        }
-                    }
-                }
-            }
             if (!motion || !scene) {
                 continue;
             }
-            if (!traced) {
-                // The motion forms a scene draw of this state can take (draw_walker: scene_aux, which one pass for the scene
-                // turns into 4 unless it is the motion), out of a layer window and, with `layer`, in one; aux 0 is above.
-                const auto scene_form = [&](bool layer_window) -> unsigned {
-                    const unsigned aux = scene_aux(entry.desc.state, layer_window);
-                    return one_pass && aux != 1u ? 4u : aux;
-                };
-                const unsigned out_of_window = scene_form(false);
-                const unsigned in_window = layer ? scene_form(true) : out_of_window;
-                // With the wide variant listed, walk_scene_begin draws every scene wide unless the wide targets cannot be
-                // had (begin_wide_scene: memory, the camera pass): the narrow variant's motion forms are left for after the
-                // first scene, made then or by such a draw.
-                const bool left = (variant & kSceneVariantHdr) == 0u &&
-                                  std::any_of(variants.begin(), variants.end(),
-                                              [](unsigned listed) { return (listed & kSceneVariantHdr) != 0u; });
-                const auto motion_form = [&](unsigned aux) {
-                    if (aux == 0u) {
-                        return;
-                    }
-                    if (left) {
-                        later.push_back(Job{id, prepared.entry, variant, aux, false, true});
-                    } else {
-                        add(variant, aux);
-                    }
-                };
-                motion_form(out_of_window);
-                if (in_window != out_of_window) {
-                    motion_form(in_window);
+            // The motion forms a scene draw of this state can take (draw_walker: scene_aux, which one pass for the scene
+            // turns into 4 unless it is the motion), out of a layer window and, with `layer`, in one; aux 0 is above.
+            const auto scene_form = [&](bool layer_window) -> unsigned {
+                const unsigned aux = scene_aux(entry.desc.state, layer_window);
+                return one_pass && aux != 1u ? 4u : aux;
+            };
+            const unsigned out_of_window = scene_form(false);
+            const unsigned in_window = layer ? scene_form(true) : out_of_window;
+            // With the wide variant listed, walk_scene_begin draws every scene wide unless the wide targets cannot be
+            // had (begin_wide_scene: memory, the camera pass): the narrow variant's motion forms are left for after the
+            // first scene, made then or by such a draw.
+            const bool left = (variant & kSceneVariantHdr) == 0u &&
+                              std::any_of(variants.begin(), variants.end(),
+                                          [](unsigned listed) { return (listed & kSceneVariantHdr) != 0u; });
+            const auto motion_form = [&](unsigned aux) {
+                if (aux == 0u) {
+                    return;
                 }
-                continue;
-            }
-            add(variant, 1u);
-            if (one_pass) {
-                add(variant, 4u);
-                continue;
-            }
-            add(variant, 2u);
-            if (layer) {
-                add(variant, 3u);
+                if (left) {
+                    later.push_back(Job{id, prepared.entry, variant, aux, false, true});
+                } else {
+                    add(variant, aux);
+                }
+            };
+            motion_form(out_of_window);
+            if (in_window != out_of_window) {
+                motion_form(in_window);
             }
         }
     }
@@ -451,6 +419,9 @@ void Pipelines::worker() {
             job = std::move(from.front());
             from.pop_front();
         }
+        if (!warm_decided_.load(std::memory_order_acquire)) {
+            decide_warm();
+        }
         try {
             std::atomic<gpu::Pipeline*>* at = cell(job.id, job.variant, job.aux);
             // A texture target's form, where the targets file is kept: its key in the file's sets (0, prepared as any other,
@@ -476,12 +447,12 @@ void Pipelines::worker() {
                     left_.fetch_add(1u, std::memory_order_relaxed);
                     defer(job);  // a load from the cache then, at this thread's priority, not the draw's
                 } else {
-                    bool memory = false;
-                    if (gpu::Pipeline* built = build_noting(*job.entry, job.variant, job.aux, memory); built != nullptr) {
+                    Failure why = Failure::refused;
+                    if (gpu::Pipeline* built = build_noting(*job.entry, job.variant, job.aux, why); built != nullptr) {
                         note_target_stored(form);
                         publish(*at, built);
                     } else {
-                        failed(job.id, *job.entry, job.variant, job.aux, memory, &job);
+                        failed(job.id, *job.entry, job.variant, job.aux, why, &job);
                     }
                 }
             }
@@ -489,7 +460,7 @@ void Pipelines::worker() {
             // Out of memory in our own code around the build: as the driver's (pipeline_workers.h).
             try {
                 if (!job.optimize) {
-                    failed(job.id, *job.entry, job.variant, job.aux, true, &job);
+                    failed(job.id, *job.entry, job.variant, job.aux, Failure::memory, &job);
                 }
             } catch (...) {
             }
@@ -552,6 +523,11 @@ void Pipelines::drained() noexcept {
         stored = stored_forms();
     } catch (...) {
     }
+    {
+        // Every cache written from here holds the start's set: the targets file says so (decide_warm, a later run).
+        std::lock_guard guard(targets_lock_);
+        start_drained_ = true;
+    }
     const std::size_t written = unsaved_.exchange(false, std::memory_order_acq_rel) ? save_cache() : 0u;
     save_targets(stored);
     {
@@ -572,10 +548,15 @@ void Pipelines::drained() noexcept {
 
 namespace {
 
-// The targets file: the magic, the hash of the cache data it goes with, the counts of the two sets, then the stored forms' keys
-// and the drawn forms' keys, eight bytes each.
-constexpr char kTargetsMagic[8] = {'N', 'B', 'T', 'G', 'T', 'S', '0', '1'};
-constexpr std::size_t kTargetsHeader = 8u + 8u + 4u + 4u;
+// The targets file: the magic, the hash of the cache data it goes with, the counts of the two sets, the writing run's programs
+// (program_set_identity) and start's settings (prepare), its flags (kTargetsComplete), four bytes kept zero, then the stored
+// forms' keys and the drawn forms' keys, eight bytes each. A file of the first form (01) has neither identity nor flags.
+constexpr char kTargetsMagic[8] = {'N', 'B', 'T', 'G', 'T', 'S', '0', '2'};
+constexpr char kTargetsMagicFirst[8] = {'N', 'B', 'T', 'G', 'T', 'S', '0', '1'};
+constexpr std::size_t kTargetsHeader = 8u + 8u + 4u + 4u + 8u + 8u + 4u + 4u;
+constexpr std::size_t kTargetsHeaderFirst = 8u + 8u + 4u + 4u;
+// The writing run's start's set had drained: the cache data named holds all of it.
+constexpr std::uint32_t kTargetsComplete = 1u;
 // More keys than the game has pipelines is a file from something else.
 constexpr std::uint32_t kTargetsMost = 1u << 20u;
 
@@ -616,28 +597,39 @@ bool Pipelines::targets_open() {
         return true;
     }
     const auto length = static_cast<std::size_t>(in.tellg());
-    if (length < kTargetsHeader) {
+    if (length < kTargetsHeaderFirst) {
         return true;
     }
     std::vector<char> bytes(length);
     in.seekg(0);
     in.read(bytes.data(), static_cast<std::streamsize>(length));
-    if (!in || std::memcmp(bytes.data(), kTargetsMagic, sizeof(kTargetsMagic)) != 0) {
+    const bool first = in && std::memcmp(bytes.data(), kTargetsMagicFirst, sizeof(kTargetsMagicFirst)) == 0;
+    if (!in || (!first && (length < kTargetsHeader || std::memcmp(bytes.data(), kTargetsMagic, sizeof(kTargetsMagic)) != 0))) {
         return true;
     }
+    const std::size_t header = first ? kTargetsHeaderFirst : kTargetsHeader;
     std::uint64_t hash = 0u;
     std::uint32_t stored = 0u, drawn = 0u;
     std::memcpy(&hash, bytes.data() + 8u, 8u);
     std::memcpy(&stored, bytes.data() + 16u, 4u);
     std::memcpy(&drawn, bytes.data() + 20u, 4u);
-    targets_hash_ = hash;
     if (stored > kTargetsMost || drawn > kTargetsMost ||
-        length != kTargetsHeader + (std::size_t{stored} + std::size_t{drawn}) * 8u) {
+        length != header + (std::size_t{stored} + std::size_t{drawn}) * 8u) {
         return true;
     }
+    // The first form is written again in the second (save_targets: a hash it does not name).
+    targets_hash_ = first ? 0u : hash;
+    if (!first) {
+        std::uint32_t flags = 0u;
+        std::memcpy(&file_programs_, bytes.data() + 24u, 8u);
+        std::memcpy(&file_settings_, bytes.data() + 32u, 8u);
+        std::memcpy(&flags, bytes.data() + 40u, 4u);
+        file_complete_ = (flags & kTargetsComplete) != 0u;
+    }
+    file_names_cache_ = accepted != 0u && hash == accepted;
     const auto key_at = [&](std::size_t i) {
         std::uint64_t key;
-        std::memcpy(&key, bytes.data() + kTargetsHeader + i * 8u, 8u);
+        std::memcpy(&key, bytes.data() + header + i * 8u, 8u);
         return key;
     };
     // What a target pass drew stands whatever the cache; what the cache holds only if it is the data the driver took.
@@ -660,7 +652,7 @@ std::uint64_t Pipelines::form_key(const PipelineEntry& entry, unsigned variant, 
     const unsigned samples_log2 = variant & kSceneVariantSamplesMask;
     const unsigned program =
         program_variant(desc.pixel, aux, (desc.state & NEBULA_STATE_PIXEL_SHADING) != 0u ? 0u : samples_log2);
-    const ProgramBytes vs = program_bytes(desc.vertex, aux == kAuxPrepassMotion ? unsigned{kProgramTracedMotion} : program, false);
+    const ProgramBytes vs = program_bytes(desc.vertex, program, false);
     const ProgramBytes ps = program_bytes(desc.pixel, program, true);
     if (vs.size == 0u || ps.size == 0u) {
         return 0u;
@@ -696,6 +688,37 @@ std::uint64_t Pipelines::form_key(const PipelineEntry& entry, unsigned variant, 
     return hash != 0u ? hash : 1u;
 }
 
+void Pipelines::decide_warm() noexcept {
+    try {
+        const bool kept = targets_open();
+        const std::uint64_t settings = start_settings_.load(std::memory_order_acquire);
+        if (settings == 0u) {
+            return;  // a draw's own job before the first list: the next job decides
+        }
+        std::lock_guard guard(targets_lock_);
+        if (warm_decided_.load(std::memory_order_relaxed)) {
+            return;
+        }
+        const std::uint64_t programs = program_set_identity();
+        const bool warm = kept && file_names_cache_ && file_complete_ && programs != 0u && file_programs_ == programs &&
+                          file_settings_ == settings;
+        if (!warm && kept) {
+            targets_unsaved_ = true;  // written again for this run's programs and settings once its start's set drains
+        }
+        warm_.store(warm, std::memory_order_release);
+        warm_decided_.store(true, std::memory_order_release);
+        std::fprintf(stderr, "[pipelines] %s\n",
+                     warm ? "the driver's cache holds the start's set: loaded behind the game, nothing waits for it"
+                          : !kept ? "no cache file of the renderer's own: the start's set is prepared before play"
+                          : !file_names_cache_ ? "the driver's cache is new or was refused: the start's set is prepared before play"
+                          : file_programs_ != programs ? "the cache is another build's programs': the start's set is prepared before play"
+                          : file_settings_ != settings ? "the cache is other settings': the start's set is prepared before play"
+                                                       : "the cache was written before the start's set was whole: prepared before play");
+    } catch (...) {
+        warm_decided_.store(true, std::memory_order_release);
+    }
+}
+
 bool Pipelines::left_to_cache(std::uint64_t form) {
     if (form == 0u) {
         return false;
@@ -705,7 +728,7 @@ bool Pipelines::left_to_cache(std::uint64_t form) {
 }
 
 void Pipelines::note_target_drawn(std::uint64_t id, const PipelineEntry& entry, unsigned variant, unsigned aux) {
-    Page* page = page_of(id, key_of(variant, aux) / kKeys);
+    Page* page = page_of(id);
     if (page == nullptr || page->drawn[id & kPageMask].exchange(1u, std::memory_order_relaxed) != 0u) {
         return;
     }
@@ -762,12 +785,18 @@ void Pipelines::save_targets(const std::vector<std::uint64_t>& stored) noexcept 
             }
             const auto stored_count = static_cast<std::uint32_t>(stored.size());
             const auto drawn_count = static_cast<std::uint32_t>(target_drawn_.size());
-            bytes.resize(kTargetsHeader + (std::size_t{stored_count} + std::size_t{drawn_count}) * 8u);
+            const std::uint64_t programs = program_set_identity();
+            const std::uint64_t settings = start_settings_.load(std::memory_order_acquire);
+            const std::uint32_t flags = start_drained_ ? kTargetsComplete : 0u;
+            bytes.assign(kTargetsHeader + (std::size_t{stored_count} + std::size_t{drawn_count}) * 8u, '\0');
             char* at = bytes.data();
             std::memcpy(at, kTargetsMagic, sizeof(kTargetsMagic));
             std::memcpy(at + 8u, &hash, 8u);
             std::memcpy(at + 16u, &stored_count, 4u);
             std::memcpy(at + 20u, &drawn_count, 4u);
+            std::memcpy(at + 24u, &programs, 8u);
+            std::memcpy(at + 32u, &settings, 8u);
+            std::memcpy(at + 40u, &flags, 4u);
             at += kTargetsHeader;
             for (const std::uint64_t key : stored) {
                 std::memcpy(at, &key, 8u);

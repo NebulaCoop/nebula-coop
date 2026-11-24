@@ -2,6 +2,7 @@
 // benchmark_menu.h: the settings menu's benchmark rows, questions and results window.
 #include "galaxy/ui/benchmark_menu.h"
 
+#include "galaxy/benchmark.h"
 #include "galaxy/benchmark_recommend.h"
 #include "galaxy/benchmark_results.h"
 #include "galaxy/native_settings_pad.h"
@@ -101,14 +102,13 @@ void read_results(State& state) {
     }
 }
 
-// The frame-time graph of the shown run's main part (the player's settings, else the standard): empty when its frame
-// lists are missing or unreadable.
+// The frame-time graph of the shown run's stages at the player's settings: empty when its frame lists are missing or
+// unreadable.
 void draw_graph(State& state) {
     state.graph_picture.reset();
     state.graph = {};
     if (state.shown >= state.runs.size()) return;
-    const bench::ResultView& run = state.runs[state.shown];
-    const unsigned part = run.yours.present || !run.standard.present ? 0u : 1u;
+    constexpr unsigned part = 0u;  // the frame lists' part at the player's settings (benchmark.cpp frame_lists)
     const std::string bytes = file_text(bench::frames_file(state.files[state.shown]), kMostFrameBytes);
     std::vector<bench::FrameList> lists;
     if (!bench::decode_frame_lists(bytes, lists)) return;
@@ -215,6 +215,8 @@ BenchmarkView rows(const render::RenderConfig& draft, std::string_view adapter,
         view.apply = BenchmarkApply::NoResult;
     } else if (!last.gpu.empty() && !adapter.empty() && last.gpu != adapter) {
         view.apply = BenchmarkApply::OtherGpu;
+    } else if (!last.backend.empty() && last.backend != bench::running_backend()) {
+        view.apply = BenchmarkApply::OtherRenderer;
     } else if (recommended == draft) {
         view.apply = BenchmarkApply::InUse;
     } else {

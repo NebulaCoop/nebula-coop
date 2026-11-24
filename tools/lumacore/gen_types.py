@@ -1,5 +1,5 @@
 """gen_types.py --commands COMPILE_COMMANDS --out DIR [--entry FILE] [--defined DIR] [--depfile FILE] [--libclang PATH]
-                [--tree DIR]
+                [--tree DIR] [--needs FILE]
 
 The type rows of every record, field, base, enum, alias and global the game's headers declare (language/types.md).
 One unit includes every game header (native/petari/include, native/math/include, native/include) and is parsed by libclang
@@ -22,7 +22,8 @@ names); a header's global gets a row only when one of them, or the header itself
 --depfile: the files the headers' unit read, as a Makefile rule (Ninja reads it).
 What a .cpp defines (nerve classes, file-level structs) comes from instrument.py's per-unit pass (Reader, unit_pass).
 The tree is the one this script is in (tools/lumacore). --tree: one folder's headers in place of the game's (the
-fixture of tools/lumacore/types_fixture_test.py).
+fixture of tools/lumacore/types_fixture_test.py), and no hand table of needs unless --needs names one.
+--needs: the hand table of what functions need (default tools/lumacore/needs.json).
 """
 import ctypes
 import json
@@ -43,6 +44,34 @@ def option(flag, default=None):
     if flag in ARGS:
         return ARGS[ARGS.index(flag) + 1]
     return default
+
+
+# The units the build names (P-329): the instrumented copies' lists (.types, .rows, .numbers, .globals) of a reused build
+# folder include those of a source the build no longer has, and the merges below read every list there. NAMED is the set of
+# copies the compile commands name (normalized paths), None to read every list: commands that name no copy of the folder
+# (a fixture's) leave nothing out.
+NAMED = None
+
+
+def _norm(path):
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def name_units(commands, folder):
+    """Sets NAMED from the compile commands: the copies of `folder` that the build compiles."""
+    global NAMED
+    prefix = _norm(folder) + os.sep
+    named = {_norm(pathlib.Path(e.get("directory") or ".") / e["file"]) for e in commands}
+    NAMED = named if any(n.startswith(prefix) for n in named) else None
+
+
+def unit_files(folder, pattern):
+    """The files of `pattern` ('*.types') in the folder of the instrumented copies, in order, for the units the build names."""
+    found = sorted(pathlib.Path(folder).rglob(pattern))
+    if NAMED is None:
+        return found
+    suffix = pattern[1:]
+    return [f for f in found if _norm(str(f)[:-len(suffix)]) in NAMED]
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -201,7 +230,17 @@ class Api:
 
 
 def main():
-    global OUT, DEFINED, DEPFILE
+    # A self-test that starts this tool as a child process runs it under the live-state guard (tools/gate/selftest_guard.py).
+    import pathlib as _pathlib
+    import sys as _sys
+    _gate = str(_pathlib.Path(__file__).resolve().parents[1] / "gate")
+    _sys.path.insert(0, _gate)
+    try:
+        import selftest_guard
+    finally:
+        _sys.path.remove(_gate)
+    selftest_guard.install_if_asked()
+    global OUT, DEFINED, DEPFILE, NEEDS_TABLE
     if option("--commands") is None or option("--out") is None:
         sys.exit(__doc__)
     OUT = pathlib.Path(option("--out")).resolve()
@@ -214,7 +253,12 @@ def main():
     if option("--tree"):
         global GAME_INCLUDES, GAME_TREES
         GAME_INCLUDES = GAME_TREES = [pathlib.Path(option("--tree")).resolve()]
+        NEEDS_TABLE = None
+    if option("--needs"):
+        NEEDS_TABLE = pathlib.Path(option("--needs")).resolve()
     commands = json.loads(pathlib.Path(option("--commands")).read_text(encoding="utf-8"))
+    if DEFINED is not None:
+        name_units(commands, DEFINED)
     wanted = option("--entry")
 
     def is_game(entry):
@@ -914,6 +958,11 @@ class Reader:
             if wrong:
                 sys.exit("gen_types.py: the function rows' facts (luma_functions.json) do not hold:\n  " +
                          "\n  ".join(wrong[:200]) + ("\n  ... %d in all" % len(wrong) if len(wrong) > 200 else ""))
+            wrong = merge_needs(DEFINED, functions, NEEDS_TABLE)
+            if wrong:
+                sys.exit("gen_types.py: what the functions need (luma_functions.json needs) does not hold:\n  " +
+                         "\n  ".join(wrong[:200]) + ("\n  ... %d in all" % len(wrong) if len(wrong) > 200 else ""))
+            lines += needs_rows(functions)
             I.write_if_changed(OUT / "luma_functions.json", (json.dumps(
                 {"functions": functions}, indent=1, ensure_ascii=False) + "\n").encode("utf-8"))
             numbers, wrong = merge_numbers(DEFINED, {(f["name"], f["signature"]) for f in functions})
@@ -1096,7 +1145,7 @@ class Reader:
         twice = {}  # alias name -> {record: file}
         named_once = {}  # an instance only .cpp files name -> the first such file
         clashes = []  # a record or global defined twice: all of them are said, then the build stops
-        for part in sorted(pathlib.Path(folder).rglob("*.types")):
+        for part in unit_files(folder, "*.types"):
             data = json.loads(part.read_text(encoding="utf-8"))
             for key, table, mine in (("records", records, self.records), ("globals", globals_, self.globals)):
                 for row in data[key]:
@@ -1511,7 +1560,7 @@ def merge_functions(folder, records, left_records):
     what is wrong). Each unit's facts are its .rows, row for row; an owner is a record row or a record left out; each
     override has a name, and says whether it is a function row (`row`)."""
     functions, wrong = [], []
-    for rows_file in sorted(pathlib.Path(folder).rglob("*.rows")):
+    for rows_file in unit_files(folder, "*.rows"):
         source = rows_file.relative_to(folder).as_posix()[:-len(".rows")]
         rows = [tuple(line.split("\t")[:2]) for line in rows_file.read_text(encoding="utf-8").splitlines() if line]
         facts_file = rows_file.with_suffix(".functions")
@@ -1541,6 +1590,173 @@ def merge_functions(folder, records, left_records):
     return functions, wrong
 
 
+# What each function needs (M2; the audit's design note "marking every function with what it needs"): the units'
+# .needs (instrument.py Needs) closed over the whole game. A need is a scene object by its SceneObj_ name without the
+# prefix (MarioHolder), or "scene": the scene's holder of those objects (MR::getSceneObjHolder reads the scene
+# controller with no test). Per row:
+#   null_when  the needs whose absence makes the function's pointer result null: a scene object it gives back, or a
+#              callee's null_when it gives back
+#   needs      the needs whose absence makes it fault: a scene object or a callee's null result it uses untested, a
+#              scene object read without MR::isExistSceneObj ("scene"), and every callee's needs
+#   needs_why  for each need, the first place that adds it: "file:line callee" (or the scene object)
+# A call through a virtual function adds the named row's needs only (each override keeps its own). The hand table
+# (tools/lumacore/needs.json) adds what the pass cannot see; a row it names that does not exist stops the build. Its
+# rows name one function (name, signature) or a class (class, except): each member function of the class but the
+# named ones (all their overloads; each must exist) gets the row's needs. Besides the scene objects and "scene", a
+# need may be one of the game system's objects (luma_hook.h; SYSTEM_NEEDS).
+NEEDS_TABLE = pathlib.Path(__file__).resolve().parent / "needs.json"
+SYSTEM_NEEDS = {"scene": "luma::kNeedScene", "UserFile": "luma::kNeedUserFile",
+                "CometScheduler": "luma::kNeedCometScheduler", "MarioActor": "luma::kNeedMarioActor"}
+
+
+def merge_needs(folder, functions, table_path):
+    wrong = []
+    by_key = {(f["name"], f["signature"]): f for f in functions}
+    facts = {}
+    for rows_file in unit_files(folder, "*.rows"):
+        source = rows_file.relative_to(folder).as_posix()[:-len(".rows")]
+        rows = [tuple(line.split("\t")[:2]) for line in rows_file.read_text(encoding="utf-8").splitlines() if line]
+        needs_file = rows_file.with_suffix(".needs")
+        if not needs_file.is_file():
+            wrong.append("%s: %d rows and no .needs" % (source, len(rows)))
+            continue
+        entries = json.loads(needs_file.read_text(encoding="utf-8"))
+        if [(e["name"], e["signature"]) for e in entries] != rows:
+            wrong.append("%s: its .needs is not its .rows, row for row" % source)
+            continue
+        for e in entries:
+            facts[(e["name"], e["signature"])] = (source, e)
+    table = json.loads(pathlib.Path(table_path).read_text(encoding="utf-8")) if table_path is not None else {"rows": []}
+    added = []  # (key, row)
+    for row in table.get("rows", []):
+        if "class" in row:
+            prefix = row["class"] + "::"
+            members = [k for k in by_key if k[0].startswith(prefix) and "::" not in k[0][len(prefix):]]
+            names = {k[0][len(prefix):] for k in members}
+            if not members:
+                wrong.append("needs.json: class %s has no function rows" % row["class"])
+            for name in row.get("except", []):
+                if name not in names:
+                    wrong.append("needs.json: class %s has no function %s" % (row["class"], name))
+            if not row.get("why"):
+                wrong.append("needs.json: class %s has no why" % row["class"])
+            added += [(k, row) for k in members if k[0][len(prefix):] not in row.get("except", [])]
+            continue
+        key = (row["name"], row["signature"])
+        if key not in by_key:
+            wrong.append("needs.json: %s %s is no function row" % key)
+            continue
+        if not row.get("why"):
+            wrong.append("needs.json: %s %s has no why" % key)
+        added.append((key, row))
+    if wrong:
+        return wrong
+
+    needs = {k: {} for k in by_key}       # need -> why
+    null_when = {k: {} for k in by_key}  # need -> why
+    callers = {k: [] for k in by_key}
+    # A function that gives a pointer and tests one that may be null gives null when that is missing (MarioAccess::
+    # getPlayerActor: `holder != nullptr ? holder->getMarioActor() : nullptr`), so it is null when the tested one is.
+    gives_pointer = {k: result_text(k[1]).endswith("*") for k in by_key}
+    # What a function makes (MR::createSceneObj(id), its own or a callee's): it needs no such object to be there.
+    makes = {k: set() for k in by_key}
+    for key, (source, e) in facts.items():
+        makes[key].update(m["id"] for m in e.get("made", []) if m["id"] != "?")
+        for c in e["calls"]:
+            callee = (c["name"], c["signature"])
+            if callee in by_key:
+                callers[callee].append((key, c["use"], "%s:%d %s" % (source, c["line"], c["name"])))
+    work = [k for k in by_key if makes[k]]
+    queued = set(work)
+    while work:
+        callee = work.pop()
+        queued.discard(callee)
+        for caller, _use, _why in callers[callee]:
+            if not makes[callee] <= makes[caller]:
+                makes[caller] |= makes[callee]
+                if caller not in queued:
+                    work.append(caller)
+                    queued.add(caller)
+    for key, (source, e) in facts.items():
+        for r in e["roots"]:
+            if r["id"] in makes[key]:
+                if not r["checked"]:
+                    needs[key].setdefault("scene", "%s:%d %s" % (source, r["line"], r["id"]))
+                continue
+            why = "%s:%d %s" % (source, r["line"], r["id"])
+            if r["use"] == "returned" or r["use"] == "tested" and gives_pointer[key]:
+                null_when[key].setdefault(r["id"], why)
+            elif r["use"] == "deref":
+                needs[key].setdefault(r["id"], why)
+            if not r["checked"]:
+                needs[key].setdefault("scene", why)
+    for key, row in added:
+        for need in row.get("needs", []):
+            needs[key].setdefault(need, "needs.json: " + row["why"])
+        for need in row.get("null_when", []):
+            null_when[key].setdefault(need, "needs.json: " + row["why"])
+    # To a fixed point: a callee's change goes to its callers.
+    work = list(by_key)
+    queued = set(work)
+    while work:
+        callee = work.pop()
+        queued.discard(callee)
+        for caller, use, why in callers[callee]:
+            grew = False
+            for need in needs[callee]:
+                if need not in needs[caller] and need not in makes[caller]:
+                    needs[caller][need] = why
+                    grew = True
+            if use in ("returned", "deref") or use == "tested" and gives_pointer[caller]:
+                into = null_when[caller] if use != "deref" else needs[caller]
+                for need in null_when[callee]:
+                    if need not in into and need not in makes[caller]:
+                        into[need] = why
+                        grew = True
+            if grew and caller not in queued:
+                work.append(caller)
+                queued.add(caller)
+    for key, f in by_key.items():
+        f["needs"] = sorted(needs[key])
+        f["null_when"] = sorted(null_when[key])
+        if needs[key]:
+            f["needs_why"] = {n: needs[key][n] for n in sorted(needs[key])}
+        if makes[key]:
+            f["makes"] = sorted(makes[key])
+    return wrong
+
+
+def result_text(signature):
+    """A function type's result, as written before its parameter list: "MarioActor *" for "MarioActor *()"."""
+    depth = 0
+    for i in range(len(signature) - 1, -1, -1):
+        if signature[i] == ")":
+            depth += 1
+        elif signature[i] == "(":
+            depth -= 1
+            if depth == 0:
+                return signature[:i].strip()
+    return signature.strip()
+
+
+def needs_rows(functions):
+    """The module's needs rows (luma_hook.h NeedsRow, in the lumand section): each function row that needs a scene
+    object, with the ids it needs; the kernel gives each row's flag its set when it sorts the rows."""
+    lines = ["", "// What each function needs (M2): luma_hook.h NeedsRow.", "namespace {"]
+    count = 0
+    for f in functions:
+        if not f.get("needs"):
+            continue
+        ids = ", ".join(SYSTEM_NEEDS.get(n, "SceneObj_" + n) for n in f["needs"])
+        lines.append("const unsigned char kNd%d[] = {%s, luma::kNeedsEnd};" % (count, ids))
+        names = "".join(n + "\\0" for n in f["needs"])
+        lines.append('LUMA_NEEDS_SECTION const luma::NeedsRow kNr%d = {%s, %s, kNd%d, "%s"};' % (
+            count, I.quote(f["name"]), I.quote(f["signature"]), count, names))
+        count += 1
+    lines.append("}  // namespace")
+    return lines
+
+
 def merge_numbers(folder, rows):
     """1.5: every unit's .numbers (instrument.py) as luma_numbers.json: each number by its name, signature and place,
     with its unit, line, type and the game's value as written; and the completeness report: how many numbers were
@@ -1550,7 +1766,7 @@ def merge_numbers(folder, rows):
     tables, tables_skipped, table_names = [], {}, set()
     uses = 0
     seen = set()
-    for listed in sorted(pathlib.Path(folder).rglob("*.numbers")):
+    for listed in unit_files(folder, "*.numbers"):
         unit = listed.relative_to(folder).as_posix()[:-len(".numbers")]
         part = json.loads(listed.read_text(encoding="utf-8"))
         uses += part["uses"]
@@ -1584,7 +1800,7 @@ def defined_symbols(folder):
     if folder is None:
         return None
     out = set()
-    for listed in pathlib.Path(folder).rglob("*.globals"):
+    for listed in unit_files(folder, "*.globals"):
         out.update(line for line in listed.read_text(encoding="utf-8").splitlines() if line)
     return out
 

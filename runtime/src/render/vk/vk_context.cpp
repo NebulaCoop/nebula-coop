@@ -5,7 +5,6 @@
 #include "galaxy/launch_args.h"
 #include "galaxy/render/render_config.h"
 #include "galaxy/render/renderer_choice.h"
-#include "galaxy/render/rt/rt_shaders.h"
 #include "galaxy/runtime_settings.h"
 
 #include "galaxy/render/vk/temporal_upscaler_vk.h"
@@ -88,7 +87,11 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_message(VkDebugUtilsMessageSeverityFlagBits
                                              VkDebugUtilsMessageTypeFlagsEXT, const VkDebugUtilsMessengerCallbackDataEXT* data,
                                              void*) {
     if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT && data != nullptr && data->pMessage != nullptr) {
-        std::fprintf(stderr, "[vulkan] %s\n", data->pMessage);
+        // The tags the gate's validate lane counts, as Direct3D's [D3D12-LIVE-ERR] / [D3D12-LIVE-WARN]: the layer's message id
+        // (its VUID), then the message.
+        const bool error = severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+        std::fprintf(stderr, "[%s] id %s: %s\n", error ? "VK-LIVE-ERR" : "VK-LIVE-WARN",
+                     data->pMessageIdName != nullptr ? data->pMessageIdName : "none", data->pMessage);
     }
     return VK_FALSE;
 }
@@ -298,14 +301,19 @@ Context& Context::get() noexcept {
 
 bool Context::initialize(const std::string& chosen_gpu, bool validation,
                          std::vector<const char*> instance_extensions,
-                         const std::function<VkSurfaceKHR(VkInstance)>& create_surface, VkSurfaceKHR* surface,
-                         bool ray_tracing) {
+                         const std::function<VkSurfaceKHR(VkInstance)>& create_surface, VkSurfaceKHR* surface) {
     if (device_ != VK_NULL_HANDLE) {
         return true;
     }
     failure_.clear();
     if (load_vulkan() != VK_SUCCESS) {
         std::fprintf(stderr, "[vulkan] no Vulkan loader\n");
+        if (::galaxy::launch_args().software_device) {
+            // No loader, so no software device either: said at the start, and no other renderer is tried in its place.
+            std::printf("%s\n", software_device_missing_line(RendererKind::kVulkan).c_str());
+            failure_ = "no Vulkan driver";
+            return false;
+        }
         note_no_device();
         failure_ = "no Vulkan driver";
         return false;
@@ -398,6 +406,15 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
         surface_maintenance_khr_ = std::strcmp(surface_maintenance, "VK_KHR_surface_maintenance1") == 0;
         surface_maintenance_ = true;
     }
+    // Surface capabilities 2 wherever the instance has it: present timing's surface queries (create_swapchain) need it.
+    if (has_instance_extension(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) {
+        if (std::none_of(instance_extensions.begin(), instance_extensions.end(), [](const char* have) {
+                return std::strcmp(have, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) == 0;
+            })) {
+            instance_extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+        }
+        surface_capabilities2_ = true;
+    }
     // The surface's HDR formats (HDR10 ST 2084, scRGB) are listed only with this on the instance.
     if (has_instance_extension(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
         if (std::none_of(instance_extensions.begin(), instance_extensions.end(),
@@ -412,8 +429,11 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
     instance_info.ppEnabledExtensionNames = instance_extensions.data();
     instance_info.enabledLayerCount = static_cast<std::uint32_t>(layers.size());
     instance_info.ppEnabledLayerNames = layers.data();
-    if (vkCreateInstance(&instance_info, nullptr, &instance_) != VK_SUCCESS) {
-        std::fprintf(stderr, "[vulkan] vkCreateInstance failed\n");
+    const VkResult created = vkCreateInstance(&instance_info, nullptr, &instance_);
+    if (created != VK_SUCCESS) {
+        // The result says which: no driver (VK_ERROR_INCOMPATIBLE_DRIVER), an extension or a layer missing.
+        std::fprintf(stderr, "[vulkan] vkCreateInstance failed: VkResult %d (%u extensions, %u layers asked for)\n",
+                     static_cast<int>(created), instance_info.enabledExtensionCount, instance_info.enabledLayerCount);
         return false;
     }
     volkLoadInstance(instance_);
@@ -429,8 +449,8 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
     debug_names_ = debug_utils;
     VkSurfaceKHR window_surface = VK_NULL_HANDLE;
     // Every failure from here leaves no instance, device or surface behind.
-    const auto fail = [&](const char* message) {
-        std::fprintf(stderr, "[vulkan] %s\n", message);
+    const auto fail = [&](const char* message, bool say = true) {
+        if (say) std::fprintf(stderr, "[vulkan] %s\n", message);
         failure_ = message;
         if (window_surface != VK_NULL_HANDLE) {
             if (device_ != VK_NULL_HANDLE) {
@@ -532,6 +552,11 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
     for (const VkPhysicalDevice candidate : devices) {
         VkPhysicalDeviceProperties candidate_properties{};
         vkGetPhysicalDeviceProperties(candidate, &candidate_properties);
+        // --software-device: only a device of the processor type (renderer_choice.h adapter_allowed).
+        if (!adapter_allowed(candidate_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU, ::galaxy::launch_args().software_device,
+                             true)) {
+            continue;
+        }
         VulkanFacts facts;
         facts.swapchain = has_device_extension(candidate, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
         facts.version = std::min(app.apiVersion, candidate_properties.apiVersion);
@@ -565,6 +590,12 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
             break;
         }
         if (refused != RendererRefusal::kVulkanVersion) refused = RendererRefusal::kNoPresentQueue;
+    }
+    if (physical_ == VK_NULL_HANDLE && ::galaxy::launch_args().software_device) {
+        // Said at the start, and no other renderer is tried in its place.
+        const std::string missing = software_device_missing_line(RendererKind::kVulkan);
+        std::printf("%s\n", missing.c_str());
+        return fail(missing.c_str() + std::string("[gpu] ").size(), false);
     }
     if (physical_ == VK_NULL_HANDLE) {
         note_no_device();
@@ -679,8 +710,8 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
         // (a larger set is made while the frames that read the smaller finish: together at most twice the larger).
         const std::uint64_t others = std::uint64_t{kBindlessSamplerSlots} + 16u;
         const auto beyond = [others](std::uint64_t limit) { return limit > others ? limit - others : 0u; };
-        // The tracer's passes name the array beside their own sampled images (rt_backend_vk.cpp: set 0's textures and
-        // reads, 16 with room): both image limits count a pipeline layout's every set.
+        // A draw's other sets name sampled images beside the array (16 with room): both image limits count a pipeline
+        // layout's every set.
         const auto beside = [](std::uint64_t limit) { return limit > 16u ? limit - 16u : 0u; };
         const std::uint64_t images =
             std::min({beside(limits.maxDescriptorSetUpdateAfterBindSampledImages),
@@ -825,6 +856,7 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
     }
     // The driver's per-heap budget (the internal-resolution memory check), where it reports one.
     memory_budget_ = has_device_extension(physical_, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    memory_reading_.forget();
     if (memory_budget_) {
         device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     }
@@ -897,7 +929,7 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
     // both features.
     VkPhysicalDevicePresentIdFeaturesKHR present_id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR};
     VkPhysicalDevicePresentWaitFeaturesKHR present_wait{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR};
-    if (has_device_extension(physical_, VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
+    if (!quirks_.no_present_wait && has_device_extension(physical_, VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
         has_device_extension(physical_, VK_KHR_PRESENT_WAIT_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         features.pNext = &present_id;
@@ -910,6 +942,36 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
         }
         present_id.pNext = nullptr;
         present_wait.pNext = nullptr;
+    }
+    // When each present reached the display (the pacing recorder's report, renderer_vk.cpp report_present_times):
+    // VK_EXT_present_timing, which needs present id 2, calibrated timestamps and surface capabilities 2; its swap chains
+    // wait with present wait 2.
+    VkPhysicalDevicePresentId2FeaturesKHR present_id2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR};
+    VkPhysicalDevicePresentWait2FeaturesKHR present_wait2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR};
+    VkPhysicalDevicePresentTimingFeaturesEXT present_timing{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT};
+    if (surface_capabilities2_ && has_device_extension(physical_, VK_KHR_PRESENT_ID_2_EXTENSION_NAME) &&
+        has_device_extension(physical_, VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME) &&
+        has_device_extension(physical_, VK_EXT_PRESENT_TIMING_EXTENSION_NAME) &&
+        has_device_extension(physical_, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        features.pNext = &present_id2;
+        present_id2.pNext = &present_wait2;
+        present_wait2.pNext = &present_timing;
+        vkGetPhysicalDeviceFeatures2(physical_, &features);
+        present_timing_ = present_id2.presentId2 == VK_TRUE && present_wait2.presentWait2 == VK_TRUE &&
+                          present_timing.presentTiming == VK_TRUE;
+        if (present_timing_) {
+            for (const char* name : {VK_KHR_PRESENT_ID_2_EXTENSION_NAME, VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME,
+                                     VK_EXT_PRESENT_TIMING_EXTENSION_NAME, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME}) {
+                device_extensions.push_back(name);
+            }
+        }
+        present_id2.pNext = nullptr;
+        present_wait2.pNext = nullptr;
+        present_timing.pNext = nullptr;
+        // Only the reports: no present at a time asked for.
+        present_timing.presentAtAbsoluteTime = VK_FALSE;
+        present_timing.presentAtRelativeTime = VK_FALSE;
     }
     // A present mode per present (the surface side was enabled on the instance): swapchain maintenance 1 and its feature.
     VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT swap_maintenance{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT};
@@ -978,22 +1040,40 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
     VkPhysicalDevice16BitStorageFeatures storage16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES};
     VkPhysicalDeviceSubgroupSizeControlFeaturesEXT subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT};
     VkPhysicalDeviceSeparateDepthStencilLayoutsFeaturesKHR separate{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES_KHR};
-    if (fsr3_compiled() && core_12 && has_device_extension(physical_, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME) &&
-        has_device_extension(physical_, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME) &&
-        has_device_extension(physical_, VK_KHR_SEPARATE_DEPTH_STENCIL_LAYOUTS_EXTENSION_NAME) &&
-        has_device_extension(physical_, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME) &&
-        available.independentBlend == VK_TRUE && available.shaderInt16 == VK_TRUE &&
-        available.shaderStorageImageWriteWithoutFormat == VK_TRUE &&
-        available.shaderStorageImageExtendedFormats == VK_TRUE) {
+    // What keeps it off this device, named in the log (an upscaler the settings do not offer says why there).
+    std::string fsr3_lacks;
+    bool fsr3_device = fsr3_compiled();
+    const auto fsr3_needs = [&fsr3_lacks, &fsr3_device](bool present, const char* what) {
+        if (!present) {
+            fsr3_device = false;
+            fsr3_lacks += (fsr3_lacks.empty() ? "" : ", ") + std::string(what);
+        }
+        return present;
+    };
+    if (fsr3_device) {
+        fsr3_needs(core_12, "Vulkan 1.2");
+        for (const char* extension : {VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,
+                                      VK_KHR_SEPARATE_DEPTH_STENCIL_LAYOUTS_EXTENSION_NAME, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME}) {
+            fsr3_needs(has_device_extension(physical_, extension), extension);
+        }
+        fsr3_needs(available.independentBlend == VK_TRUE, "independentBlend");
+        fsr3_needs(available.shaderInt16 == VK_TRUE, "shaderInt16");
+        fsr3_needs(available.shaderStorageImageWriteWithoutFormat == VK_TRUE, "shaderStorageImageWriteWithoutFormat");
+        fsr3_needs(available.shaderStorageImageExtendedFormats == VK_TRUE, "shaderStorageImageExtendedFormats");
+    }
+    if (fsr3_device) {
         float16.pNext = &storage16;
         storage16.pNext = &subgroup;
         subgroup.pNext = &separate;
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         features.pNext = &float16;
         vkGetPhysicalDeviceFeatures2(physical_, &features);
-        temporal_upscaling_ = float16.shaderFloat16 == VK_TRUE && storage16.storageBuffer16BitAccess == VK_TRUE &&
-                              subgroup.subgroupSizeControl == VK_TRUE && subgroup.computeFullSubgroups == VK_TRUE &&
-                              separate.separateDepthStencilLayouts == VK_TRUE;
+        fsr3_needs(float16.shaderFloat16 == VK_TRUE, "shaderFloat16");
+        fsr3_needs(storage16.storageBuffer16BitAccess == VK_TRUE, "storageBuffer16BitAccess");
+        fsr3_needs(subgroup.subgroupSizeControl == VK_TRUE, "subgroupSizeControl");
+        fsr3_needs(subgroup.computeFullSubgroups == VK_TRUE, "computeFullSubgroups");
+        fsr3_needs(separate.separateDepthStencilLayouts == VK_TRUE, "separateDepthStencilLayouts");
+        temporal_upscaling_ = fsr3_device;
         if (temporal_upscaling_) {
             enabled.shaderInt16 = VK_TRUE;
             device_extensions.push_back(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
@@ -1004,61 +1084,11 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
             enabled.shaderStorageImageExtendedFormats = VK_TRUE;
         }
     }
-    // Ray tracing (rt_caps.h): acceleration structures and ray queries, with device addresses, on Vulkan 1.2 (descriptor
-    // indexing, SPIR-V 1.4 and the address feature are core there). Reported for every device; the device is made with
-    // them only when `ray_tracing` asks.
-    VkPhysicalDeviceAccelerationStructureFeaturesKHR rt_structures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
-    VkPhysicalDeviceRayQueryFeaturesKHR rt_queries{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
-    rt_caps_ = RtCaps{};
-    rt_caps_.shaders = rt_shaders_present();
-    rt_caps_.bindless = bindless_;
-    rt_caps_.unified_memory = properties_.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
-    // --diagnostics rt-absent: taken as a device without ray tracing.
-    if (!::galaxy::diagnosing(::galaxy::kDiagnoseRtAbsent) && core_12 &&
-        has_device_extension(physical_, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
-        has_device_extension(physical_, VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
-        has_device_extension(physical_, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)) {
-        VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-        rt_structures.pNext = &rt_queries;
-        rt_queries.pNext = &have12;
-        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-        features.pNext = &rt_structures;
-        vkGetPhysicalDeviceFeatures2(physical_, &features);
-        rt_caps_.acceleration_structures = rt_structures.accelerationStructure == VK_TRUE && have12.bufferDeviceAddress == VK_TRUE;
-        rt_caps_.ray_queries = rt_queries.rayQuery == VK_TRUE;
-        // Opacity micromaps: the extension and its feature, with synchronization2's barriers (a micromap
-        // build's stage has no version-1 bit).
-        if (has_device_extension(physical_, VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME) && (sync2_core || sync2_extension)) {
-            VkPhysicalDeviceOpacityMicromapFeaturesEXT have_micromaps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT};
-            VkPhysicalDeviceFeatures2 micromap_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-            micromap_features.pNext = &have_micromaps;
-            vkGetPhysicalDeviceFeatures2(physical_, &micromap_features);
-            rt_caps_.micromaps = have_micromaps.micromap == VK_TRUE;
-        }
-        // A pass reads the texture a ray meets: an index that differs from pixel to pixel.
-        rt_caps_.bindless = bindless_ && have12.shaderSampledImageArrayNonUniformIndexing == VK_TRUE;
-    }
-    // The prepass's pixel stage reads its triangle's number where Vulkan gives a fragment shader one: on a device with
-    // geometry shaders. Without them (or under rt-no-geometry, the test of that) the prepass names its item only and
-    // the surface pass finds the triangle by a ray.
-    rt_caps_.triangle_ids = available.geometryShader == VK_TRUE && !::galaxy::diagnosing(::galaxy::kDiagnoseRtNoGeometry);
-    const bool rt_enable = ray_tracing && rt_caps_.ray_queries && rt_caps_.acceleration_structures && rt_caps_.bindless;
-    if (rt_enable && rt_caps_.triangle_ids) {
-        enabled.geometryShader = VK_TRUE;
-    }
-    // Only what the tracer uses is enabled, whatever else the device reports in these structures.
-    rt_structures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
-    rt_structures.accelerationStructure = VK_TRUE;
-    rt_queries = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
-    rt_queries.rayQuery = VK_TRUE;
-    VkPhysicalDeviceOpacityMicromapFeaturesEXT micromaps_on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT};
-    micromaps_on.micromap = VK_TRUE;
-    if (rt_enable) {
-        device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
-        device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
-        device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
-        if (rt_caps_.micromaps) {
-            device_extensions.push_back(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
+    if (fsr3_compiled()) {
+        if (temporal_upscaling_) {
+            std::fprintf(stderr, "[vulkan] FSR 3: the device has what it needs\n");
+        } else {
+            std::fprintf(stderr, "[vulkan] FSR 3 is not offered on this device: it lacks %s\n", fsr3_lacks.c_str());
         }
     }
     depth_clamp_ = available.depthClamp == VK_TRUE;
@@ -1067,15 +1097,6 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
         depth_clip.pNext = nullptr;
         depth_clip.depthClipEnable = VK_TRUE;
         device_info.pNext = &depth_clip;
-    }
-    if (rt_enable) {
-        rt_queries.pNext = const_cast<void*>(device_info.pNext);
-        rt_structures.pNext = &rt_queries;
-        device_info.pNext = &rt_structures;
-    }
-    if (rt_enable && rt_caps_.micromaps) {
-        micromaps_on.pNext = const_cast<void*>(device_info.pNext);
-        device_info.pNext = &micromaps_on;
     }
     if (sync2_extension) {
         sync2.pNext = const_cast<void*>(device_info.pNext);
@@ -1094,6 +1115,12 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
         present_id.pNext = &present_wait;
         device_info.pNext = &present_id;
     }
+    if (present_timing_) {
+        present_timing.pNext = const_cast<void*>(device_info.pNext);
+        present_wait2.pNext = &present_timing;
+        present_id2.pNext = &present_wait2;
+        device_info.pNext = &present_id2;
+    }
     if (present_mode_switching_) {
         swap_maintenance.pNext = const_cast<void*>(device_info.pNext);
         device_info.pNext = &swap_maintenance;
@@ -1107,10 +1134,6 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
         device_info.pNext = &timeline_features;
     }
     if (core_12) {
-        if (rt_enable) {
-            features12.bufferDeviceAddress = VK_TRUE;
-            features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
-        }
         if (temporal_upscaling_) {
             features11.storageBuffer16BitAccess = VK_TRUE;
             features12.shaderFloat16 = VK_TRUE;
@@ -1251,7 +1274,6 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
         return fail("vkCreateDevice failed");
     }
     volkLoadDevice(device_);
-    rt_caps_.enabled = rt_enable;
     fault_reported_.store(false, std::memory_order_relaxed);
     simulated_loss_.store(false, std::memory_order_relaxed);
     loss_was_simulated_ = false;
@@ -1306,7 +1328,7 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
     functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
     VmaAllocatorCreateInfo allocator_info{};
-    allocator_info.vulkanApiVersion = vulkan_1_0 ? VK_API_VERSION_1_0 : VK_API_VERSION_1_1;
+    allocator_info.vulkanApiVersion = allocator_api_version(app.apiVersion, properties_.apiVersion);
     if (dedicated_extension) {
         allocator_info.flags |= VMA_ALLOCATOR_CREATE_KHR_DEDICATED_ALLOCATION_BIT;
     }
@@ -1319,11 +1341,6 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
     allocator_info.preferredLargeHeapBlockSize = VkDeviceSize{64} << 20u;
     if (memory_budget_) {
         allocator_info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
-    }
-    if (rt_caps_.enabled) {
-        // Buffers an acceleration structure is built from are named by device address (core in the device's Vulkan 1.2).
-        allocator_info.vulkanApiVersion = VK_API_VERSION_1_2;
-        allocator_info.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
     }
     if (vmaCreateAllocator(&allocator_info, &allocator_) != VK_SUCCESS) {
         allocator_ = nullptr;
@@ -1897,16 +1914,15 @@ bool Context::grey_view(Texture& texture) const {
 bool Context::device_memory_budget(std::uint64_t& usage, std::uint64_t& budget) const noexcept {
     usage = budget = 0u;
     if (memory_budget_ && physical_ != VK_NULL_HANDLE) {
-        // The driver's own figures, whole-process and whoever else is on the card, read afresh at most ten times a second.
+        // The driver's own figures, whole-process and whoever else is on the card, by the renderers' rule (at most ten
+        // reads a second).
         const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
                                      std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (memory_budget_bytes_ == 0u || now - memory_read_ms_ >= 100) {
+        const auto ask = [this](std::uint64_t& used, std::uint64_t& largest) {
             VkPhysicalDeviceMemoryBudgetPropertiesEXT extension{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
             VkPhysicalDeviceMemoryProperties2 memory2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
             memory2.pNext = &extension;
             vkGetPhysicalDeviceMemoryProperties2(physical_, &memory2);
-            std::uint64_t largest = 0u;
-            std::uint64_t used = 0u;
             // The largest device-local heap holds the render targets (the only one on most devices).
             for (std::uint32_t i = 0; i < memory2.memoryProperties.memoryHeapCount; ++i) {
                 if ((memory2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0u &&
@@ -1915,15 +1931,12 @@ bool Context::device_memory_budget(std::uint64_t& usage, std::uint64_t& budget) 
                     used = extension.heapUsage[i];
                 }
             }
-            memory_read_ms_ = now;
-            memory_budget_bytes_ = largest;
-            memory_usage_ = used;
-        }
-        if (memory_budget_bytes_ != 0u) {
-            usage = memory_usage_;
-            budget = memory_budget_bytes_;
+            return true;
+        };
+        if (memory_reading_.read(now, false, ask, usage, budget)) {
             return true;
         }
+        usage = budget = 0u;
     }
     if (allocator_ == nullptr) {
         return false;
@@ -2135,14 +2148,10 @@ UploadMemory create_upload_memory(Device*, std::size_t bytes, const char* name, 
     const bool local = place == UploadPlace::GpuLocal && context.device_mapped_memory();
     // One buffer serves any ring: vertices, indices, constants (uniform) and rows (storage). A binding's whole range must
     // lie in its buffer at any offset an allocation can have, hence the room past the end.
-    // With ray tracing on, an acceleration structure is built from the vertices and indices where they lie.
-    const VkBufferUsageFlags traced = context.rt_caps().enabled ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                                                                      VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
-                                                                : VkBufferUsageFlags{0u};
     std::shared_ptr<vk::Buffer> buffer = context.create_buffer(
         bytes + kBindingRoom,
         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | traced,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         name, local ? vk::BufferPlace::DeviceMapped : vk::BufferPlace::Host);
     if (!buffer) {
         return {};

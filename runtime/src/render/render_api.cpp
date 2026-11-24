@@ -68,10 +68,6 @@ unsigned bloom_route() noexcept {
     return backend().bloom_route();
 }
 
-std::uint32_t screen_probe_results(std::uint32_t channel, ScreenProbe* probes, std::uint32_t capacity) {
-    return backend().screen_probe_results(channel, probes, capacity);
-}
-
 void pump_messages() {
     backend().pump_messages();
 }

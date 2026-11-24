@@ -76,6 +76,8 @@ namespace {
 std::mutex g_input_mutex;
 InputState g_input;  // guarded by g_input_mutex
 NSWindow* g_window = nil;       // the main thread's
+// The window cannot be seen (minimised, or no part of it visible on a screen): window_unseen, for the render thread.
+std::atomic<bool> g_unseen{false};
 NebulaView* g_view = nil;
 id g_delegate = nil;
 std::vector<std::filesystem::path> g_opened_early;  // files opened before the window (the main thread's)
@@ -96,10 +98,15 @@ std::atomic<std::int64_t> g_pad_input_ms{0};
 // Held while someone plays with a controller in front (hold_display_for_pads; the main thread's).
 IOPMAssertionID g_display_assertion = kIOPMNullAssertionID;
 bool g_cursor_hidden = false;
+// A mod's first-person look wants the mouse (set_mouse_look, any thread); the window holds it now (the main thread's):
+// the cursor hidden and kept still, its moves the look's.
+std::atomic<bool> g_mouse_look_wanted{false};
+bool g_mouse_look_held = false;
 // The display mode the window was last put in (RenderConfig::display_mode; ~0: none yet).
 unsigned g_applied_mode = ~0u;
 // The system refused the last change to full screen (the main thread's).
 bool g_full_screen_owed = false;
+double g_wheel_carry = 0.0;  // the wheel's turn short of a 120th of a notch (pump_events, the main thread)
 
 // Keys the settings menu takes from other threads and from the pads, in order, on the main thread.
 std::mutex g_menu_keys_mutex;
@@ -218,6 +225,14 @@ void mouse_at(NSEvent* event) {
     const NSSize pixels = [view convertSizeToBacking:view.bounds.size];
     const bool inside = NSPointInRect([view convertPoint:event.locationInWindow fromView:nil], view.bounds);
     const std::lock_guard<std::mutex> lock(g_input_mutex);
+    if (g_mouse_look_held) {
+        // Held for a first-person look: the cursor stays where it is; its motion is the look's (points, y down).
+        g_input.mouse_dx += static_cast<float>(event.deltaX);
+        g_input.mouse_dy += static_cast<float>(event.deltaY);
+        g_input.mouse_pointer = true;
+        g_input.mouse_inside = true;
+        return;
+    }
     g_input.finger_x = static_cast<float>(place.x);
     g_input.finger_y = static_cast<float>(pixels.height - place.y);
     g_input.finger_ms = galaxy::steady_ms();
@@ -235,8 +250,17 @@ void update_cursor() {
         inside = g_input.mouse_inside;
         focused = g_input.window_focused;
     }
-    const bool hide = inside && focused && NSApp.active && g_panels.load(std::memory_order_relaxed) == 0 &&
-                      g_window != nil && g_window.keyWindow;
+    const bool front = focused && NSApp.active && g_panels.load(std::memory_order_relaxed) == 0 && g_window != nil &&
+                       g_window.keyWindow;
+    // A mod's first-person look holds the mouse while the window is in front: the cursor detached from the mouse.
+    const bool hold = front && g_mouse_look_wanted.load(std::memory_order_acquire);
+    if (hold != g_mouse_look_held) {
+        g_mouse_look_held = hold;
+        (void)CGAssociateMouseAndMouseCursorPosition(hold ? false : true);
+        const std::lock_guard<std::mutex> lock(g_input_mutex);
+        g_input.mouse_dx = g_input.mouse_dy = 0.0f;
+    }
+    const bool hide = ((inside && front) || hold);
     if (hide != g_cursor_hidden) {
         g_cursor_hidden = hide;
         if (hide) {
@@ -784,11 +808,17 @@ void files_opened(NSArray<NSURL*>* urls) {
 // A minimised window: the host stops the game's clocks and sound as for an app out of sight.
 - (void)windowDidMiniaturize:(NSNotification*)notification {
     galaxy::sdl::g_background.store(true, std::memory_order_release);
+    galaxy::sdl::g_unseen.store(true, std::memory_order_release);
     [self lumaDisplayChanged];
 }
 - (void)windowDidDeminiaturize:(NSNotification*)notification {
     galaxy::sdl::g_background.store(false, std::memory_order_release);
+    galaxy::sdl::g_unseen.store(!(galaxy::sdl::g_window.occlusionState & NSWindowOcclusionStateVisible), std::memory_order_release);
     [self lumaDisplayChanged];
+}
+- (void)windowDidChangeOcclusionState:(NSNotification*)notification {
+    galaxy::sdl::g_unseen.store(galaxy::sdl::g_window.isMiniaturized || !(galaxy::sdl::g_window.occlusionState & NSWindowOcclusionStateVisible),
+                   std::memory_order_release);
 }
 - (void)windowDidBecomeKey:(NSNotification*)notification {
     {
@@ -981,6 +1011,32 @@ void start_app() noexcept {
     }
 }
 
+// The game window is made transparent and shown by the renderer once its first picture reached it (show_window). Main thread.
+bool window_has_picture() noexcept {
+    return galaxy::sdl::g_window == nil || galaxy::sdl::g_window.alphaValue > 0.5;
+}
+
+// A start that has shown nothing for a while: the window is made visible (the system's full screen and the window's own
+// picture aside) and a message sheet says so, with the window still closable. Main thread; the game goes on behind it.
+void show_stalled_start(const char* title, const char* text) noexcept {
+    @autoreleasepool {
+        NSWindow* const window = galaxy::sdl::g_window;
+        if (window != nil) {
+            [window setAlphaValue:1.0];
+        }
+        std::fprintf(stderr, "[start] %s: %s\n", title, text);
+        NSAlert* const alert = [NSAlert new];
+        alert.alertStyle = NSAlertStyleWarning;
+        alert.messageText = @(title);
+        alert.informativeText = @(text);
+        if (window != nil) {
+            [alert beginSheetModalForWindow:window completionHandler:nil];
+        } else {
+            [alert runModal];
+        }
+    }
+}
+
 }  // namespace galaxy::apple
 
 namespace galaxy::sdl {
@@ -1052,11 +1108,14 @@ void pump_events(int timeout_ms) noexcept {
                 break;
             }
             case NSEventTypeScrollWheel: {
-                // In 120ths of a notch, positive away from the player (Windows' WHEEL_DELTA), as the game takes it: a
-                // wheel's lines, or a trackpad's points at ten to a notch.
-                const double turned = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY / 10.0 : event.scrollingDeltaY;
-                const double notches = event.directionInvertedFromDevice ? -turned : turned;
-                menu_wheel += static_cast<int>(std::lround(notches * 120.0));
+                // In 120ths of a notch, positive scrolling back up the page (Windows' WHEEL_DELTA), as the game takes
+                // it: a wheel's lines, or a trackpad's points at ten to a notch. The turn as the system gives it: with
+                // natural scrolling on the list moves the way every other page does. Parts of a notch add up (the carry).
+                const double notches = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY / 10.0 : event.scrollingDeltaY;
+                g_wheel_carry += notches * 120.0;
+                const double whole = std::trunc(g_wheel_carry);
+                g_wheel_carry -= whole;
+                menu_wheel += static_cast<int>(whole);
                 break;
             }
             default:
@@ -1087,7 +1146,7 @@ void pump_events(int timeout_ms) noexcept {
                     galaxy::ui::launcher_visible() || galaxy::bench::running(),
                 galaxy::steady_ms());
             for (std::size_t i = 0; i < step.key_count; ++i) {
-                galaxy::render::native_settings_post_key(step.keys[i]);
+                galaxy::render::native_settings_post_key(step.keys[i] | (((step.repeats >> i) & 1u) != 0u ? galaxy::render::kMenuKeyRepeat : 0u));
             }
             break;
         }
@@ -1166,7 +1225,12 @@ InputState take_input_state() noexcept {
         motion.gyro_x = motion.gyro_y = 0.0f;
         motion.touch_dx = motion.touch_dy = 0.0f;
     }
+    g_input.mouse_dx = g_input.mouse_dy = 0.0f;
     return state;
+}
+
+void set_mouse_look(bool hold) noexcept {
+    g_mouse_look_wanted.store(hold, std::memory_order_release);
 }
 
 void rumble(std::uint32_t pad_id, float strength) noexcept {
@@ -1290,6 +1354,10 @@ void show_window(NativeWindow) noexcept {
     on_main(^{
         [g_window setAlphaValue:1.0];
     });
+}
+
+bool window_unseen(NativeWindow window) noexcept {
+    return window == nullptr || galaxy::sdl::g_unseen.load(std::memory_order_acquire);
 }
 
 // The display link's rate where it is known (display_clock_apple.mm), to the whole Hz; else the screen's own.

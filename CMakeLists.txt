@@ -1,6 +1,50 @@
 cmake_minimum_required(VERSION 3.24)
 project(Nebula VERSION 2.0.0 LANGUAGES C CXX)
-add_compile_definitions(NEBULA_VERSION="${PROJECT_VERSION}")
+# What the host computes for the game (a stick's position above all) is the same bits on every CPU: no multiply and
+# add is fused into one rounding. Clang fuses them by default on CPUs with a fused multiply-add (arm64, and x86-64 at
+# AVX2): a tablet's stick then differed from a computer's by one ulp, and its replay from the computer's (N-1064). The
+# game module is built the same way (native/CMakeLists.txt). MSVC fuses none at /fp:precise without /fp:contract.
+if(MSVC)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/clang:-ffp-contract=off>)
+    endif()
+else()
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-ffp-contract=off>)
+endif()
+
+# The programs' debug information (crash dumps, the profiler): one PDB per program (/Zi), or inside each object (/Z7)
+# when a compiler cache sits in front of the compiler (the push workflow's sccache), which cannot cache a shared PDB.
+# The linker makes the same PDB either way.
+if(CMAKE_CXX_COMPILER_LAUNCHER OR "$ENV{CMAKE_CXX_COMPILER_LAUNCHER}")
+    set(NEBULA_MSVC_DEBUG_INFO /Z7)
+else()
+    set(NEBULA_MSVC_DEBUG_INFO /Zi)
+endif()
+include(cmake/nebula_options.cmake)
+add_compile_definitions(NEBULA_VERSION="${PROJECT_VERSION}${NEBULA_VERSION_SUFFIX}")
+
+# Coverage builds (the gate's long run, tools/gate/coverage.py, N-1042): every program, library and test counts the lines
+# and functions it runs (clang's source-based coverage), each process writing them where LLVM_PROFILE_FILE says when it
+# ends (the host writes its counts itself: native/host/host_main.cpp). Clang-cl only; no optimizing across source files,
+# and warnings stay warnings (clang names some that Microsoft's compiler does not; the gate's MSVC build keeps /WX).
+option(NEBULA_COVERAGE "Count the lines and functions every program runs (clang-cl)" OFF)
+if(NEBULA_COVERAGE)
+    if(NOT (MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang"))
+        message(FATAL_ERROR "NEBULA_COVERAGE needs clang-cl")
+    endif()
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fprofile-instr-generate> $<$<COMPILE_LANGUAGE:C,CXX>:-fcoverage-mapping>)
+    add_compile_definitions(NEBULA_COVERAGE=1)
+    # The profile runtime from the compiler's own resource folder.
+    execute_process(COMMAND "${CMAKE_CXX_COMPILER}" /clang:-print-resource-dir OUTPUT_VARIABLE nebula_clang_resources
+                    OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE nebula_clang_resources_result)
+    set(nebula_profile_runtime "${nebula_clang_resources}/lib/windows/clang_rt.profile-x86_64.lib")
+    if(NOT nebula_clang_resources_result EQUAL 0 OR NOT EXISTS "${nebula_profile_runtime}")
+        message(FATAL_ERROR "NEBULA_COVERAGE: no ${nebula_profile_runtime}")
+    endif()
+    link_libraries("${nebula_profile_runtime}")
+endif()
+# /WX beside /W4 in the targets below, except in a coverage build.
+set(NEBULA_WARNINGS_AS_ERRORS $<$<NOT:$<BOOL:${NEBULA_COVERAGE}>>:/WX>)
 
 # One build: a release and a test run use the same binaries (tools/release_check.ps1 checks the sources and the release).
 # The standard library's bounds checks (array, vector, span, string_view subscripts and the like) in every host build: an
@@ -82,7 +126,7 @@ endif()
 # The host libraries' Release code: no buffer security checks, no RTTI.
 function(galaxy_host_options target)
     if(MSVC)
-        target_compile_options(${target} PRIVATE /GS- /GR- /Oi /favor:INTEL64)
+        target_compile_options(${target} PRIVATE /GS- /GR- /Oi $<$<CXX_COMPILER_ID:MSVC>:/favor:INTEL64>)
     endif()
 endfunction()
 
@@ -118,7 +162,7 @@ function(nebula_host_cpu_entry target)
         target_include_directories(nebula_host_entry PRIVATE runtime/include)
         get_target_property(entry_options nebula_host_entry COMPILE_OPTIONS)
         list(FILTER entry_options EXCLUDE REGEX "arch:AVX2|-mavx2")
-        list(APPEND entry_options /GS- /Zi)
+        list(APPEND entry_options /GS- ${NEBULA_MSVC_DEBUG_INFO})
         set_property(TARGET nebula_host_entry PROPERTY COMPILE_OPTIONS "${entry_options}")
     endif()
     target_link_libraries(${target} PRIVATE nebula_host_entry)
@@ -137,104 +181,13 @@ endfunction()
 
 include_directories("${CMAKE_CURRENT_LIST_DIR}/native/include")
 
-add_library(galaxy_runtime_abi INTERFACE)
-target_include_directories(galaxy_runtime_abi INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/include")
-
-add_library(galaxy_atomic_file STATIC runtime/src/atomic_file.cpp)
-target_link_libraries(galaxy_atomic_file PUBLIC galaxy_runtime_abi)
-
-add_library(galaxy_asset_store STATIC runtime/src/asset_store.cpp)
-target_link_libraries(galaxy_asset_store PUBLIC galaxy_runtime_abi)
-
-add_library(galaxy_save_files STATIC runtime/src/save_files.cpp)
-target_link_libraries(galaxy_save_files PUBLIC galaxy_runtime_abi galaxy_atomic_file)
-
-# Every console's Mii files (mii_formats.h): the Mii import's reader, and where a Wii save folder keeps its Mii database.
-add_library(galaxy_mii_formats STATIC runtime/src/mii_formats.cpp)
-target_link_libraries(galaxy_mii_formats PUBLIC galaxy_runtime_abi)
-galaxy_host_options(galaxy_mii_formats)
-
-# Save import and export in the game (save_transfer.h): its zips, the Wii SD save's AES and the GameData.bin check are
-# BoringSSL's, zlib's inflate and the game's own SaveFileFormat.hpp.
-add_library(galaxy_save_transfer STATIC runtime/src/save_transfer.cpp)
-target_link_libraries(galaxy_save_transfer PUBLIC galaxy_runtime_abi galaxy_atomic_file nebula_bssl_crypto nebula_zinflate
-    PRIVATE galaxy_mii_formats)
-target_include_directories(galaxy_save_transfer PRIVATE native/petari/include)
-
-# The host's extensions (host_extension.h, --extension).
-add_library(galaxy_host_extension STATIC runtime/src/host_extension.cpp runtime/src/luma_services_host.cpp)
-target_link_libraries(galaxy_host_extension PUBLIC galaxy_runtime_abi)
-galaxy_host_options(galaxy_host_extension)
-add_library(galaxy_runtime_settings STATIC
-    runtime/src/runtime_settings.cpp
-    runtime/src/input_bindings.cpp
-    runtime/src/input/mod_actions.cpp
-    runtime/src/achievements.cpp
-    runtime/src/stats.cpp
-    runtime/src/coop_menu.cpp
-    runtime/src/coop_saves.cpp)
-target_link_libraries(galaxy_runtime_settings PUBLIC galaxy_runtime_abi galaxy_atomic_file galaxy_host_extension)
-galaxy_host_options(galaxy_runtime_settings)
-
-# Online co-op's network layer (runtime/src/net, docs/COOP_PLAN.md "Phase 1"): UDP sockets, the reliable and ordered
-# channels, the CoopNet-shaped direct transport and the session over it, with the join's checks and the room's mods.
-add_library(galaxy_net STATIC
-    runtime/src/net/udp.cpp
-    runtime/src/net/link.cpp
-    runtime/src/net/direct_transport.cpp
-    runtime/src/net/stun.cpp
-    runtime/src/net/turn.cpp
-    runtime/src/net/digest.cpp
-    runtime/src/net/json.cpp
-    runtime/src/net/web.cpp
-    runtime/src/net/web_win.cpp
-    runtime/src/net/web_curl.cpp
-    runtime/src/coop_nebulanet.cpp
-    runtime/src/coop_mods.cpp
-    runtime/src/coop_session.cpp
-    runtime/src/coop_chat.cpp
-    runtime/src/coop_commands.cpp
-    runtime/src/coop_popups.cpp
-    runtime/src/coop_snapshot.cpp
-    runtime/src/coop_teleport.cpp
-    runtime/src/coop_world.cpp)
-# NebulaNet's web calls: WinHTTP on Windows, the system's libcurl (loaded when first used) elsewhere.
-target_link_libraries(galaxy_net PUBLIC galaxy_runtime_abi galaxy_atomic_file ws2_32 winhttp)
-galaxy_host_options(galaxy_net)
-
-add_library(galaxy_host_pointer_events STATIC runtime/src/host_pointer_events.cpp)
-target_link_libraries(galaxy_host_pointer_events PUBLIC galaxy_runtime_abi)
-galaxy_host_options(galaxy_host_pointer_events)
-
-add_library(galaxy_native_input STATIC
-    runtime/src/controller_roster.cpp
-    runtime/src/generic_hid.cpp
-    runtime/src/input/wiimote_input.cpp
-    runtime/src/input/wiimote_motion.cpp
-    runtime/src/input/wiimote_motion_pointer.cpp
-    runtime/src/native_input.cpp
-    runtime/src/playstation_controller.cpp
-    runtime/src/simple_pads.cpp
-    runtime/src/switch2_ble.cpp
-    runtime/src/pointer_control.cpp
-    runtime/src/rumble.cpp
-    runtime/src/steam_controller.cpp
-    runtime/src/switch_controller.cpp
-    runtime/src/tilt.cpp
-    runtime/src/wiimote_protocol.cpp
-    runtime/src/wiimote_speaker.cpp)
-target_link_libraries(galaxy_native_input PUBLIC galaxy_runtime_abi)
-galaxy_host_options(galaxy_native_input)
-
-# The game's sound mixed natively (audio_mixer.h).
-add_library(galaxy_audio_mixer STATIC runtime/src/audio_mixer.cpp runtime/src/movie_audio.cpp)
-target_include_directories(galaxy_audio_mixer PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/runtime/include"
-                           "${CMAKE_CURRENT_SOURCE_DIR}/native/include")
-galaxy_host_options(galaxy_audio_mixer)
+# The runtime's small libraries (shared with the unit tests' own project, tests/unit).
+include(cmake/runtime_libs.cmake)
 
 add_library(galaxy_native_host STATIC
     runtime/src/game_paths.cpp
     runtime/src/hidden_start.cpp
+    runtime/src/whole_lines.cpp
     runtime/src/input/host_input.cpp
     runtime/src/input/controls_engine.cpp
     runtime/src/input/live_controls_engine.cpp
@@ -454,13 +407,6 @@ if(NOT GALAXY_DXC)
     find_program(GALAXY_DXC dxc REQUIRED)
 endif()
 
-# The tracer's shaders, compiled by dxc at build with NEBULA_RAY_TRACING (cmake/rt_shaders.cmake).
-include(cmake/rt_shaders.cmake)
-set(galaxy_rt_dxil "")
-if(NEBULA_RAY_TRACING)
-    galaxy_rt_shaders(galaxy_rt_dxil dxil "${GALAXY_DXC}")
-endif()
-
 # The programs, compiled by dxc at build into one file (cmake/native_materials.cmake).
 include(cmake/native_materials.cmake)
 galaxy_program_blob(galaxy_programs_dxil dxil)
@@ -481,6 +427,7 @@ add_library(galaxy_render STATIC
     "${galaxy_utility_shader_dir}/utility_shaders_dxbc.h"
     runtime/src/render/render_api.cpp
     runtime/src/render/render_config.cpp
+    runtime/src/render/device_memory.cpp
     runtime/src/render/renderer_choice.cpp
     runtime/src/render/renderer_check_win32.cpp
 runtime/src/render/host_window_win32.cpp
@@ -532,42 +479,29 @@ runtime/src/render/host_window_win32.cpp
     runtime/src/render/temporal_upscaler.cpp
     runtime/src/render/xess_library.cpp
     runtime/src/render/xess_upscaler.cpp
-    runtime/src/render/rt_materials.cpp
-    runtime/src/render/rt_caps.cpp
-    runtime/src/render/rt/rt_shaders.cpp
-    runtime/src/render/rt/rt_backend_d3d12.cpp
-    runtime/src/render/rt/rt_geometry.cpp
-    runtime/src/render/rt/rt_scene.cpp
-    ${galaxy_rt_dxil}
     runtime/src/render/streamline_bridge.cpp
     runtime/src/render/fsr_frame_generation.cpp
     runtime/src/render/frame_interpolation.cpp
     runtime/src/render/display_modes.cpp
     runtime/src/render/os_hdr.cpp
     runtime/src/render/render_core.cpp
+    runtime/src/render/frame_schedule.cpp
+    runtime/src/render/gpu_pass_times.cpp
     runtime/src/render/affine.cpp
     runtime/src/render/core/compose.cpp
     runtime/src/render/core/draw_walker.cpp
-    runtime/src/render/core/rt_walk.cpp
-    runtime/src/render/core/rt_bounce.cpp
-    runtime/src/render/core/rt_pass_indirect.cpp
-    runtime/src/render/core/rt_pass_reflect.cpp
-    runtime/src/render/core/rt_pass_transmit.cpp
-    runtime/src/render/core/rt_pass_volume.cpp
     runtime/src/render/core/pairing.cpp
     runtime/src/render/core/pipelines.cpp
     runtime/src/render/core/program_table.cpp
     runtime/src/render/core/registries.cpp
-    runtime/src/render/core/world_lights.cpp
     runtime/src/render/core/pipelines_d3d12.cpp
     runtime/src/frame_telemetry.cpp
     runtime/src/perf_hint.cpp
+    runtime/src/pacing.cpp
+    runtime/src/pacing_recorder.cpp
 )
 target_include_directories(galaxy_render PUBLIC runtime/src)
-target_include_directories(galaxy_render PRIVATE "${galaxy_utility_shader_dir}" "${galaxy_rt_shader_dir}" runtime/src/render)
-if(NEBULA_RAY_TRACING)
-    target_compile_definitions(galaxy_render PRIVATE GALAXY_RT_DXIL=1)
-endif()
+target_include_directories(galaxy_render PRIVATE "${galaxy_utility_shader_dir}" runtime/src/render)
 # AMD FSR 3 (cmake/fidelityfx.cmake).
 include(cmake/fidelityfx.cmake)
 target_link_libraries(galaxy_render PRIVATE nebula_fidelityfx)
@@ -611,7 +545,7 @@ target_include_directories(galaxy_render
         "${CMAKE_CURRENT_SOURCE_DIR}/native/include"
 )
 if(MSVC)
-    target_compile_options(galaxy_render PRIVATE /GS- /GR- /Oi /favor:INTEL64)
+    target_compile_options(galaxy_render PRIVATE /GS- /GR- /Oi $<$<CXX_COMPILER_ID:MSVC>:/favor:INTEL64>)
 endif()
 
 # The native game's windowed host (native/host): runs the game module that native/CMakeLists.txt builds with clang
@@ -635,10 +569,11 @@ target_compile_features(Nebula PRIVATE cxx_std_20)
 target_link_libraries(Nebula PRIVATE galaxy_render galaxy_save_files galaxy_asset_store dwmapi)
 nebula_agility_runtime(Nebula)
 if(MSVC)
-    # Paths past MAX_PATH (CMake merges a .manifest source into the program's manifest).
+    # The program's identity and the Windows versions it supports, merged into the linker's manifest (which names the
+    # execution level, asInvoker); the DPI and path settings are nebula_game.manifest's.
     target_sources(Nebula PRIVATE native/host/nebula_host.manifest)
     # Symbols for crash dumps and the thread profiler; code generation is unchanged.
-    target_compile_options(Nebula PRIVATE /Zi)
+    target_compile_options(Nebula PRIVATE ${NEBULA_MSVC_DEBUG_INFO})
     target_link_options(Nebula PRIVATE /DEBUG /OPT:REF /OPT:ICF /PDBALTPATH:Nebula.pdb)
 endif()
 nebula_host_cpu_entry(Nebula)
@@ -651,7 +586,7 @@ if(NEBULA_TEST_TOOLS)
     add_compile_definitions(NEBULA_TEST_TOOLS=1)
 endif()
 set(nebula_host_ipo_effective OFF)
-if(NEBULA_HOST_IPO)
+if(NEBULA_HOST_IPO AND NOT NEBULA_COVERAGE)
     include(CheckIPOSupported)
     check_ipo_supported(RESULT nebula_host_ipo_supported OUTPUT nebula_host_ipo_error LANGUAGES CXX)
     if(nebula_host_ipo_supported)
@@ -667,95 +602,38 @@ if(NEBULA_HOST_IPO)
 endif()
 message(STATUS "Host Release IPO: ${nebula_host_ipo_effective}")
 
-enable_testing()
-# A unit test: an executable from SOURCES linked with LIBS, registered with ctest (run with ARGS).
-function(galaxy_test name)
-    cmake_parse_arguments(arg "" "" "SOURCES;LIBS;ARGS" ${ARGN})
-    add_executable(${name} ${arg_SOURCES})
-    target_include_directories(${name} PRIVATE runtime/include)
-    target_compile_features(${name} PRIVATE cxx_std_20)
-    target_link_libraries(${name} PRIVATE galaxy_runtime_abi ${arg_LIBS})
-    if(MSVC)
-        target_compile_options(${name} PRIVATE /W4 /WX /permissive- /EHsc)
-    endif()
-    add_test(NAME ${name} COMMAND ${name} ${arg_ARGS})
-endfunction()
+# The unit tests every desktop system runs (cmake/unit_tests.cmake); the tests of Windows code and of the renderers
+# follow.
+include(cmake/unit_tests.cmake)
 
 set(rt runtime/src)
-galaxy_test(galaxy_atomic_file_tests SOURCES ${rt}/atomic_file_tests.cpp LIBS galaxy_atomic_file)
+set(render_src runtime/src/render)
 # The update core of the desktop hosts (runtime/src/update), with a stand-in transport and platform.
 galaxy_test(galaxy_update_tests SOURCES ${rt}/update/update.cpp ${rt}/update/update_crypto.cpp ${rt}/update/update_tests.cpp
     LIBS galaxy_atomic_file shell32 ARGS "${CMAKE_CURRENT_SOURCE_DIR}/installer/release-public-key.xml")
-galaxy_test(galaxy_save_files_tests SOURCES ${rt}/save_files_tests.cpp LIBS galaxy_save_files)
-galaxy_test(galaxy_save_format_tests SOURCES ${rt}/save_format_tests.cpp)
-galaxy_test(galaxy_launch_args_tests SOURCES ${rt}/launch_args_tests.cpp)
-target_include_directories(galaxy_save_format_tests PRIVATE native/petari/include)
-galaxy_test(galaxy_save_transfer_tests SOURCES ${rt}/save_transfer_tests.cpp LIBS galaxy_save_transfer galaxy_mii_formats)
-galaxy_test(galaxy_asset_store_tests SOURCES ${rt}/asset_store_tests.cpp ${rt}/luma_game_store.cpp LIBS galaxy_asset_store)
-target_include_directories(galaxy_asset_store_tests PRIVATE crates/nebula-import/include)
-# D-07: an older install's store and saves under the current layout.
-galaxy_test(galaxy_install_migration_tests SOURCES ${rt}/install_migration_tests.cpp LIBS galaxy_save_files galaxy_asset_store)
-# The game's calendar (native/petari), compiled against a host the test provides.
-galaxy_test(galaxy_native_calendar_tests SOURCES ${rt}/native_calendar_tests.cpp
-    native/petari/src/Game/System/NebulaCalendar.cpp)
-target_include_directories(galaxy_native_calendar_tests PRIVATE native/include native/petari/include)
-galaxy_test(galaxy_runtime_settings_tests SOURCES ${rt}/runtime_settings_tests.cpp LIBS galaxy_runtime_settings)
-galaxy_test(galaxy_palette_tests SOURCES ${rt}/palette_tests.cpp)
-galaxy_test(galaxy_coop_menu_tests SOURCES ${rt}/coop_menu_tests.cpp LIBS galaxy_runtime_settings)
-galaxy_test(galaxy_net_tests SOURCES ${rt}/net/net_tests.cpp LIBS galaxy_net)
-galaxy_test(galaxy_coop_chat_tests SOURCES ${rt}/coop_chat_tests.cpp LIBS galaxy_net)
-galaxy_test(galaxy_coop_commands_tests SOURCES ${rt}/coop_commands_tests.cpp LIBS galaxy_net)
-galaxy_test(galaxy_coop_popups_tests SOURCES ${rt}/coop_popups_tests.cpp LIBS galaxy_net)
-galaxy_test(galaxy_coop_snapshot_tests SOURCES ${rt}/coop_snapshot_tests.cpp LIBS galaxy_net)
-galaxy_test(galaxy_coop_teleport_tests SOURCES ${rt}/coop_teleport_tests.cpp LIBS galaxy_net)
-galaxy_test(galaxy_coop_world_tests SOURCES ${rt}/coop_world_tests.cpp LIBS galaxy_net)
-galaxy_test(galaxy_achievements_tests SOURCES ${rt}/achievements_tests.cpp LIBS galaxy_runtime_settings)
-galaxy_test(galaxy_stats_tests SOURCES ${rt}/stats_tests.cpp LIBS galaxy_runtime_settings)
-galaxy_test(galaxy_controls_tests SOURCES ${rt}/controls_tests.cpp LIBS galaxy_runtime_settings galaxy_native_input)
 galaxy_test(galaxy_live_controls_engine_tests SOURCES ${rt}/input/live_controls_engine_tests.cpp LIBS galaxy_native_host)
 galaxy_test(galaxy_input_hotplug_tests SOURCES ${rt}/input/input_hotplug_tests.cpp LIBS galaxy_native_host)
-galaxy_test(galaxy_keyboard_layout_tests SOURCES ${rt}/input/keyboard_layout_tests.cpp LIBS galaxy_runtime_settings)
-galaxy_test(galaxy_keyboard_state_tests SOURCES ${rt}/input/keyboard_state_tests.cpp)
-galaxy_test(galaxy_raw_mouse_tests SOURCES ${rt}/input/raw_mouse_tests.cpp)
-galaxy_test(galaxy_rumble_route_tests SOURCES ${rt}/input/rumble_route_tests.cpp ${rt}/input/rumble_route.cpp)
-galaxy_test(galaxy_wiimote_motion_tests SOURCES ${rt}/input/wiimote_motion_tests.cpp ${rt}/input/wiimote_motion.cpp)
-galaxy_test(galaxy_wiimote_motion_pointer_tests SOURCES ${rt}/input/wiimote_motion_pointer_tests.cpp
-    LIBS galaxy_native_input)
-galaxy_test(galaxy_mouse_projection_tests SOURCES ${rt}/input/mouse_projection_tests.cpp LIBS galaxy_native_input)
 galaxy_test(galaxy_raw_mouse_win32_tests SOURCES ${rt}/input/raw_mouse_win32_tests.cpp LIBS galaxy_native_host)
 galaxy_test(galaxy_key_positions_win32_tests SOURCES ${rt}/input/key_positions_win32_tests.cpp
     ${rt}/input/key_positions_win32.cpp LIBS user32)
-galaxy_test(galaxy_pad_controller_tests SOURCES ${rt}/pad_controller_tests.cpp
-    LIBS galaxy_runtime_settings galaxy_native_input)
-galaxy_test(galaxy_native_input_tests SOURCES ${rt}/native_input_tests.cpp LIBS galaxy_native_input)
-galaxy_test(galaxy_wiimote_speaker_tests SOURCES ${rt}/wiimote_speaker_tests.cpp LIBS galaxy_native_input)
-galaxy_test(galaxy_host_pointer_events_tests SOURCES ${rt}/host_pointer_events_tests.cpp
-    LIBS galaxy_host_pointer_events)
-galaxy_test(galaxy_audio_mixer_tests SOURCES ${rt}/audio_mixer_tests.cpp LIBS galaxy_audio_mixer)
-galaxy_test(galaxy_movie_video_tests SOURCES ${rt}/movie_video_tests.cpp ${rt}/movie_video.cpp)
-# draw.post's registry (mod_post.cpp) without a device.
-galaxy_test(galaxy_mod_post_tests SOURCES ${rt}/render/mod_post_tests.cpp ${rt}/render/mod_post.cpp)
 galaxy_test(galaxy_windows_power_tests SOURCES ${rt}/windows_power_tests.cpp)
-if(WIN32)
-    galaxy_test(galaxy_windows_child_tests SOURCES ${rt}/windows_child_tests.cpp)
-endif()
-galaxy_test(galaxy_power_policy_tests SOURCES ${rt}/power_policy_tests.cpp)
-galaxy_test(galaxy_frame_phase_tests SOURCES ${rt}/frame_phase_tests.cpp ${rt}/frame_phase.cpp)
-galaxy_test(galaxy_precise_wait_tests SOURCES ${rt}/precise_wait_tests.cpp)
+galaxy_test(galaxy_windows_child_tests SOURCES ${rt}/windows_child_tests.cpp)
+galaxy_test(galaxy_settings_graphics_page_tests SOURCES ${rt}/ui/settings_graphics_page_tests.cpp
+    ${rt}/ui/settings_graphics_page.cpp ${rt}/ui/settings_model.cpp LIBS galaxy_render)
+# The HDR calibration's steps, with the renderer library's levels and patterns.
+galaxy_test(galaxy_hdr_calibration_tests SOURCES ${rt}/ui/hdr_calibration_tests.cpp LIBS galaxy_render)
+galaxy_test(galaxy_calibration_scene_tests SOURCES ${rt}/calibration_scene_tests.cpp LIBS galaxy_render)
+galaxy_test(galaxy_os_hdr_tests SOURCES ${rt}/render/os_hdr_tests.cpp LIBS galaxy_render)
+galaxy_test(galaxy_window_owner_tests SOURCES ${render_src}/window_owner_tests.cpp ${render_src}/window_owner.cpp)
+target_link_libraries(galaxy_window_owner_tests PRIVATE dwmapi)
+set_tests_properties(galaxy_window_owner_tests PROPERTIES TIMEOUT 20)
+# The frame counts' shared memory for outside readers (frame_telemetry.cpp: Windows only; elsewhere it publishes nothing).
 galaxy_test(galaxy_frame_telemetry_tests SOURCES ${rt}/frame_telemetry_tests.cpp ${rt}/frame_telemetry.cpp)
-galaxy_test(galaxy_mii_import_tests SOURCES ${rt}/mii_import_tests.cpp ${rt}/mii_import.cpp
-    LIBS galaxy_atomic_file galaxy_mii_formats)
-galaxy_test(galaxy_luma_tests SOURCES ${rt}/luma_tests.cpp ${rt}/luma.cpp)
-galaxy_test(galaxy_luma_net_reach_tests SOURCES ${rt}/luma_net_reach_tests.cpp ${rt}/luma_net_reach.cpp)
-galaxy_test(galaxy_mods_tests SOURCES ${rt}/mods_tests.cpp ${rt}/mod_xml.cpp ${rt}/mods.cpp ${rt}/mod_consent.cpp ${rt}/luma.cpp
-    ${rt}/mod_import.cpp ${rt}/texture_categories.cpp ${rt}/dolphin_pack.cpp ${rt}/asset_store.cpp LIBS galaxy_atomic_file nebula_archive)
-# The consent store (docs/modding/concepts/permissions.md): answers, digests and their round trip through the mod settings.
-galaxy_test(galaxy_mod_consent_tests SOURCES ${rt}/mod_consent_tests.cpp ${rt}/mod_consent.cpp ${rt}/mods.cpp ${rt}/mod_xml.cpp
-    ${rt}/luma.cpp ${rt}/mod_import.cpp ${rt}/texture_categories.cpp ${rt}/dolphin_pack.cpp ${rt}/asset_store.cpp
-    LIBS galaxy_atomic_file nebula_archive)
-# Console mods the tests read as files (runtime/tests).
-target_compile_definitions(galaxy_mods_tests PRIVATE MODS_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/runtime/tests")
-galaxy_test(galaxy_crash_report_tests SOURCES ${rt}/crash_report_tests.cpp ${rt}/crash_report.cpp)
+# Renderer core code that reads the GPU types (galaxy/render/gpu_types.h: Direct3D 12's here, with no backend chosen).
+galaxy_test(galaxy_core_pairing_tests SOURCES ${render_src}/core/pairing_tests.cpp ${render_src}/core/pairing.cpp
+    ${render_src}/frame_interpolation.cpp ${render_src}/affine.cpp)
+target_include_directories(galaxy_core_pairing_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/src" "${CMAKE_CURRENT_SOURCE_DIR}/native/include")
 
 # Additions a build asks for at configure, as a list of CMake files (-DNEBULA_EXTRA_CMAKE=<file>;...), each included
 # here after the product's targets and galaxy_test. A build that passes none builds the product and its unit tests only.
@@ -765,67 +643,8 @@ foreach(extra IN LISTS NEBULA_EXTRA_CMAKE)
     include("${extra}")
 endforeach()
 
-galaxy_test(galaxy_home_menu_model_tests SOURCES ${rt}/home_menu_model_tests.cpp)
-galaxy_test(galaxy_launcher_model_tests SOURCES ${rt}/ui/launcher_model_tests.cpp)
-galaxy_test(galaxy_resolution_fit_tests SOURCES ${rt}/render/resolution_fit_tests.cpp)
-galaxy_test(galaxy_benchmark_recommend_tests SOURCES ${rt}/benchmark_recommend_tests.cpp ${rt}/benchmark_recommend.cpp
-    ${rt}/strict_json.cpp)
-galaxy_test(galaxy_benchmark_stats_tests SOURCES ${rt}/benchmark_stats_tests.cpp ${rt}/benchmark_stats.cpp ${rt}/strict_json.cpp)
-galaxy_test(galaxy_diag_report_tests SOURCES ${rt}/diag_report_tests.cpp ${rt}/diag_report.cpp ${rt}/diag_seal.cpp ${rt}/strict_json.cpp
-    LIBS nebula_archive nebula_bssl_crypto)
-target_compile_definitions(galaxy_diag_report_tests PRIVATE
-    NEBULA_BENCHMARK_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tools/telemetry/testdata/benchmark.json")
-
-galaxy_test(galaxy_settings_model_tests SOURCES ${rt}/ui/settings_model_tests.cpp ${rt}/ui/settings_model.cpp)
-
-galaxy_test(galaxy_settings_save_model_tests SOURCES ${rt}/ui/settings_save_model_tests.cpp ${rt}/ui/settings_save_model.cpp)
-
-galaxy_test(galaxy_settings_graphics_page_tests SOURCES ${rt}/ui/settings_graphics_page_tests.cpp
-    ${rt}/ui/settings_graphics_page.cpp ${rt}/ui/settings_model.cpp LIBS galaxy_render)
-
-galaxy_test(galaxy_settings_general_page_tests SOURCES ${rt}/ui/settings_general_page_tests.cpp
-    ${rt}/ui/settings_general_page.cpp ${rt}/ui/settings_model.cpp)
-
-galaxy_test(galaxy_settings_display_page_tests SOURCES ${rt}/ui/settings_display_page_tests.cpp
-    ${rt}/ui/settings_display_page.cpp ${rt}/ui/settings_model.cpp)
-# The HDR calibration's steps, with the renderer library's levels and patterns.
-galaxy_test(galaxy_hdr_calibration_tests SOURCES ${rt}/ui/hdr_calibration_tests.cpp LIBS galaxy_render)
-galaxy_test(galaxy_calibration_scene_tests SOURCES ${rt}/calibration_scene_tests.cpp LIBS galaxy_render)
-galaxy_test(galaxy_os_hdr_tests SOURCES ${rt}/render/os_hdr_tests.cpp LIBS galaxy_render)
-
-galaxy_test(galaxy_settings_advanced_page_tests SOURCES ${rt}/ui/settings_advanced_page_tests.cpp
-    ${rt}/ui/settings_advanced_page.cpp ${rt}/ui/settings_model.cpp runtime/src/render/galaxy_select.cpp)
-galaxy_test(galaxy_settings_system_page_tests SOURCES ${rt}/ui/settings_system_page_tests.cpp
-    ${rt}/ui/settings_system_page.cpp ${rt}/ui/settings_model.cpp ${rt}/render/renderer_choice.cpp)
-galaxy_test(galaxy_renderer_choice_tests SOURCES ${rt}/render/renderer_choice_tests.cpp ${rt}/render/renderer_choice.cpp)
-galaxy_test(galaxy_settings_benchmark_page_tests SOURCES ${rt}/ui/settings_benchmark_page_tests.cpp
-    ${rt}/ui/settings_benchmark_page.cpp ${rt}/benchmark_results.cpp ${rt}/benchmark_stats.cpp ${rt}/strict_json.cpp)
-if(WIN32)
-    target_link_libraries(galaxy_settings_benchmark_page_tests PRIVATE shell32)
-endif()
-galaxy_test(galaxy_discord_presence_tests SOURCES ${rt}/discord_presence_tests.cpp ${rt}/discord_presence.cpp)
-
-set(render_src runtime/src/render)
-galaxy_test(galaxy_frame_interpolation_tests SOURCES ${render_src}/frame_interpolation_tests.cpp
-    ${render_src}/frame_interpolation.cpp ${render_src}/affine.cpp)
-galaxy_test(galaxy_core_pairing_tests SOURCES ${render_src}/core/pairing_tests.cpp ${render_src}/core/pairing.cpp
-    ${render_src}/frame_interpolation.cpp ${render_src}/affine.cpp)
-target_include_directories(galaxy_core_pairing_tests PRIVATE runtime/src native/include)
-galaxy_test(galaxy_present_slots_tests SOURCES ${render_src}/present_slots_tests.cpp ${render_src}/present_slots.cpp)
-galaxy_test(galaxy_window_owner_tests SOURCES ${render_src}/window_owner_tests.cpp ${render_src}/window_owner.cpp)
-target_link_libraries(galaxy_window_owner_tests PRIVATE dwmapi)
-galaxy_test(galaxy_core_world_lights_tests SOURCES ${render_src}/core/world_lights_tests.cpp ${render_src}/core/world_lights.cpp)
-galaxy_test(galaxy_rt_geometry_tests SOURCES ${render_src}/rt/rt_geometry_tests.cpp ${render_src}/rt/rt_geometry.cpp
-    ${render_src}/rt/rt_scene.cpp ${render_src}/rt/rt_backend_fake.cpp)
-target_include_directories(galaxy_rt_geometry_tests PRIVATE runtime/src)
-target_include_directories(galaxy_core_world_lights_tests PRIVATE runtime/src native/include)
-# The pipeline cache files' headers (header-only; both backends' caches).
-galaxy_test(galaxy_pipeline_cache_file_tests SOURCES ${render_src}/core/pipeline_cache_file_tests.cpp)
-target_include_directories(galaxy_pipeline_cache_file_tests PRIVATE runtime/src)
-set_tests_properties(galaxy_window_owner_tests PROPERTIES TIMEOUT 20)
 # Tests of the renderer library.
-foreach(name render_config gpu_sampler rt_materials texture_pack movie_playback frame_pass post_process
-        render_core_host rt_caps)
+foreach(name render_config gpu_sampler texture_pack movie_playback frame_pass post_process render_core_host)
     galaxy_test(galaxy_${name}_tests SOURCES ${render_src}/${name}_tests.cpp LIBS galaxy_render)
 endforeach()
 # The pictures the mod check reads with the same answers (crates/nebula-import cook/pack_texture.rs).
@@ -837,7 +656,7 @@ target_link_libraries(galaxy_frame_pass_tests PRIVATE d3dcompiler)
 if(MSVC)
     foreach(target galaxy_render galaxy_runtime_settings galaxy_atomic_file
             galaxy_host_pointer_events galaxy_native_input galaxy_native_host galaxy_audio_mixer)
-        target_compile_options(${target} PRIVATE /W4 /WX /permissive- /EHsc)
+        target_compile_options(${target} PRIVATE /W4 ${NEBULA_WARNINGS_AS_ERRORS} /permissive- /EHsc)
     endforeach()
 endif()
 
@@ -872,6 +691,7 @@ if(NEBULA_VULKAN)
     add_library(galaxy_render_vk STATIC
         runtime/src/render/render_api.cpp
             runtime/src/render/render_config.cpp
+            runtime/src/render/device_memory.cpp
             runtime/src/render/renderer_choice.cpp
             runtime/src/render/renderer_check_win32.cpp
 runtime/src/render/host_window_win32.cpp
@@ -901,20 +721,15 @@ runtime/src/render/host_window_win32.cpp
         runtime/src/render/display_modes.cpp
         runtime/src/render/os_hdr.cpp
             runtime/src/render/render_core.cpp
+            runtime/src/render/frame_schedule.cpp
+            runtime/src/render/gpu_pass_times.cpp
         runtime/src/render/affine.cpp
         runtime/src/render/core/compose.cpp
         runtime/src/render/core/draw_walker.cpp
-        runtime/src/render/core/rt_walk.cpp
-        runtime/src/render/core/rt_bounce.cpp
-        runtime/src/render/core/rt_pass_indirect.cpp
-        runtime/src/render/core/rt_pass_reflect.cpp
-        runtime/src/render/core/rt_pass_transmit.cpp
-        runtime/src/render/core/rt_pass_volume.cpp
         runtime/src/render/core/pairing.cpp
         runtime/src/render/core/pipelines.cpp
         runtime/src/render/core/program_table.cpp
         runtime/src/render/core/registries.cpp
-        runtime/src/render/core/world_lights.cpp
         runtime/src/render/core/pipelines_vk.cpp
         runtime/src/render/core/encoder_vk.cpp
         runtime/src/render/galaxy_select.cpp
@@ -924,15 +739,11 @@ runtime/src/render/host_window_win32.cpp
         runtime/src/benchmark_stats.cpp
         runtime/src/benchmark_results.cpp
         runtime/src/render/frame_interpolation.cpp
-        runtime/src/render/rt_materials.cpp
-        runtime/src/render/rt_caps.cpp
-        runtime/src/render/rt/rt_shaders.cpp
-        runtime/src/render/vk/rt_backend_vk.cpp
-        runtime/src/render/rt/rt_geometry.cpp
-        runtime/src/render/rt/rt_scene.cpp
         runtime/src/render/streamline_bridge.cpp
         runtime/src/frame_telemetry.cpp
         runtime/src/perf_hint.cpp
+        runtime/src/pacing.cpp
+        runtime/src/pacing_recorder.cpp
         runtime/src/render/vk/vk_context.cpp
         runtime/src/render/vk/device_quirks_vk.cpp
         runtime/src/render/vk/vk_libraries.cpp
@@ -964,17 +775,6 @@ runtime/src/render/host_window_win32.cpp
     target_include_directories(galaxy_render_vk PUBLIC runtime/include)
     target_include_directories(galaxy_render_vk PUBLIC runtime/src)
     target_include_directories(galaxy_render_vk PRIVATE "${galaxy_utility_spirv_dir}")
-    # The tracer's SPIR-V, with NEBULA_RAY_TRACING where a dxc that writes it is named (cmake/rt_shaders.cmake).
-    set(galaxy_dxc_spirv "")
-    if(NEBULA_RAY_TRACING)
-        galaxy_find_dxc_spirv(galaxy_dxc_spirv)
-    endif()
-    if(galaxy_dxc_spirv)
-        galaxy_rt_shaders(galaxy_rt_spirv spirv "${galaxy_dxc_spirv}")
-        target_sources(galaxy_render_vk PRIVATE "${galaxy_rt_spirv}")
-        target_include_directories(galaxy_render_vk PRIVATE "${galaxy_rt_shader_dir}")
-        target_compile_definitions(galaxy_render_vk PRIVATE GALAXY_RT_SPIRV=1)
-    endif()
     target_include_directories(galaxy_render_vk PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/smaa"
         "${CMAKE_CURRENT_SOURCE_DIR}/native/include")
     target_compile_features(galaxy_render_vk PUBLIC cxx_std_20)
@@ -995,7 +795,7 @@ runtime/src/render/host_window_win32.cpp
             galaxy_runtime_settings
             galaxy_host_pointer_events)
     if(MSVC)
-        target_compile_options(galaxy_render_vk PRIVATE /GS- /GR- /Oi /favor:INTEL64)
+        target_compile_options(galaxy_render_vk PRIVATE /GS- /GR- /Oi $<$<CXX_COMPILER_ID:MSVC>:/favor:INTEL64>)
     endif()
     if(WIN32)
         target_link_libraries(galaxy_render_vk PRIVATE mfplat mfreadwrite mfuuid d3d11 dwmapi)
@@ -1009,7 +809,7 @@ runtime/src/render/host_window_win32.cpp
     target_link_libraries(NebulaVk PRIVATE dwmapi galaxy_render_vk galaxy_save_files galaxy_asset_store)
     if(MSVC)
         target_sources(NebulaVk PRIVATE native/host/nebula_host.manifest)
-        target_compile_options(NebulaVk PRIVATE /Zi)
+        target_compile_options(NebulaVk PRIVATE ${NEBULA_MSVC_DEBUG_INFO})
         target_link_options(NebulaVk PRIVATE /DEBUG /OPT:REF /OPT:ICF /PDBALTPATH:NebulaVk.pdb)
     endif()
     nebula_host_cpu_entry(NebulaVk)
@@ -1036,6 +836,7 @@ if(NEBULA_D3D11)
     add_library(galaxy_render_d3d11 STATIC
         runtime/src/render/render_api.cpp
         runtime/src/render/render_config.cpp
+        runtime/src/render/device_memory.cpp
         runtime/src/render/renderer_choice.cpp
         runtime/src/render/renderer_check_win32.cpp
         runtime/src/render/host_window_win32.cpp
@@ -1065,20 +866,15 @@ if(NEBULA_D3D11)
         runtime/src/render/display_modes.cpp
         runtime/src/render/os_hdr.cpp
         runtime/src/render/render_core.cpp
+        runtime/src/render/frame_schedule.cpp
+        runtime/src/render/gpu_pass_times.cpp
         runtime/src/render/affine.cpp
         runtime/src/render/core/compose.cpp
         runtime/src/render/core/draw_walker.cpp
-        runtime/src/render/core/rt_walk.cpp
-        runtime/src/render/core/rt_bounce.cpp
-        runtime/src/render/core/rt_pass_indirect.cpp
-        runtime/src/render/core/rt_pass_reflect.cpp
-        runtime/src/render/core/rt_pass_transmit.cpp
-        runtime/src/render/core/rt_pass_volume.cpp
         runtime/src/render/core/pairing.cpp
         runtime/src/render/core/pipelines.cpp
         runtime/src/render/core/program_table.cpp
         runtime/src/render/core/registries.cpp
-        runtime/src/render/core/world_lights.cpp
         runtime/src/render/core/pipelines_d3d11.cpp
         runtime/src/render/galaxy_select.cpp
         runtime/src/benchmark_recommend.cpp
@@ -1087,14 +883,12 @@ if(NEBULA_D3D11)
         runtime/src/benchmark_stats.cpp
         runtime/src/benchmark_results.cpp
         runtime/src/render/frame_interpolation.cpp
-        runtime/src/render/rt_materials.cpp
-        runtime/src/render/rt_caps.cpp
-        runtime/src/render/rt/rt_geometry.cpp
-        runtime/src/render/rt/rt_scene.cpp
         runtime/src/render/streamline_bridge.cpp
         runtime/src/render/xess_library.cpp
         runtime/src/frame_telemetry.cpp
         runtime/src/perf_hint.cpp
+        runtime/src/pacing.cpp
+        runtime/src/pacing_recorder.cpp
         runtime/src/render/mod_shaders.cpp
         runtime/src/render/mod_shader_build.cpp
         runtime/src/render/mod_post.cpp
@@ -1125,7 +919,8 @@ if(NEBULA_D3D11)
         PRIVATE
             mfplat mfreadwrite mfuuid dwmapi)
     if(MSVC)
-        target_compile_options(galaxy_render_d3d11 PRIVATE /GS- /GR- /Oi /favor:INTEL64 /W4 /WX /permissive- /EHsc)
+        target_compile_options(galaxy_render_d3d11 PRIVATE /GS- /GR- /Oi $<$<CXX_COMPILER_ID:MSVC>:/favor:INTEL64> /W4 ${NEBULA_WARNINGS_AS_ERRORS}
+                               /permissive- /EHsc)
     endif()
 
     add_executable(NebulaD11 native/host/host_main.cpp runtime/src/frame_phase.cpp)
@@ -1137,12 +932,18 @@ if(NEBULA_D3D11)
     target_link_libraries(NebulaD11 PRIVATE dwmapi galaxy_render_d3d11 galaxy_save_files galaxy_asset_store)
     if(MSVC)
         target_sources(NebulaD11 PRIVATE native/host/nebula_host.manifest)
-        target_compile_options(NebulaD11 PRIVATE /Zi)
+        target_compile_options(NebulaD11 PRIVATE ${NEBULA_MSVC_DEBUG_INFO})
         target_link_options(NebulaD11 PRIVATE /DEBUG /OPT:REF /OPT:ICF /PDBALTPATH:NebulaD11.pdb)
     endif()
     # Both CPU levels like the other hosts (NebulaD11-x86-64-v2.exe from the baseline tree).
     nebula_host_cpu_entry(NebulaD11)
     nebula_host_delay_loads(NebulaD11)
+    # The constant ring on the machine's own device (P-242); the test compiles its own small shaders.
+    galaxy_test(galaxy_d3d11_constant_ring_tests SOURCES runtime/src/render/d3d11_constant_ring_tests.cpp
+        LIBS galaxy_render_d3d11 d3dcompiler)
+    # The constants watch (P-332): a wrong binding prints its line, the right ones nothing.
+    galaxy_test(galaxy_d3d11_constants_watch_tests SOURCES runtime/src/render/d3d11_constants_watch_tests.cpp
+        LIBS galaxy_render_d3d11 d3dcompiler)
 endif()
 
 # AV1 movies (a mod's movie, NMOV codec 1): dav1d 1.5.1 built in-tree (cmake/dav1d.cmake), for every renderer.

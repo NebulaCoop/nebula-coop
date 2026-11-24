@@ -24,8 +24,8 @@ class DescriptorRing;
 // size are stretched over the screen. Here the same chain runs on the internal resolution: the threshold over the
 // game's own 4 x 4 pixel footprint, each ring replaced by the Gaussian of its spread (a ring of radius r spreads r^2 / 2
 // along each axis, plus what the game's bilinear taps and resampling add at its resolution, less what this chain's own
-// resampling adds), the game's tap weights, clamps and intensity. The scene keep is the scene target's own format, so the
-// ray tracer's HDR scene passes through whole.
+// resampling adds), the game's tap weights, clamps and intensity. The scene keep is the scene target's own format, so a
+// wide scene passes through whole.
 class GameBloom {
 public:
     GameBloom() = default;
@@ -33,10 +33,14 @@ public:
     GameBloom& operator=(const GameBloom&) = delete;
     ~GameBloom() { shutdown(); }
 
-    // The root signature and compute pipelines (precompiled shaders); the composite's pipelines are made per sample
-    // count and format at first use. False leaves the bloom to the game's own chain.
+    // The root signature and compute pipelines (precompiled shaders); the composite's pipelines are
+    // prepare_pipelines'. False leaves the bloom to the game's own chain.
     bool initialize(ID3D12Device* device);
     void shutdown() noexcept;
+    // Every pipeline of the pass for each sample count up to `max_samples` (a power of two, at most 8) while the renderer
+    // starts (P-052), so a frame never makes one; one the device refuses is not tried again. On any thread, while no
+    // frame records with the pass.
+    void prepare_pipelines(unsigned max_samples);
     [[nodiscard]] bool ready() const noexcept { return ready_; }
 
     // game_bloom.hlsl's BloomConstants.
