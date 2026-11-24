@@ -66,10 +66,14 @@ The other arguments are in [using-nebula/command-line-arguments.md](using-nebula
 
 ```powershell
 ctest --test-dir build\host --output-on-failure
-cargo test -p nebula-import
-sh native/tests/run_tests.sh
+.\native\build.ps1 -Petari native\petari -Build build\game -Target native_tests
+ctest --test-dir build\game --output-on-failure
+cargo test -p nebula-import -p luma-validate
 .\tools\audit_repo.ps1
 ```
+
+On Linux and macOS, `cmake -S tests/unit -B build/unit -G Ninja` builds the same unit tests (the co-op ones included);
+`ctest --test-dir build/unit` runs them.
 
 The Build workflow runs only what a change can affect: a change under `installer/` compiles Setup (`installer/native`)
 and not the game builds, and any other change to the code runs the game builds and their tests and not

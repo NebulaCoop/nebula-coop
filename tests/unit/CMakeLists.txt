@@ -32,3 +32,7 @@ include("${nebula_root}/third_party/boringssl.cmake")
 include("${nebula_root}/third_party/zlib_inflate.cmake")
 
 include("${nebula_root}/cmake/unit_tests.cmake")
+
+# NebulaCoop's built-in mods (cmake/nebula_builtin_mods.cmake) for mods.cpp, which the mods tests compile.
+include("${nebula_root}/cmake/nebula_builtin_mods.cmake")
+nebula_builtin_mods("${nebula_root}" "${CMAKE_CURRENT_BINARY_DIR}/generated")
