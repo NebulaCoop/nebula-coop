@@ -6,6 +6,7 @@
 #include "galaxy/render/game_bloom_shape.h"
 #include "galaxy/render/frame_pass.h"
 #include "galaxy/render/renderer_d3d12.h"
+#include "render/core/utility_pipeline_d3d12.h"
 #include "galaxy/render/idle_clock.h"
 
 #include <algorithm>
@@ -89,24 +90,9 @@ bool GameBloom::initialize(ID3D12Device* device) {
     };
     for (const auto& pass : passes) {
         cd.CS = pass.shader;
-        if (FAILED(device_->CreateComputePipelineState(&cd, IID_PPV_ARGS(&*pass.pipeline)))) {
+        if (FAILED(core::utility_pipeline(device_, cd, &*pass.pipeline))) {
             std::cerr << "[bloom] compute pipeline failed\n";
             return false;
-        }
-    }
-    // The composite for every sample count the device supports in each scene colour format, now rather than at a scene's
-    // first bloom in play.
-    for (const bool hdr : {false, true}) {
-        for (unsigned samples = 1u; samples <= 8u; samples *= 2u) {
-            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{};
-            levels.Format = hdr ? kSceneHdrColorFormat : kSceneColorFormat;
-            levels.SampleCount = samples;
-            if (samples > 1u && (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
-                                                                     sizeof(levels))) ||
-                                 levels.NumQualityLevels == 0u)) {
-                continue;
-            }
-            (void)composite_pipeline(samples, hdr);  // one that fails is not tried again (composite_failed_)
         }
     }
     ready_ = true;
@@ -157,12 +143,20 @@ ID3D12PipelineState* GameBloom::composite_pipeline(unsigned samples, bool hdr) {
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = hdr ? kSceneHdrColorFormat : kSceneColorFormat;
     pd.SampleDesc.Count = 1u << (index & 3u);
-    if (FAILED(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&composite_[index])))) {
+    if (FAILED(core::utility_pipeline(device_, pd, &composite_[index]))) {
         std::cerr << "[bloom] composite pipeline failed for " << (1u << (index & 3u)) << " samples\n";
         composite_failed_ |= 1u << index;
         return nullptr;
     }
     return composite_[index].Get();
+}
+
+void GameBloom::prepare_pipelines(unsigned max_samples) {
+    for (const bool hdr : {false, true}) {
+        for (unsigned samples = 1u; samples <= std::min(max_samples, 8u); samples *= 2u) {
+            (void)composite_pipeline(samples, hdr);  // one that fails is not tried again (composite_failed_)
+        }
+    }
 }
 
 bool GameBloom::ensure_target(Target& target, DXGI_FORMAT format, unsigned width, unsigned height, bool unordered,
@@ -599,12 +593,12 @@ D3D12_GPU_DESCRIPTOR_HANDLE GameBloom::table(DescriptorRing& ring, const std::ar
             view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             view.Texture2D.MipLevels = 1;
-            device_->CreateShaderResourceView(srvs[i], &view, h);
+            ring.write_view(h, srvs[i], view);
         } else {
             D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
             view.Format = kWorkFormat;
             view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-            device_->CreateUnorderedAccessView(uavs[i - 3u], nullptr, &view, h);
+            ring.write_view(h, uavs[i - 3u], view);
         }
     }
     return t.gpu;

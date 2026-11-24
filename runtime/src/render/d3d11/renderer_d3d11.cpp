@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // The Direct3D 11 renderer (d3d11/renderer_d3d11.h): device, swap chain, frames, present, the draws' replay, samplers and
-// tables. The scene target, its passes, copies, pictures, probes and the renderer's parts are renderer_d3d11_scene.cpp.
+// tables. The scene target, its passes, copies, pictures and the renderer's parts are renderer_d3d11_scene.cpp.
+#include "galaxy/render/present_clock.h"
 #include "galaxy/render/d3d11/renderer_d3d11.h"
+#include "../dxgi_pacing.h"
 
 #include "galaxy/content_viewport.h"
+#include "galaxy/crash_report.h"
 #include "galaxy/display_aspect.h"
+#include "galaxy/render/device_memory.h"
 #include "galaxy/benchmark.h"
 #include "galaxy/frame_timeline.h"
 #include "galaxy/launch_args.h"
@@ -40,19 +44,19 @@ UINT constants_in(std::uint64_t size, std::uint64_t offset) noexcept {
     return static_cast<UINT>(std::min<std::uint64_t>(D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT, left & ~std::uint64_t{15}));
 }
 
-// RendererD3D11::GpuPass by name: the settings page's, and present-stats' gpu-pass-ms (Direct3D 12's names).
-constexpr const char* kPassTimeNames[] = {"scene", "resolve", "frame read", "display copy", "bloom", "scene aa", "scene ao",
-                                          "present", "camera"};
-constexpr const char* kPassStatNames[] = {"scene", "resolve", "frame-read", "display-copy", "bloom", "scene-aa", "scene-ao",
-                                          "present", "camera"};
-
 }  // namespace
 
 // FSR 3 frame generation is not built on Direct3D 11 (its interface is Direct3D 12's and Vulkan's).
 bool fsr_frame_generation_compiled() noexcept { return false; }
 
+// Direct3D 11 has no call that removes its device: the next present reports DXGI_ERROR_DEVICE_REMOVED instead of
+// presenting, which goes through the same recovery as a real removal (render_core.cpp restart_device).
 void RendererD3D11::lose_device() {
-    std::cerr << "[Renderer] Direct3D 11 has no device loss to rehearse\n";
+    loss_asked_ = true;
+}
+
+void RendererD3D11::allocation_failed(const char* what) const {
+    throw std::runtime_error(galaxy::crash::gpu_allocation_failure(what, gpu::device_removed(d3d11::Context::get().device())));
 }
 
 bool RendererD3D11::initialize(int window_width, int window_height, const FrameMap& frame) {
@@ -76,6 +80,7 @@ bool RendererD3D11::initialize(int window_width, int window_height, const FrameM
             return false;
         }
         report_adapter();
+        memory_.attach(d3d11::Context::get().adapter());
         if (!create_scene_targets(scene_map_, wanted_msaa_samples())) {
             shutdown();
             return false;
@@ -171,15 +176,6 @@ bool RendererD3D11::create_states() {
     sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
     check(device->CreateSamplerState(&sampler, &point_clamp_), "point sampler");
 
-    D3D11_BUFFER_DESC constants{};
-    constants.Usage = D3D11_USAGE_DYNAMIC;
-    constants.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    constants.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    constants.ByteWidth = 32u;  // a DrawRoot (program.hlsli cbuffer Draw), padded to 16-byte steps
-    check(device->CreateBuffer(&constants, nullptr, &root_constants_), "draw constants");
-    constants.ByteWidth = 256u;
-    check(device->CreateBuffer(&constants, nullptr, &utility_constants_), "utility constants");
-
     check(device->CreateVertexShader(g_utility_BlitVs, sizeof(g_utility_BlitVs), nullptr, &full_screen_vs_), "full-screen vertex shader");
     const struct {
         Utility which;
@@ -198,7 +194,12 @@ bool RendererD3D11::create_states() {
         check(device->CreatePixelShader(shader.bytes, shader.size, nullptr, &utility_ps_[static_cast<std::size_t>(shader.which)]),
               "utility pixel shader");
     }
-    check(device->CreateComputeShader(g_utility_ScreenProbeCs, sizeof(g_utility_ScreenProbeCs), nullptr, &probe_cs_), "probe shader");
+    if (galaxy::diagnosing(galaxy::kDiagnoseConstantsWatch)) {
+        constants_watch_ = std::make_unique<d3d11::ConstantsWatch>();
+        if (!constants_watch_->initialize(device, g_utility_ConstantsWatchCs)) {
+            std::cerr << "[constants] watch: its objects could not be made; the run is not watched\n";
+        }
+    }
 
     D3D11_RASTERIZER_DESC raster{};
     raster.FillMode = D3D11_FILL_SOLID;
@@ -241,7 +242,8 @@ void RendererD3D11::report_adapter() {
     DXGI_ADAPTER_DESC1 desc{};
     IDXGIAdapter1* const adapter = context.adapter();
     const bool described = adapter != nullptr && SUCCEEDED(adapter->GetDesc1(&desc));
-    record_render_adapter(name.c_str(), vendor, described ? desc.DeviceId : 0u, described ? desc.SubSysId : 0u, false);
+    set_device_unified_memory(context.caps().unified_memory);
+    record_render_adapter(name.c_str(), vendor, described ? desc.DeviceId : 0u, described ? desc.SubSysId : 0u);
     record_render_driver(dxgi_driver_version(adapter));
     RenderFeatureCaps caps{};
     caps.adapter_vendor_id = vendor;
@@ -250,7 +252,6 @@ void RendererD3D11::report_adapter() {
     caps.msaa = make_render_feature_status(true, msaa, true, true,
                                            msaa ? "the scene target is multisampled" : "the GPU has no multisampled scene target formats");
     caps.taa = make_render_feature_status(false, false, false, false, "temporal upscaling runs on Direct3D 12 and Vulkan");
-    caps.dxr = make_render_feature_status(false, false, false, false, "ray tracing runs on Direct3D 12");
     caps.streamline_bridge_built = false;
     caps.streamline = make_render_feature_status(false, false, false, false, "NVIDIA Streamline runs on Direct3D 12");
     caps.reflex = make_render_feature_status(false, false, false, false, "Reflex runs on Direct3D 12");
@@ -357,6 +358,7 @@ RendererD3D11::Kept RendererD3D11::take_apart_lost_device() {
 }
 
 void RendererD3D11::shutdown() {
+    memory_.release();
     set_mod_post_compiler(nullptr, false);
     d3d11::Context& context = d3d11::Context::get();
     if (context.ready()) {
@@ -377,8 +379,7 @@ void RendererD3D11::shutdown() {
         target_slots_.clear();
         pictures_.clear();
         frame_pass_targets_.clear();
-        scene_capture_ = backbuffer_capture_ = display_capture_ = Readback{};
-        probe_slots_.clear();
+        captures_.clear();
         for (Frame& frame : frames_) {
             frame = Frame{};
         }
@@ -399,14 +400,12 @@ void RendererD3D11::shutdown() {
         }
         utility_ps_ = {};
         full_screen_vs_.Reset();
-        probe_cs_.Reset();
         utility_raster_.Reset();
         write_masks_ = {};
         depth_uses_ = {};
         linear_clamp_.Reset();
         point_clamp_.Reset();
-        root_constants_.Reset();
-        utility_constants_.Reset();
+        root_buffer_.Reset();
         backbuffer_rtv_.Reset();
         if (frame_latency_waitable_ != nullptr) {
             CloseHandle(frame_latency_waitable_);
@@ -428,19 +427,19 @@ void RendererD3D11::shutdown() {
 void RendererD3D11::grow_rings() {
     // A ring whose frames took over half their budget (or spilled) grows; one whose last 30 seconds (and 600 frames)
     // stayed under a quarter of it gives half of its memory back on a frame without the scene (UploadRing::kQuietNs).
-    // Only that ring is made again.
+    // Only that ring is made again; --diagnostics ring-stress makes them all again every kRingStressFrames frames.
     const UploadRingSlot rings[] = {{&vertex_ring_, "vertex", kFramesInFlight, true},
                                     {&index_ring_, "index", kFramesInFlight, true},
                                     {&constant_ring_, "constant", kFramesInFlight, true},
                                     {&matrix_ring_, "matrix", kFramesInFlight, false}};
-    if (ring_growth_failed_ || std::none_of(std::begin(rings), std::end(rings),
-                                            [](const UploadRingSlot& s) { return s.ring->wants_new_size(); })) {
+    const RingRemake due = upload_rings_due(rings, frame_index_, ring_growth_failed_);
+    if (due == RingRemake::None) {
         return;
     }
     const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::RingResize);
     // A ring is made again as new upload memory; the old memory goes with the frames that may still read it.
     std::vector<gpu::BufferRef> old;
-    remake_upload_rings(device(), rings, false, ring_growth_failed_, old);
+    remake_upload_rings(device(), rings, due == RingRemake::All, ring_growth_failed_, old);
     for (gpu::BufferRef& buffer : old) {
         frame_->retired_buffers.push_back(std::move(buffer));
     }
@@ -489,19 +488,7 @@ void RendererD3D11::wait_for_fence_value(std::uint64_t fence_value) {
 }
 
 bool RendererD3D11::video_memory(std::uint64_t& usage, std::uint64_t& budget) const noexcept {
-    usage = budget = 0u;
-    d3d11::ComPtr<IDXGIAdapter3> adapter;
-    IDXGIAdapter1* const base = d3d11::Context::get().adapter();
-    if (base == nullptr || FAILED(base->QueryInterface(IID_PPV_ARGS(&adapter)))) {
-        return false;
-    }
-    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
-    if (FAILED(adapter->QueryVideoMemoryInfo(0u, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
-        return false;
-    }
-    usage = info.CurrentUsage;
-    budget = info.Budget;
-    return true;
+    return memory_.read(usage, budget);
 }
 
 void RendererD3D11::probe_occlusion() noexcept {
@@ -520,7 +507,7 @@ void RendererD3D11::attach_texture_uploads(TextureStore& cache) {
 }
 
 void RendererD3D11::begin_frame() {
-    host_window::poll_render_config_file();
+    host_window::watch_render_config_file();
     follow_window_and_resize();
     apply_window_size();
     apply_dynamic_resolution();
@@ -543,16 +530,7 @@ void RendererD3D11::begin_frame() {
                 ctx->GetData(frame.frame_time[0].Get(), &start, sizeof(start), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
                 ctx->GetData(frame.frame_time[1].Get(), &end, sizeof(end), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK && end >= start) {
                 const double gpu_ms = static_cast<double>(end - start) * 1000.0 / static_cast<double>(disjoint.Frequency);
-                if (frame.scene_drawn) {
-                    native_scene_gpu_ema_ms_ = native_scene_gpu_ema_ms_ == 0.0 ? gpu_ms
-                                               : native_scene_gpu_ema_ms_ + (gpu_ms - native_scene_gpu_ema_ms_) * 0.1;
-                }
-                if (frame.generated) {
-                    generated_gpu_ms_ += gpu_ms;
-                    ++generated_gpu_samples_;
-                    generated_gpu_ema_ms_ = generated_gpu_ema_ms_ == 0.0 ? gpu_ms
-                                            : generated_gpu_ema_ms_ + (gpu_ms - generated_gpu_ema_ms_) * 0.1;
-                }
+                frame_gpu_.add(gpu_ms, frame.scene_drawn, frame.generated);
                 const float before = frame_gpu_ema_ms_.load(std::memory_order_relaxed);
                 frame_gpu_ema_ms_.store(before == 0.0f ? static_cast<float>(gpu_ms)
                                                        : before + (static_cast<float>(gpu_ms) - before) * 0.1f,
@@ -583,8 +561,8 @@ void RendererD3D11::begin_frame() {
                       SUCCEEDED(device->CreateQuery(&query, &frame.frame_time[1]));
     }
     // The passes' timestamps: for the settings page while it asks, or the diagnostics.
-    pass_timing_on_ = frame.timed && (gpu_timing_on() || ::galaxy::diagnosing(::galaxy::kDiagnoseGpuPasses));
-    if (pass_timing_on_ && frame.pass_queries.empty()) {
+    const bool pass_timing = frame.timed && (gpu_timing_on() || ::galaxy::diagnosing(::galaxy::kDiagnoseGpuPasses));
+    if (pass_timing && frame.pass_queries.empty()) {
         D3D11_QUERY_DESC query{D3D11_QUERY_TIMESTAMP, 0u};
         frame.pass_queries.resize(kGpuPassSlots);
         for (d3d11::ComPtr<ID3D11Query>& q : frame.pass_queries) {
@@ -594,11 +572,11 @@ void RendererD3D11::begin_frame() {
             }
         }
     }
-    pass_timing_on_ = pass_timing_on_ && !frame.pass_queries.empty();
+    pass_times_.begin_frame(pass_timing && !frame.pass_queries.empty());
     if (frame.timed) {
         context()->Begin(frame.disjoint.Get());
         context()->End(frame.frame_time[0].Get());
-        if (pass_timing_on_) {
+        if (pass_times_.timed()) {
             context()->End(frame.pass_queries[0].Get());
             frame.pass_marks[0] = GpuPass::Scene;
             frame.pass_mark_count = 1u;
@@ -620,21 +598,8 @@ void RendererD3D11::begin_frame() {
 
 unsigned RendererD3D11::present_sync_interval(unsigned configured, float max_fps) {
     const bool game_frame = std::exchange(present_game_frame_, false);
-    if (configured != 1u || variable_refresh_) {
-        return configured;  // a variable refresh display shows a frame at once: whole refreshes mean nothing
-    }
-    const double hz = display_refresh_hz_;
-    if (hz <= 0.0) {
-        return 1u;
-    }
-    // As renderer_d3d12.cpp present_sync_interval: a game frame holds for its whole 60 Hz frame on a display of a multiple.
-    const double rate = game_frame ? std::min(kGameStepRate, present_frame_rate(max_fps, configured, hz))
-                                   : present_frame_rate(max_fps, configured, hz);
-    const double multiple = std::round(hz / rate);
-    if (multiple >= 2.0 && multiple <= 4.0 && std::abs(hz - rate * multiple) <= 0.015 * hz) {
-        return static_cast<unsigned>(multiple);
-    }
-    return 1u;
+    return dxgi_sync_interval(configured, variable_refresh_, display_refresh_hz_, max_fps, game_frame,
+                              [this] { return interpolation_mode(); });
 }
 
 bool RendererD3D11::interpolation_mode() const {
@@ -651,6 +616,9 @@ std::uint64_t RendererD3D11::end_frame(bool present_swap_chain, SubmissionCallba
         mirrored_store_->backend().set_upload_list(nullptr);
     }
     ID3D11DeviceContext1* const ctx = context();
+    if (constants_watch_ != nullptr) {
+        constants_watch_->frame(ctx);  // fenced by this frame's signal below
+    }
     if (frame.timed) {
         ctx->End(frame.frame_time[1].Get());
         ctx->End(frame.disjoint.Get());
@@ -682,7 +650,12 @@ std::uint64_t RendererD3D11::end_frame(bool present_swap_chain, SubmissionCallba
         HRESULT hr = S_OK;
         {
             const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::Present);
-            hr = swap_chain_->Present(vsync, flags);
+            if (loss_asked_) {
+                loss_asked_ = false;  // lose_device: as the driver reports a removed device
+                hr = DXGI_ERROR_DEVICE_REMOVED;
+            } else {
+                hr = swap_chain_->Present(vsync, flags);
+            }
         }
         if (timeline_present) {
             galaxy::timeline::record(galaxy::timeline::Event::PresentEnd, timeline_present_ordinal);
@@ -695,6 +668,8 @@ std::uint64_t RendererD3D11::end_frame(bool present_swap_chain, SubmissionCallba
             throw std::runtime_error("the Direct3D 11 device was lost at present");
         }
         swap_present_qpc_ = end;
+        std::int64_t vblank = 0, period = 0;
+        report_dxgi_present(swap_chain_.Get(), hr == S_OK, vblank_grid(vblank, period) ? period : 0);
     }
     surface_lock_ = {};
     const std::uint64_t fence = d3d11::Context::get().signal();
@@ -703,20 +678,7 @@ std::uint64_t RendererD3D11::end_frame(bool present_swap_chain, SubmissionCallba
     frame.scene_drawn = scene_drawn_;
     frame.generated = generated;
     last_submitted_ = fence;
-    for (ProbeSlot& probes : probe_slots_) {
-        if (probes.fence == kProbesInFrame) {
-            probes.fence = fence;
-        }
-    }
-    if (scene_capture_.staging && scene_capture_.fence == 0u && !scene_capture_pending_path_.empty()) {
-        scene_capture_.fence = fence;
-    }
-    if (backbuffer_capture_.staging && backbuffer_capture_.fence == 0u && !backbuffer_capture_pending_path_.empty()) {
-        backbuffer_capture_.fence = fence;
-    }
-    if (display_capture_.staging && display_capture_.fence == 0u && !display_capture_pending_path_.empty()) {
-        display_capture_.fence = fence;
-    }
+    captures_.submitted(fence);
     if (on_submitted != nullptr) {
         on_submitted(submission_context, fence);
     }
@@ -783,12 +745,7 @@ void RendererD3D11::report_present_stats(double pace_wait_ms, double present_ms)
     }
     message << " gpu-samples=" << stats_.gpu_samples;
     if (::galaxy::diagnosing(::galaxy::kDiagnoseGpuPasses)) {
-        static_assert(std::size(kPassStatNames) == static_cast<std::size_t>(GpuPass::Count));
-        message << " gpu-pass-ms=";
-        for (std::size_t pass = 0u; pass < std::size(kPassStatNames); ++pass) {
-            message << (pass == 0u ? "" : ",") << kPassStatNames[pass] << ':' << telemetry_pass_ms_[pass] / presents;
-        }
-        telemetry_pass_ms_.fill(0.0);
+        message << pass_times_.take_window_field();  // each pass's ms a timed frame
     }
     message << " api=d3d11\n";
     std::cerr << message.str();
@@ -808,7 +765,7 @@ void RendererD3D11::gpu_pass(GpuPass pass) {
     }
     current_pass_ = pass;
     Frame& frame = frames_[frame_slot_];
-    if (!pass_timing_on_ || frame.pass_mark_count >= frame.pass_queries.size()) {
+    if (!pass_times_.timed() || frame.pass_mark_count >= frame.pass_queries.size()) {
         return;
     }
     flush_draws();
@@ -830,33 +787,12 @@ void RendererD3D11::read_pass_times(Frame& frame, UINT64 frequency, UINT64 frame
         }
     }
     ticks[marks] = frame_end;
-    std::array<double, static_cast<std::size_t>(GpuPass::Count)> frame_ms{};
-    for (unsigned i = 0u; i < marks; ++i) {
-        if (ticks[i + 1u] >= ticks[i]) {
-            const double ms = static_cast<double>(ticks[i + 1u] - ticks[i]) * 1000.0 / static_cast<double>(frequency);
-            frame_ms[static_cast<std::size_t>(frame.pass_marks[i])] += ms;
-        }
-    }
-    for (std::size_t pass = 0u; pass < frame_ms.size(); ++pass) {
-        telemetry_pass_ms_[pass] += frame_ms[pass];
-        if (frame_ms[pass] > 0.0) {
-            const float before = pass_ema_ms_[pass].load(std::memory_order_relaxed);
-            const float value = static_cast<float>(frame_ms[pass]);
-            pass_ema_ms_[pass].store(before == 0.0f ? value : before + (value - before) * 0.1f, std::memory_order_relaxed);
-        }
-    }
-    galaxy::bench::note_gpu_frame(kPassTimeNames, frame_ms.data(), std::min(std::size(kPassTimeNames), frame_ms.size()));
+    pass_times_.add_frame(gpu_pass_ms(ticks.data(), frame.pass_marks.data(), marks, 1000.0 / static_cast<double>(frequency)),
+                          frame.scene_drawn && !frame.generated);
 }
 
 std::size_t RendererD3D11::gpu_pass_times(GpuPassTime* out, std::size_t capacity) const noexcept {
-    static_assert(std::size(kPassTimeNames) == static_cast<std::size_t>(GpuPass::Count));
-    std::size_t count = 0u;
-    for (std::size_t pass = 0u; pass < std::size(kPassTimeNames) && count < capacity; ++pass) {
-        if (const float ms = pass_ema_ms_[pass].load(std::memory_order_relaxed); ms > 0.0f) {
-            out[count++] = {kPassTimeNames[pass], ms};
-        }
-    }
-    return count;
+    return pass_times_.page_times(out, capacity);
 }
 
 void RendererD3D11::sync_post_process() {
@@ -897,6 +833,7 @@ void RendererD3D11::refresh_display_rate() {
         }
     }
     variable_refresh_ = variable;
+    g_variable_refresh.store(variable, std::memory_order_relaxed);
     if (std::abs(hz - display_refresh_hz_) >= 0.1) {
         if (!variable) {
             std::cerr << "[display] refresh-hz=" << hz << '\n';
@@ -1012,11 +949,19 @@ void RendererD3D11::flush_draws() {
     // The draws go to the scene target: a multisampled one's resolve is stale from here.
     scene_.color_dirty |= scene_.samples > 1u;
     ID3D11DeviceContext1* const ctx = context();
-    ID3D11Buffer* const root = root_constants_.Get();
-    ctx->VSSetConstantBuffers(3u, 1u, &root);
-    ctx->PSSetConstantBuffers(3u, 1u, &root);
+    const auto bind_root = [this, ctx](UINT first) {
+        ID3D11Buffer* const root = root_buffer_.Get();
+        const UINT count = 16u;  // a DrawRoot's 256 bytes (program.hlsli cbuffer Draw)
+        ctx->VSSetConstantBuffers1(3u, 1u, &root, &first, &count);
+        ctx->PSSetConstantBuffers1(3u, 1u, &root, &first, &count);
+    };
+    // The pass starts with the last root bound (a draw before the pass's first Root keeps it), then each Root its own.
+    root_first_.assign(pass_ops_.size(), 0u);
+    std::size_t written = write_roots(0u, true);
+    bind_root(root_carried_first_);
     D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
-    for (const gpu::DrawOp& op : pass_ops_) {
+    for (std::size_t index = 0; index < pass_ops_.size(); ++index) {
+        const gpu::DrawOp& op = pass_ops_[index];
         switch (op.kind) {
         case gpu::DrawOp::Kind::Pipeline: {
             const auto* pipeline = reinterpret_cast<const d3d11::Pipeline*>(static_cast<std::uintptr_t>(op.a[0]));
@@ -1053,14 +998,12 @@ void RendererD3D11::flush_draws() {
             ctx->PSSetConstantBuffers1(1u, 2u, buffers, first, count);
             break;
         }
-        case gpu::DrawOp::Kind::Root: {
-            D3D11_MAPPED_SUBRESOURCE mapped{};
-            if (SUCCEEDED(ctx->Map(root, 0u, D3D11_MAP_WRITE_DISCARD, 0u, &mapped))) {
-                std::memcpy(mapped.pData, op.w, sizeof(gpu::DrawRoot));
-                ctx->Unmap(root, 0u);
+        case gpu::DrawOp::Kind::Root:
+            if (index >= written) {
+                written = write_roots(index, false);  // the piece ran out: the next, after the draws before
             }
+            bind_root(root_first_[index]);
             break;
-        }
         case gpu::DrawOp::Kind::Tables: {
             const auto* textures = reinterpret_cast<const d3d11::BoundTable*>(static_cast<std::uintptr_t>(op.a[0]));
             const auto* samplers = reinterpret_cast<const d3d11::BoundTable*>(static_cast<std::uintptr_t>(op.a[1]));
@@ -1117,6 +1060,47 @@ void RendererD3D11::flush_draws() {
     pass_ops_.clear();
 }
 
+std::size_t RendererD3D11::write_roots(std::size_t from, bool carried) {
+    std::size_t roots = carried ? 1u : 0u;
+    for (std::size_t i = from; i < pass_ops_.size(); ++i) {
+        roots += pass_ops_[i].kind == gpu::DrawOp::Kind::Root ? 1u : 0u;
+    }
+    if (roots == 0u) {
+        return pass_ops_.size();
+    }
+    static_assert(sizeof(gpu::DrawRoot) <= 256u);
+    d3d11::Context& device = d3d11::Context::get();
+    roots = std::min(roots, d3d11::Context::kConstantRingBytes / 4u / 256u);
+    d3d11::Context::ConstantPlace place;
+    std::byte* const base = device.begin_constants(roots * 256u, place);
+    if (base == nullptr) {
+        root_buffer_.Reset();  // no roots this pass (the device is lost): its draws read none
+        return pass_ops_.size();
+    }
+    root_buffer_ = place.buffer;
+    std::size_t put_count = 0u;
+    const auto put = [&](const void* words) {
+        std::memcpy(base + put_count * 256u, words, sizeof(gpu::DrawRoot));
+        return place.first + static_cast<UINT>(put_count++) * 16u;
+    };
+    if (carried) {
+        root_carried_first_ = put(&root_carried_);
+    }
+    std::size_t i = from;
+    for (; i < pass_ops_.size(); ++i) {
+        if (pass_ops_[i].kind != gpu::DrawOp::Kind::Root) {
+            continue;
+        }
+        if (put_count == roots) {
+            break;
+        }
+        root_first_[i] = put(pass_ops_[i].w);
+        std::memcpy(&root_carried_, pass_ops_[i].w, sizeof(gpu::DrawRoot));
+    }
+    device.end_constants();
+    return i;
+}
+
 // A chunk of a recorded pass replayed inline, as the walker would have drawn it.
 void RendererD3D11::replay_draws(std::uint8_t aux, const gpu::DrawOp* ops, std::size_t count) {
     set_draw_aux(aux);
@@ -1128,13 +1112,8 @@ void RendererD3D11::utility_draw(Utility shader, ID3D11ShaderResourceView* sourc
     flush_draws();
     ID3D11DeviceContext1* const ctx = context();
     if (constants != nullptr && constant_bytes != 0u) {
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        if (SUCCEEDED(ctx->Map(utility_constants_.Get(), 0u, D3D11_MAP_WRITE_DISCARD, 0u, &mapped))) {
-            std::memcpy(mapped.pData, constants, std::min<std::size_t>(constant_bytes, 256u));
-            ctx->Unmap(utility_constants_.Get(), 0u);
-        }
-        ID3D11Buffer* const buffer = utility_constants_.Get();
-        ctx->PSSetConstantBuffers(0u, 1u, &buffer);
+        d3d11::bind_place(ctx, d3d11::kPixelConstants, 0u,
+                          d3d11::Context::get().put_constants(constants, std::min<std::size_t>(constant_bytes, 256u)));
     }
     ctx->IASetInputLayout(nullptr);
     ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1299,7 +1278,8 @@ gpu::Address RendererD3D11::zero_stream(std::uint32_t bytes) {
         zero_stream_bytes_ = std::max(bytes, 1u << 16u);
         UploadBuffer memory = gpu::create_upload_memory(device(), zero_stream_bytes_, "zero stream");
         if (!memory) {
-            throw std::runtime_error("the zero stream could not be made");
+            zero_stream_bytes_ = 0u;
+            allocation_failed("the zero stream");
         }
         std::memset(memory.cpu, 0, zero_stream_bytes_);
         zero_vertices_ = std::move(memory.buffer);
@@ -1356,6 +1336,10 @@ bool RendererD3D11::present(const DisplayTexture* source, bool capture_backbuffe
         content = galaxy::ContentViewport{0, 0, bb_w, bb_h};
     }
     (void)galaxy::g_presentation_content.publish(bb_w, bb_h, content);
+    if (capture_backbuffer && !present_black_) {
+        // A test snapshot also keeps the picture itself, before it is scaled to the window.
+        static_cast<void>(debug_copy_selected_display_to_readback(*source));
+    }
     draw_presented_picture(backbuffer_rtv_.Get(), *source->texture, source->width, source->height, content);
     // The swap chain's buffer is not bound past here: the flip model takes it at present.
     context()->OMSetRenderTargets(0u, nullptr, nullptr);
@@ -1363,29 +1347,16 @@ bool RendererD3D11::present(const DisplayTexture* source, bool capture_backbuffe
     host_window::native_settings_present();
     reset_draw_bindings();
     // A test capture of the presented picture: the buffer as drawn, copied before the present takes it.
-    if (capture_backbuffer && !present_black_ && !backbuffer_capture_path_.empty() && backbuffer_capture_pending_path_.empty()) {
+    if (capture_backbuffer && !present_black_ && !backbuffer_capture_path_.empty()) {
         d3d11::ComPtr<ID3D11Texture2D> buffer;
-        D3D11_TEXTURE2D_DESC desc{};
         if (SUCCEEDED(swap_chain_->GetBuffer(0u, IID_PPV_ARGS(&buffer)))) {
+            D3D11_TEXTURE2D_DESC desc{};
             buffer->GetDesc(&desc);
-            desc.BindFlags = 0u;
-            desc.MiscFlags = 0u;
-            desc.Usage = D3D11_USAGE_STAGING;
-            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            D3D11_TEXTURE2D_DESC had{};
-            if (backbuffer_capture_.staging) {
-                backbuffer_capture_.staging->GetDesc(&had);
-            }
-            if (!backbuffer_capture_.staging || had.Width != desc.Width || had.Height != desc.Height) {
-                backbuffer_capture_.staging.Reset();
-                (void)d3d11::Context::get().device()->CreateTexture2D(&desc, nullptr, &backbuffer_capture_.staging);
-            }
-            if (backbuffer_capture_.staging) {
-                context()->CopyResource(backbuffer_capture_.staging.Get(), buffer.Get());
-                backbuffer_capture_.fence = 0u;
-                backbuffer_capture_pending_path_ = backbuffer_capture_path_;
-                backbuffer_capture_width_ = desc.Width;
-                backbuffer_capture_height_ = desc.Height;
+            d3d11::ComPtr<ID3D11Texture2D> staging = capture_staging(desc.Width, desc.Height, desc.Format);
+            if (staging) {
+                context()->CopyResource(staging.Get(), buffer.Get());
+                captures_.recorded({std::move(staging), 0u, backbuffer_capture_path_, desc.Width, desc.Height, 0u,
+                                    desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM ? Captures::Form::TenBit : Captures::Form::Rgba8});
                 return true;
             }
         }

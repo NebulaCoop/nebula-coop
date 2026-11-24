@@ -6,7 +6,8 @@ project(NebulaGame LANGUAGES C CXX)
 # The game's version, from the main project's file.
 file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/../CMakeLists.txt" nebula_project_line REGEX "^project\\(Nebula VERSION ")
 string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+" nebula_version "${nebula_project_line}")
-add_compile_definitions(NEBULA_VERSION="${nebula_version}")
+include("${CMAKE_CURRENT_LIST_DIR}/../cmake/nebula_options.cmake")
+add_compile_definitions(NEBULA_VERSION="${nebula_version}${NEBULA_VERSION_SUFFIX}")
 
 if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
     message(FATAL_ERROR "The game module is built with clang's GNU driver (clang++, not clang-cl).")
@@ -70,6 +71,8 @@ if(NEBULA_LUMA_HOOKS)
 endif()
 set(module_sources)
 set(luma_defined_lists)
+set(luma_copied_sources)  # each source the loop below copies, and its copy: what the end of this file compares
+set(luma_copied_copies)
 foreach(source IN LISTS game_sources)
     if(NEBULA_LUMA_HOOKS AND source MATCHES "\\.cpp$" AND NOT source MATCHES "/System/(Luma(Hook|Loader|Types|Numbers)\\.cpp$|generated/)")
         file(RELATIVE_PATH relative "${petari}/src" "${source}")
@@ -77,13 +80,17 @@ foreach(source IN LISTS game_sources)
         set(copy "${CMAKE_CURRENT_BINARY_DIR}/luma/${relative}")
         add_custom_command(OUTPUT "${copy}"
             BYPRODUCTS "${copy}.globals" "${copy}.types" "${copy}.rows" "${copy}.functions" "${copy}.numbers" "${copy}.places"
+                       "${copy}.needs"
             COMMAND "${Python3_EXECUTABLE}" "${luma_tool}" "${source}" "${copy}"
                     --commands "${CMAKE_BINARY_DIR}/compile_commands.json" --root "${petari}/src" --depfile "${copy}.d"
                     ${luma_libclang}
             DEPENDS "${source}" "${luma_tool}" "${luma_types_tool}" DEPFILE "${copy}.d" VERBATIM)
         set_source_files_properties("${copy}" PROPERTIES COMPILE_OPTIONS "-iquote${folder}")
         list(APPEND module_sources "${copy}")
-        list(APPEND luma_defined_lists "${copy}.globals" "${copy}.types" "${copy}.rows" "${copy}.functions" "${copy}.numbers" "${copy}.places")
+        list(APPEND luma_copied_sources "${source}")
+        list(APPEND luma_copied_copies "${copy}")
+        list(APPEND luma_defined_lists "${copy}.globals" "${copy}.types" "${copy}.rows" "${copy}.functions" "${copy}.numbers" "${copy}.places"
+             "${copy}.needs")
     else()
         list(APPEND module_sources "${source}")
     endif()
@@ -188,11 +195,19 @@ endif()
 # plain one when no enabled mod has code (runtime/src/game_module.cpp). Everything else about them is the same, in
 # smg_game_common. OFF: one module, as before (a build that needs only the rows one).
 option(NEBULA_LUMA_PLAIN_MODULE "Also build smg_game_plain, the game without rows, for a start with no mod code" ON)
+# Coverage builds (tests only, N-1042): the modules count every line and function they run (clang's source-based
+# coverage, written where LLVM_PROFILE_FILE says); tools/gate/coverage.py lists what no test ran.
+option(NEBULA_COVERAGE "Count the lines and functions the game modules run (a test build)" OFF)
+# A sanitizer's runtime and the profile counters' need the C runtime in the module (below).
+set(nebula_module_with_crt OFF)
+if(WIN32 AND (NEBULA_SANITIZE OR NEBULA_COVERAGE OR CMAKE_CXX_FLAGS MATCHES "fprofile-instr-generate"))
+    set(nebula_module_with_crt ON)
+endif()
 set(game_runtime_sources
     math/src/nebula_math.c
     math/src/nebula_libm.c
     math/src/nebula_libc.c
-    $<$<PLATFORM_ID:Windows>:math/src/nebula_runtime_win.c>)
+    $<$<AND:$<PLATFORM_ID:Windows>,$<NOT:$<BOOL:${nebula_module_with_crt}>>>:math/src/nebula_runtime_win.c>)
 add_library(smg_game_common INTERFACE)
 add_library(smg_game SHARED ${module_sources} ${game_runtime_sources})
 target_link_libraries(smg_game PRIVATE smg_game_common)
@@ -283,8 +298,21 @@ target_compile_definitions(smg_game_common INTERFACE $<$<PLATFORM_ID:Linux,Andro
     # Apple's headers turn memcpy, strcpy and the like into checking macros that call the system's library: the module
     # defines those functions itself (math/src/nebula_libc.c) and calls its own.
     $<$<PLATFORM_ID:Darwin,iOS>:_FORTIFY_SOURCE=0>)
+# The game's math functions whose results are rounded (math/src/nebula_libm.c): the compiler treats none of them as the
+# C library's. With -fno-math-errno it would otherwise make intrinsics of them and fold a call with a constant using the
+# build computer's own library. A sine and a cosine of one angle that still reach the compiler as intrinsics (<cmath>'s
+# std::sin(float) is __builtin_sinf) are joined into one sincosf (ELF) or __sincosf_stret (Apple): nebula_libm.c
+# defines those too, so the system's never answers (Android's sincosf made a device's game steps differ from the
+# PC's). The exact ones (sqrt, floor, ceil, trunc, round, fmod) stay the compiler's: single instructions, the same
+# everywhere. cmake/check_module_imports.cmake, at each module's link, fails on any math function taken from the system.
+set(game_math sin cos tan asin acos atan atan2 pow)
+set(game_math_flags "")
+foreach(name IN LISTS game_math)
+    list(APPEND game_math_flags -fno-builtin-${name} -fno-builtin-${name}f)
+endforeach()
 target_compile_options(smg_game_common INTERFACE
     -ffp-contract=off  # the same results on every CPU (A-10)
+    ${game_math_flags}
     $<$<NOT:$<PLATFORM_ID:Windows>>:-fms-extensions>
     -fno-strict-aliasing -fno-strict-float-cast-overflow -fno-math-errno -fno-stack-protector
     $<$<NOT:$<PLATFORM_ID:Windows,Darwin,iOS>>:-fno-plt>
@@ -324,8 +352,12 @@ endif()
 set_source_files_properties(math/src/nebula_libm.c math/src/nebula_libc.c math/src/nebula_runtime_win.c PROPERTIES COMPILE_OPTIONS "-fno-builtin;-fno-lto")
 target_compile_definitions(smg_game_common INTERFACE _USE_STD_VECTOR_ALGORITHMS=0 _ACRTIMP=)
 # No system library: everything the module uses it defines or asks the host for. A sanitizer's runtime and the profile counters' need the C runtime.
-if(WIN32 AND NOT NEBULA_SANITIZE AND NOT CMAKE_CXX_FLAGS MATCHES "fprofile-instr-generate")
+if(WIN32 AND NOT nebula_module_with_crt)
     target_link_options(smg_game_common INTERFACE -nostdlib "LINKER:/NOENTRY" "LINKER:/NODEFAULTLIB")
+elseif(WIN32)
+    # With the C runtime its DLL entry runs the static constructors and it defines what nebula_runtime_win.c does: the
+    # module runs none itself (NebulaModule.c), or each would run twice (N-1062).
+    target_compile_definitions(smg_game_common INTERFACE NEBULA_MODULE_WITH_CRT=1)
 endif()
 
 if(WIN32)
@@ -350,9 +382,21 @@ else()
         target_link_libraries(smg_game_common INTERFACE pthread)
     endif()
 endif()
+if(NOT WIN32)
+    # Windows' module has no C runtime to take anything from; elsewhere the system's library is there to bind to.
+    foreach(module IN LISTS game_modules)
+        add_custom_command(TARGET ${module} POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" "-DNM=${CMAKE_NM}" "-DMODULE=$<TARGET_FILE:${module}>"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/check_module_imports.cmake"
+            VERBATIM)
+    endforeach()
+endif()
 
-# A build for players: ThinLTO with the profile of a tour (native/pgo/game.profdata, tools/verify/pgo_profile.sh): the game's CPU falls about
-# 17 %. A profile older than the code still applies to what has not changed.
+# A build for players: ThinLTO with the profile of a tour (native/pgo/game.profdata, made by tools/gate/pgo.py make,
+# what made it in game.profdata.txt): the game's CPU falls about 17 %. A profile older than the code still applies to
+# what has not changed; the build says how much has (the two warnings below stay on, not as errors) and
+# tools/gate/pgo.py check fails a build with more than 5 % of its functions out of date or a file the profile does
+# not know (P-014).
 # The profile names functions as the Windows build mangles them (the Microsoft C++ ABI): on Android, Linux and Apple
 # (the Itanium ABI) no function would find its counts, so those builds take ThinLTO alone, NEBULA_LTO: about 7 % of the
 # game's CPU by itself on Windows (the same table). -ffp-contract=off holds the results bit for bit through either.
@@ -366,7 +410,10 @@ endif()
 if(NEBULA_PGO)
     set(game_profile "${CMAKE_CURRENT_SOURCE_DIR}/pgo/game.profdata")
     target_compile_options(smg_game_common INTERFACE -flto=thin "-fprofile-instr-use=${game_profile}"
-                           -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+                           -Wprofile-instr-unprofiled -Wprofile-instr-out-of-date -Wno-error=profile-instr-unprofiled
+                           -Wno-error=profile-instr-out-of-date -Wno-backend-plugin)
+    # The line tools/gate/pgo.py check knows a profile build's log by.
+    message(STATUS "Nebula game profile: ${game_profile}")
     target_link_options(smg_game_common INTERFACE -flto=thin "-fprofile-instr-use=${game_profile}")
 elseif(NEBULA_LTO)
     # CMake links a small library and program with the toolchain's ThinLTO first: a linker that cannot read the
@@ -402,20 +449,74 @@ message(STATUS "Nebula game module CPU level: ${NEBULA_CPU_LEVEL}")
 # Sanitizer builds (tests only): e.g. -DNEBULA_SANITIZE=address for the module and the host.
 set(NEBULA_SANITIZE "" CACHE STRING "Sanitizers for a test build (clang -fsanitize=...)")
 if(NEBULA_SANITIZE)
-    target_compile_options(smg_game_common INTERFACE -fsanitize=${NEBULA_SANITIZE} -fno-omit-frame-pointer)
+    # A finding ends the run (no recovery): the harness and ctest see it as the crash it is.
+    target_compile_options(smg_game_common INTERFACE -fsanitize=${NEBULA_SANITIZE} -fno-sanitize-recover=all
+                           -fno-omit-frame-pointer)
     # The module's operator new/delete are NebulaArena's; the sanitizer runtime's own definitions give way.
     target_link_options(smg_game_common INTERFACE -fsanitize=${NEBULA_SANITIZE} $<$<PLATFORM_ID:Windows>:LINKER:/force:multiple>)
+    if(WIN32 AND NEBULA_SANITIZE MATCHES "address")
+        # The module imports the address sanitizer's runtime (a DLL): it is put beside the module, from the compiler that
+        # builds it, before the module is linked, since the build's own programs (luma_describe) load the module from there
+        # (N-1088). A target of its own, so the two modules do not both copy it at the same time.
+        execute_process(COMMAND "${CMAKE_C_COMPILER}" -print-resource-dir OUTPUT_VARIABLE nebula_clang_resource_dir
+                        OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE nebula_clang_resource_status)
+        file(GLOB nebula_asan_runtime "${nebula_clang_resource_dir}/lib/windows/clang_rt.asan_dynamic-*.dll")
+        list(LENGTH nebula_asan_runtime nebula_asan_runtime_count)
+        if(NOT nebula_clang_resource_status EQUAL 0 OR NOT nebula_asan_runtime_count EQUAL 1)
+            message(FATAL_ERROR "NEBULA_SANITIZE=address: no clang_rt.asan_dynamic-*.dll in '${nebula_clang_resource_dir}/lib/windows'")
+        endif()
+        add_custom_target(nebula_asan_runtime
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${nebula_asan_runtime}" "${CMAKE_CURRENT_BINARY_DIR}"
+            VERBATIM)
+        add_dependencies(smg_game nebula_asan_runtime)
+        if(TARGET smg_game_plain)
+            add_dependencies(smg_game_plain nebula_asan_runtime)
+        endif()
+    endif()
     if(NEBULA_SANITIZE MATCHES "address")
         # The game's arenas manage their own memory: built uninstrumented, they keep what is free poisoned and
-        # what they hand out (NebulaArena.cpp), so overflows and uses after free inside them are reported too.
-        set_source_files_properties("${petari}/src/Game/System/NebulaArena.cpp" PROPERTIES COMPILE_OPTIONS "-fno-sanitize=address"
-                                    COMPILE_DEFINITIONS NEBULA_ASAN_HEAPS=1)
+        # what they hand out (NebulaArena.cpp), so overflows and uses after free inside them are reported too. The
+        # definition belongs to every target that compiles the file (smg_game_common: the rows module, smg_game_plain and,
+        # through native/tests/CMakeLists.txt, native_arena_tests), so no copy of the file can miss it. The option stays
+        # on the file: the source as written (smg_game_plain, native_arena_tests) and the rows module's generated copy
+        # (the loop above; its -iquote option stays). NebulaArena.cpp stops the build if it is compiled instrumented.
+        target_compile_definitions(smg_game_common INTERFACE NEBULA_ASAN_HEAPS=1)
+        foreach(arena_file "${petari}/src/Game/System/NebulaArena.cpp" "${CMAKE_CURRENT_BINARY_DIR}/luma/Game/System/NebulaArena.cpp")
+            set_property(SOURCE "${arena_file}" APPEND PROPERTY COMPILE_OPTIONS "-fno-sanitize=address")
+        endforeach()
     endif()
+endif()
+if(NEBULA_COVERAGE)
+    if(NEBULA_PGO OR NEBULA_LTO)
+        message(FATAL_ERROR "NEBULA_COVERAGE counts the code as written: build it without NEBULA_PGO and NEBULA_LTO")
+    endif()
+    target_compile_options(smg_game_common INTERFACE -fprofile-instr-generate -fcoverage-mapping)
+    target_link_options(smg_game_common INTERFACE -fprofile-instr-generate)
+    get_target_property(game_exports_all smg_game WINDOWS_EXPORT_ALL_SYMBOLS)
+    if(WIN32 AND game_exports_all)
+        # The rows module keeps its exports (mods find the game's functions in this build too), less the counters,
+        # whose names CMake's own list cuts (../cmake/coverage_exports.py).
+        set(game_def "${CMAKE_CURRENT_BINARY_DIR}/smg_game_coverage.def")
+        file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/smg_game_objects.txt" CONTENT "$<JOIN:$<TARGET_OBJECTS:smg_game>,\n>\n")
+        set_target_properties(smg_game PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS OFF)
+        add_custom_command(TARGET smg_game PRE_LINK
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/coverage_exports.py" --cmake "${CMAKE_COMMAND}"
+                    --nm "${CMAKE_NM}" --objects "${CMAKE_CURRENT_BINARY_DIR}/smg_game_objects.txt" --out "${game_def}"
+            VERBATIM)
+        target_link_options(smg_game PRIVATE "LINKER:/DEF:${game_def}")
+    endif()
+endif()
+# A counting build (coverage, or the profile's training build: tools/gate/pgo.py make): the host asks for the counts
+# as it ends (nebula_game_write_counts), since it runs no library's exit.
+if(NEBULA_COVERAGE OR CMAKE_CXX_FLAGS MATCHES "fprofile-instr-generate")
+    foreach(module IN LISTS game_modules)
+        target_sources(${module} PRIVATE coverage_counts.c)
+    endforeach()
 endif()
 
 # The native game's host (host/host_main.cpp): loads the module and serves it. Built with the host's own C++ library.
 # The mods' virtual disc (galaxy::mods) serves this host's disc reads as the windowed host's.
-add_executable(nebula_native_host host/host_main.cpp ../runtime/src/host_extension.cpp ../runtime/src/luma_services_host.cpp ../runtime/src/luma_system.cpp ../runtime/src/luma_mods.cpp ../runtime/src/luma_fs.cpp ../runtime/src/luma_net.cpp ../runtime/src/luma_net_reach.cpp ../runtime/src/luma_assets.cpp ../runtime/src/luma_audio.cpp ../runtime/src/luma_capture.cpp
+add_executable(nebula_native_host host/host_main.cpp ../runtime/src/whole_lines.cpp ../runtime/src/host_extension.cpp ../runtime/src/luma_services_host.cpp ../runtime/src/luma_system.cpp ../runtime/src/luma_mods.cpp ../runtime/src/luma_fs.cpp ../runtime/src/luma_net.cpp ../runtime/src/luma_net_reach.cpp ../runtime/src/luma_assets.cpp ../runtime/src/luma_audio.cpp ../runtime/src/luma_capture.cpp
     ../runtime/src/luma_input.cpp ../runtime/src/input/mod_actions.cpp ../runtime/src/input_bindings.cpp
     ../runtime/src/mod_log.cpp ../runtime/src/mod_check.cpp ../runtime/src/luma_game_store.cpp ../runtime/src/mod_screens.cpp ../runtime/src/mod_start_check.cpp ../runtime/src/mod_plugins.cpp ../runtime/src/game_module.cpp host/luma_guard.cpp host/crash_watch.cpp
     ../runtime/src/luma.cpp ../runtime/src/mods.cpp ../runtime/src/mod_consent.cpp ../runtime/src/texture_categories.cpp ../runtime/src/dolphin_pack.cpp ../runtime/src/mod_xml.cpp ../runtime/src/atomic_file.cpp ../runtime/src/save_files.cpp ../runtime/src/asset_store.cpp
@@ -450,6 +551,56 @@ target_link_libraries(nebula_native_host PRIVATE nebula_bssl_ssl nebula_zinflate
 target_compile_definitions(nebula_native_host PRIVATE _CRT_SECURE_NO_WARNINGS)
 add_dependencies(nebula_native_host ${game_modules})
 if(NEBULA_SANITIZE)
-    target_compile_options(nebula_native_host PRIVATE -fsanitize=${NEBULA_SANITIZE} -fno-omit-frame-pointer)
+    # The host and the libraries it links are built alike: the C++ library's container annotations must agree between
+    # them (lld-link's /failifmismatch 'annotate_string'), and their code is checked too (N-1062).
+    foreach(target nebula_native_host nebula_bssl_crypto nebula_bssl_ssl nebula_zinflate)
+        target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize=${NEBULA_SANITIZE}
+                               -fno-sanitize-recover=all -fno-omit-frame-pointer>)
+    endforeach()
     target_link_options(nebula_native_host PRIVATE -fsanitize=${NEBULA_SANITIZE})
+endif()
+
+# The game's unit tests (native/tests/CMakeLists.txt), where the build runs its own programs.
+option(NEBULA_NATIVE_TESTS "Build the game's unit tests" ON)
+if(NEBULA_NATIVE_TESTS AND NOT ANDROID AND NOT IOS AND NOT CMAKE_CROSSCOMPILING)
+    include(tests/CMakeLists.txt)
+endif()
+
+# The rows module compiles the generated copies of the game's sources (the loop near the top), not the sources. A property set on a source as
+# written is missing on its copy, and every tour, replay and soak loads the rows module: the sanitizer build was blind to the game's own
+# memory for that reason (P-341). The copy keeps its own -iquote option; anything else the source has and its copy lacks stops the configure.
+list(LENGTH luma_copied_sources luma_copied_count)
+if(luma_copied_count GREATER 0)
+    math(EXPR luma_copied_last "${luma_copied_count} - 1")
+    foreach(luma_index RANGE ${luma_copied_last})
+        list(GET luma_copied_sources ${luma_index} luma_source)
+        list(GET luma_copied_copies ${luma_index} luma_copy)
+        foreach(luma_property COMPILE_OPTIONS COMPILE_DEFINITIONS COMPILE_FLAGS)
+            get_source_file_property(luma_wanted "${luma_source}" ${luma_property})
+            get_source_file_property(luma_given "${luma_copy}" ${luma_property})
+            if(NOT luma_wanted OR luma_wanted STREQUAL "NOTFOUND")
+                continue()
+            endif()
+            if(luma_property STREQUAL "COMPILE_FLAGS")
+                set(luma_items "${luma_wanted}")
+                set(luma_has "${luma_given}")
+                if(NOT luma_has OR luma_has STREQUAL "NOTFOUND")
+                    set(luma_has "")
+                endif()
+                string(FIND "${luma_has}" "${luma_wanted}" luma_found)
+                if(luma_found EQUAL -1)
+                    message(FATAL_ERROR "native/CMakeLists.txt: ${luma_source} has the ${luma_property} '${luma_wanted}' and its copy for the rows module (${luma_copy}) has not: set it on the copy too.")
+                endif()
+                continue()
+            endif()
+            if(NOT luma_given OR luma_given STREQUAL "NOTFOUND")
+                set(luma_given "")
+            endif()
+            foreach(luma_item IN LISTS luma_wanted)
+                if(NOT luma_item IN_LIST luma_given)
+                    message(FATAL_ERROR "native/CMakeLists.txt: ${luma_source} has the ${luma_property} '${luma_item}' and its copy for the rows module (${luma_copy}) has not: set it on the copy too.")
+                endif()
+            endforeach()
+        endforeach()
+    endforeach()
 endif()

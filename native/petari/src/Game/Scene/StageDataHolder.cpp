@@ -1,7 +1,7 @@
 #include <nebula_game_api.h>
 #include "nebula_module.h"
-extern "C" const NebulaHostServices* nebula_host(void);
 #include "Game/Scene/StageDataHolder.hpp"
+#include "Game/NameObj/LoadSlice.hpp"
 #include "Game/NameObj/NameObjFactory.hpp"
 #include "Game/Scene/PlacementInfoOrdered.hpp"
 #include "Game/Scene/SceneObjHolder.hpp"
@@ -22,7 +22,9 @@ extern "C" const NebulaHostServices* nebula_host(void);
 #include "Game/System/LumaCore.hpp"
 
 namespace {
-    // One per bit of a layer mask.
+    // One per bit of a layer mask. Common and LayerA to LayerP are the disc's (the console walks those 17); LayerQ to
+    // LayerAE are for mods' stages, whose scenarios may set a mask bit past 16. A folder the zone's archive does not
+    // have holds no table, so a disc stage reads exactly the console's set.
     const char* const cLayerDirName[32] = {"Common", "LayerA", "LayerB", "LayerC", "LayerD", "LayerE", "LayerF", "LayerG", "LayerH", "LayerI", "LayerJ", "LayerK", "LayerL", "LayerM", "LayerN", "LayerO", "LayerP", "LayerQ", "LayerR", "LayerS", "LayerT", "LayerU", "LayerV", "LayerW", "LayerX", "LayerY", "LayerZ", "LayerAA", "LayerAB", "LayerAC", "LayerAD", "LayerAE"};
 
     static bool isPrioPlacementObjInfo(const char* pName) {
@@ -152,22 +154,25 @@ void StageDataHolder::initAfterScenarioSelected() {
 }
 
 void StageDataHolder::initPlacement() {
-    while (!initPlacementStep(UINT64_MAX)) {}
+    LoadSlice whole = LoadSlice::whole();
+    while (!initPlacementStep(whole)) {}
 }
 
-bool StageDataHolder::initPlacementStep(uint64_t deadline) {
+// The player counts one item of the slice; each list spends its own items.
+bool StageDataHolder::initPlacementStep(LoadSlice& rSlice) {
     while (mPlacementStage < 6u) {
         if (mPlacementStage == 0u) {
             MR::setInitializeStatePlacementPlayer();
             initPlacementMario();
+            rSlice.spend();
         } else {
             PlacementInfoOrdered* lists[] = {mCommonPriorityOrder, mScenarioPriorityOrder, mCommonNormalOrder, mScenarioNormalOrder, mAfterScenarioOrder};
             if (mPlacementStage <= 2u) MR::setInitializeStatePlacementHighPriority();
             else MR::setInitializeStatePlacement();
-            if (!lists[mPlacementStage - 1u]->initPlacementStep(deadline)) return false;
+            if (!lists[mPlacementStage - 1u]->initPlacementStep(rSlice)) return false;
         }
         ++mPlacementStage;
-        if (nebula_host()->clock_ns(nebula_host()->user) >= deadline) return mPlacementStage == 6u;
+        if (rSlice.isUsedUp()) return mPlacementStage == 6u;
     }
     return true;
 }

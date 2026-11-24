@@ -18,21 +18,23 @@
 #include "galaxy/platform_time.h"
 #include "galaxy/launch_args.h"
 #include "galaxy/render/ambient_occlusion_objects.h"
+#include "galaxy/render/d3d11/constants_watch_d3d11.h"
 #include "galaxy/render/d3d11/d3d11_context.h"
 #include "galaxy/render/d3d11/fx_d3d11.h"
 #include "galaxy/render/display_modes.h"
+#include "galaxy/render/dxgi_memory.h"
 #include "galaxy/render/dynamic_resolution.h"
 #include "galaxy/render/frame_pass.h"
+#include "galaxy/render/gpu_pass_times.h"
 #include "galaxy/render/gpu_types.h"
 #include "galaxy/render/gpu_upload_ring.h"
 #include "galaxy/render/host_window.h"
 #include "galaxy/render/mod_post.h"
 #include "galaxy/render/post_process_settings.h"
 #include "galaxy/render/render_config.h"
+#include "galaxy/render/present_slots.h"
 #include "galaxy/render/renderer_common.h"
-#include "galaxy/render/rt/rt_backend.h"
-#include "galaxy/render/rt/rt_denoiser.h"
-#include "galaxy/render/rt_types.h"
+#include "galaxy/render/scene_view.h"
 #include "galaxy/render/window_owner.h"
 #include "galaxy/render_api.h"
 #include "galaxy/render/idle_clock.h"
@@ -84,7 +86,7 @@ public:
     void record_scene_aa();
     // Ambient occlusion of the opaque scene (d3d11::AmbientOcclusion).
     [[nodiscard]] bool ambient_occlusion_ready() const noexcept { return ao_.ready(); }
-    void set_scene_ao_view(const RtView& view) noexcept { scene_ao_view_ = view; }
+    void set_scene_ao_view(const SceneView& view) noexcept { scene_ao_view_ = view; }
     void set_scene_ao_objects(std::vector<ao::ObjectOccluder>& objects) noexcept { scene_ao_objects_.swap(objects); }
     void record_scene_ao();
     // The game's bloom (d3d11::GameBloom): `kind` a NEBULA_PASS_BLOOM_*, `a` and `b` its values.
@@ -92,15 +94,15 @@ public:
     void game_bloom(std::uint32_t kind, std::uint32_t a, std::uint32_t b);
     // Interpolation re-walks the newest list for each picture between game steps (RenderCore); no frame generation or
     // temporal upscaler on Direct3D 11, so a generated picture costs what a scene picture costs.
-    void reset_generated_gpu_ema() noexcept { generated_gpu_ema_ms_ = 0.0; }
-    [[nodiscard]] double generated_gpu_ema_ms() const noexcept { return generated_gpu_ema_ms_; }
-    [[nodiscard]] double interpolation_gpu_cost_ms() const noexcept { return native_scene_gpu_ema_ms_; }
+    void reset_generated_gpu_ema() noexcept { frame_gpu_.reset_generated_ema(); }
+    [[nodiscard]] double generated_gpu_ema_ms() const noexcept { return frame_gpu_.generated_ema_ms(); }
+    [[nodiscard]] double interpolation_gpu_cost_ms() const noexcept { return frame_gpu_.scene_ema_ms(); }
     void suspend_temporal_interpolation(double) {}
     [[nodiscard]] bool temporal_interpolation() const noexcept { return false; }
     [[nodiscard]] unsigned temporal_output_width() const noexcept { return 0u; }
     [[nodiscard]] double gpu_ms_per_tick() const noexcept { return 0.0; }
     // Smoothed GPU time of a frame that drew the scene (0 until measured).
-    [[nodiscard]] double scene_gpu_ema_ms() const noexcept { return native_scene_gpu_ema_ms_; }
+    [[nodiscard]] double scene_gpu_ema_ms() const noexcept { return frame_gpu_.scene_ema_ms(); }
     void set_scene_view(const std::array<float, 12>* view) noexcept {
         scene_view_known_ = view != nullptr;
         if (view != nullptr) {
@@ -112,7 +114,7 @@ public:
     [[nodiscard]] std::int64_t last_present_qpc() const noexcept { return swap_present_qpc_; }
     // The 3D scene in a wide target while `wanted` (the enhanced lighting), its camera at the end (d3d11::SceneCamera).
     bool begin_wide_scene(bool wanted, const SceneClearValues* initial_clear = nullptr);
-    void end_wide_scene(unsigned finish = 0u);  // finish: the traced relight's camera (always 0: nothing traces here)
+    void end_wide_scene();
     [[nodiscard]] bool temporal_mode() const { return false; }
     [[nodiscard]] bool motion_pass_only() const { return false; }
     [[nodiscard]] bool has_layer_targets() const noexcept { return false; }
@@ -120,10 +122,7 @@ public:
     [[nodiscard]] bool bindless() const noexcept { return false; }
     [[nodiscard]] std::uint32_t texture_slot(const TextureHandle&) const noexcept { return 0u; }
     [[nodiscard]] std::uint32_t sampler_slot(const SamplerKey&) { return 0u; }
-    void write_texture_list(const std::uint32_t*, std::uint32_t, gpu::Address& lists, std::uint32_t& first) {
-        lists = 0u;
-        first = 0u;
-    }
+    bool make_texture_list_chunk(std::uint32_t, std::uint32_t*&, gpu::Address&) { return false; }
     void bind_draw_textures(gpu::Address) {}
     [[nodiscard]] std::uint32_t table_slots() const noexcept { return d3d11::kBoundTableSlots; }
     [[nodiscard]] gpu::Table texture_table_for(const TextureHandle* handles, unsigned count, const TextureStore& cache);
@@ -138,7 +137,7 @@ public:
     void trace_rings() const;
     void copy_fg_hudless_display(const DisplayTexture&) {}
     void attach_texture_uploads(TextureStore& cache);
-    // The video memory in use and its budget (IDXGIAdapter3::QueryVideoMemoryInfo), read at a frame boundary.
+    // The video memory in use and its budget (dxgi_memory.h: asked at most every 100 ms, at once when the budget moved).
     [[nodiscard]] bool video_memory(std::uint64_t& usage, std::uint64_t& budget) const noexcept;
     void wait_for_gpu_idle();
     void pump_messages() {}
@@ -147,7 +146,11 @@ public:
     [[nodiscard]] bool occluded() const noexcept { return occluded_; }
     void probe_occlusion() noexcept;
 
+    // An extension's lose_gpu_device, on the render thread: the next present reports a removed device.
     void lose_device();
+    // A GPU allocation inside the frame failed: thrown as a device loss when the device is gone (the renderer is made
+    // again), as memory run out otherwise (P-062).
+    [[noreturn]] void allocation_failed(const char* what) const;
     void begin_frame();
     std::uint64_t end_frame(bool present_swap_chain = true, SubmissionCallback on_submitted = nullptr,
                             void* submission_context = nullptr, bool generated = false);
@@ -170,26 +173,6 @@ public:
     // GPU time by pass (render_api.h GpuPassTime): any thread.
     void set_gpu_timing(bool on) noexcept { gpu_timing_wanted_.store(on, std::memory_order_relaxed); }
     [[nodiscard]] bool gpu_timing_on() const noexcept { return gpu_timing_wanted_.load(std::memory_order_relaxed); }
-    // What the ray tracer records through on the other renderers: there is no tracer on Direct3D 11 (feature level 11
-    // hardware has no ray tracing), so the render core never comes here; they say there is nothing.
-    struct RtCommands {
-        void* commands = nullptr;
-        void* descriptors = nullptr;
-    };
-    [[nodiscard]] RtCommands rt_commands_begin() { return {}; }
-    void rt_commands_end() {}
-    [[nodiscard]] bool rt_depth_begin(rt::TextureView&, unsigned&, unsigned&, rt::ImageFormat&) { return false; }
-    void rt_depth_end() {}
-    void rt_copy_to_scene(void*) {}
-    [[nodiscard]] bool rt_items_begin() { return false; }
-    [[nodiscard]] bool rt_light_begin(rt::TextureView&, rt::TextureView&, unsigned&, unsigned&) { return false; }
-    void rt_light_end() {}
-    [[nodiscard]] bool rt_reactive_begin(rt::TextureView&) { return false; }
-    void rt_reactive_end() {}
-    [[nodiscard]] rt::Denoiser* rt_denoiser() noexcept { return nullptr; }
-    [[nodiscard]] std::uint32_t rt_publish_light(void*, TextureStore&, unsigned = 0u) { return 0u; }
-    void rt_unpublish_lights(TextureStore&) {}
-    void rt_wait_idle() { wait_for_gpu_idle(); }
     [[nodiscard]] std::size_t gpu_pass_times(GpuPassTime* out, std::size_t capacity) const noexcept;
     void scene_jitter_info(unsigned& index, unsigned& phases) const noexcept {
         index = 0u;
@@ -259,8 +242,7 @@ public:
     [[nodiscard]] bool interpolation_mode() const;
     // The generated pictures' GPU time since the last call (--diagnostics present-stats).
     void take_generated_gpu_ms(double& total_ms, std::uint64_t& samples) noexcept {
-        total_ms = std::exchange(generated_gpu_ms_, 0.0);
-        samples = std::exchange(generated_gpu_samples_, 0u);
+        frame_gpu_.take_generated(total_ms, samples);
     }
     void set_scene_camera(float near_plane, float far_plane, float fov_y) noexcept {
         scene_lens_[0] = near_plane;
@@ -271,18 +253,13 @@ public:
     [[nodiscard]] double measured_present_hz() const noexcept { return measured_present_hz_.load(std::memory_order_relaxed); }
     [[nodiscard]] std::uint64_t frame_index() const noexcept { return frame_index_; }
 
-    // Each point's depth (0 near, 1 far) into slot `slot`'s readback; screen_probes_finished names the values once that
-    // frame's fence has passed. `compared` probes are answered by a depth test of each point (1 seen, 0 hidden).
-    [[nodiscard]] bool record_screen_probes(std::size_t slot, std::span<const ScreenProbe> probes, bool compared);
-    [[nodiscard]] const float* screen_probes_finished(std::size_t slot);
-
-    // Test captures: the scene target and the presented picture as PPM files (paths from set_debug_capture_paths).
-    bool debug_copy_scene_to_readback();
-    void debug_log_readback();
+    // Test captures: the presented picture as PPM files (paths from set_debug_capture_paths). Writes every capture
+    // whose frame the GPU has finished.
     void debug_log_backbuffer_readback();
+    // The presented display picture itself (before it is scaled to the window), copied to <backbuffer path>.display.ppm,
+    // as the other renderers' display capture.
     bool debug_copy_selected_display_to_readback(const DisplayTexture& source);
-    void debug_log_display_readback();
-    void set_debug_capture_paths(std::string scene_ppm_path, std::string backbuffer_ppm_path);
+    void set_debug_capture_paths(std::string backbuffer_ppm_path);
     // The pictures handed to an extension, taken from the GPU and written (render thread; RenderCore::finish_pictures,
     // before a process that ends without the shutdown).
     void finish_pictures();
@@ -308,6 +285,10 @@ public:
     [[nodiscard]] void* pipeline_backend() noexcept { return this; }
     [[nodiscard]] double display_refresh_hz() const noexcept { return display_refresh_hz_; }
     [[nodiscard]] bool vblank_grid(std::int64_t& vblank, std::int64_t& period) const noexcept;
+    // What the swap chain keeps of the pictures presented (present_slots.h): every one with VSync; VSync off tears here.
+    [[nodiscard]] SwapQueue swap_queue() const noexcept {
+        return get_render_config().vsync_interval != 0u ? SwapQueue::EveryPicture : SwapQueue::Tearing;
+    }
     // The moment the next present shows (RenderCore's interpolation slots): this API has no presentation times, so
     // the presents pace themselves (PresentPacer, the swap chain's vblanks).
     void set_present_moment(std::int64_t) noexcept {}
@@ -331,9 +312,7 @@ public:
     // and every recorded draw run (flush_draws, end_scene_pass); a part leaves its own state bound, and the renderer
     // binds its own again (encoder_.reset, bound_).
     [[nodiscard]] ID3D11DeviceContext1* context() const noexcept { return d3d11::Context::get().immediate(); }
-    enum class GpuPass : std::uint8_t {
-        Scene, Resolve, FramePass, DisplayCopy, Bloom, SceneAa, SceneAo, Present, Camera, Count
-    };
+    using GpuPass = ::galaxy::render::GpuPass;
     static constexpr unsigned kGpuPassSlots = 256u;
 
 private:
@@ -360,10 +339,6 @@ private:
         gpu::TextureRef texture;
         unsigned width = 0;
         unsigned height = 0;
-    };
-    struct Readback {
-        d3d11::ComPtr<ID3D11Texture2D> staging;  // D3D11_USAGE_STAGING, CPU read
-        std::uint64_t fence = 0;                 // 0: idle
     };
     // A scene target: its colour and depth, and with MSAA the multisampled targets the pass draws into (the colour
     // resolves into `color` when read; the depth is resolved on demand, resolve_scene_depth).
@@ -452,6 +427,9 @@ private:
     void end_scene_pass(const char* caller = __builtin_FUNCTION());
     // The recorded draws run: the upload memory they read reaches the GPU, then the ops replay on the immediate context.
     void flush_draws();
+    // The roots of pass_ops_ from `from` on into one piece of the constant ring, as many as a piece holds; returns the
+    // first op not written.
+    std::size_t write_roots(std::size_t from, bool carried);
     void bind_constants(unsigned slot, gpu::Address address, bool vertex, bool pixel);
     void bind_rows(gpu::Address rows, gpu::Address instances);
     void reset_draw_bindings() noexcept;
@@ -483,6 +461,9 @@ private:
     bool window_shown_ = false;
     bool keep_window_ = false;
     bool occluded_ = false;
+    // The device's adapter's video memory (video_memory); render thread.
+    mutable DxgiMemory memory_;
+    bool loss_asked_ = false;  // lose_device, until the present that reports it
     TextureStore* mirrored_store_ = nullptr;
 
     // The swap chain.
@@ -508,11 +489,17 @@ private:
     d3d11::RenderLayout draw_layout_{};
     d3d11::ComPtr<ID3D11SamplerState> linear_clamp_;
     d3d11::ComPtr<ID3D11SamplerState> point_clamp_;
-    d3d11::ComPtr<ID3D11Buffer> root_constants_;     // b3: the draw's DrawRoot, written per change (dynamic)
-    d3d11::ComPtr<ID3D11Buffer> utility_constants_;  // the renderer's own draws' b0 (dynamic)
+    // b3: the draws' DrawRoots in the constant ring (d3d11::Context::begin_constants), 256 bytes each, written ahead of
+    // the draws in runs of one piece each, each draw bound to its own by offset (flush_draws, P-060).
+    d3d11::ComPtr<ID3D11Buffer> root_buffer_;  // the ring the last run went to
+    std::vector<UINT> root_first_;             // per pass op: where its Root was written (in 16-byte constants)
+    gpu::DrawRoot root_carried_{};             // the last root written: the next pass starts with it bound
+    UINT root_carried_first_ = 0u;             // where this pass's copy of it lies
     std::array<d3d11::ComPtr<ID3D11PixelShader>, static_cast<std::size_t>(Utility::Count)> utility_ps_{};
     d3d11::ComPtr<ID3D11VertexShader> full_screen_vs_;
-    d3d11::ComPtr<ID3D11ComputeShader> probe_cs_;
+    // --diagnostics constants-watch: once a frame, a compute read of a ring piece checked against what was written
+    // (P-332); null without it.
+    std::unique_ptr<d3d11::ConstantsWatch> constants_watch_;
     d3d11::ComPtr<ID3D11RasterizerState> utility_raster_;
     std::array<d3d11::ComPtr<ID3D11BlendState>, 16> write_masks_{};  // by D3D11_COLOR_WRITE_ENABLE_* mask
     std::array<d3d11::ComPtr<ID3D11DepthStencilState>, static_cast<std::size_t>(DepthUse::Count)> depth_uses_{};
@@ -572,7 +559,7 @@ private:
     d3d11::GameBloom bloom_;
     d3d11::AmbientOcclusion ao_;
     d3d11::SceneCamera scene_camera_;
-    RtView scene_ao_view_{};
+    SceneView scene_ao_view_{};
     std::vector<ao::ObjectOccluder> scene_ao_objects_;
     PostOutput hdr_output_{};
 
@@ -615,36 +602,13 @@ private:
     std::uint64_t frame_pass_color_key_ = 0u;
     std::uint64_t frame_pass_depth_key_ = 0u;
 
-    // Screen probes: a slot's points (written here) and values (the dispatch writes, read back), fenced with its frame.
-    struct ProbeSlot {
-        d3d11::ComPtr<ID3D11Buffer> points;  // the frame pixels to read (uint2), dynamic
-        d3d11::ComPtr<ID3D11ShaderResourceView> points_view;
-        d3d11::ComPtr<ID3D11Buffer> values;  // written by the probe dispatch
-        d3d11::ComPtr<ID3D11UnorderedAccessView> values_view;
-        d3d11::ComPtr<ID3D11Buffer> readback;  // D3D11_USAGE_STAGING
-        std::uint64_t capacity = 0;  // points they hold
-        std::uint64_t fence = 0;     // 0: idle; kProbesInFrame: recorded in the frame being built
-        std::uint32_t count = 0;
-        std::vector<float> answers;
-    };
-    static constexpr std::uint64_t kProbesInFrame = ~std::uint64_t{0};
-    std::vector<ProbeSlot> probe_slots_;
-
     // Captures and telemetry.
-    std::string scene_capture_path_;
     std::string backbuffer_capture_path_;
-    Readback scene_capture_;
-    std::string scene_capture_pending_path_;
-    unsigned scene_capture_width_ = 0;
-    unsigned scene_capture_height_ = 0;
-    Readback backbuffer_capture_;
-    std::string backbuffer_capture_pending_path_;
-    unsigned backbuffer_capture_width_ = 0;
-    unsigned backbuffer_capture_height_ = 0;
-    Readback display_capture_;
-    std::string display_capture_pending_path_;
-    unsigned display_capture_width_ = 0;
-    unsigned display_capture_height_ = 0;
+    // The pictures copied out (the presented picture and the display picture), each its own staging texture.
+    using Captures = PictureCaptures<d3d11::ComPtr<ID3D11Texture2D>>;
+    Captures captures_;
+    // A staging texture for a capture of `width` x `height` `format` pixels: a spare one, or a new one.
+    [[nodiscard]] d3d11::ComPtr<ID3D11Texture2D> capture_staging(unsigned width, unsigned height, DXGI_FORMAT format);
     std::atomic<double> measured_present_hz_{0.0};
     double display_refresh_hz_ = 0.0;
     bool variable_refresh_ = false;
@@ -664,17 +628,12 @@ private:
         double present_ms = 0.0, present_max_ms = 0.0, gpu_ms = 0.0;
     } stats_;
     PresentPacer present_pacer_;
-    double native_scene_gpu_ema_ms_ = 0.0;
-    double generated_gpu_ms_ = 0.0;  // the generated pictures' GPU time, taken by take_generated_gpu_ms
-    std::uint64_t generated_gpu_samples_ = 0u;
-    double generated_gpu_ema_ms_ = 0.0;
+    FrameGpuTime frame_gpu_;  // the frame's GPU time: the governor's and the interpolation's measures
     bool scene_drawn_ = false;
     GpuPass current_pass_ = GpuPass::Scene;
     std::atomic<bool> gpu_timing_wanted_{false};
     std::atomic<float> frame_gpu_ema_ms_{0.0f};
-    bool pass_timing_on_ = false;  // this frame marks its passes
-    std::array<std::atomic<float>, static_cast<std::size_t>(GpuPass::Count)> pass_ema_ms_{};
-    std::array<double, static_cast<std::size_t>(GpuPass::Count)> telemetry_pass_ms_{};
+    GpuPassTimes pass_times_;  // timed(): this frame marks its passes
     void read_pass_times(Frame& frame, UINT64 frequency, UINT64 frame_end);
 
     // draw.post's stages by program (mod_post_d3d11.cpp), dropped when the program leaves (mod_post_epoch); a stage the
@@ -686,8 +645,6 @@ private:
     };
     std::vector<ModPostShaders> mod_post_shaders_;
     std::uint64_t mod_post_epoch_ = 0u;
-    d3d11::ComPtr<ID3D11Buffer> mod_post_constants_;  // b0, ModPostConstants (dynamic)
-    bool mod_post_failed_ = false;
     // draw.native's context state: a mod's function binds what it likes there, and the renderer's own state is swapped
     // back in after it (ID3D11DeviceContext1::SwapDeviceContextState).
     d3d11::ComPtr<ID3DDeviceContextState> native_state_;

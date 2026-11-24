@@ -8,7 +8,6 @@ import android.content.Intent
 import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
 import android.net.Uri
-import android.util.Base64
 import androidx.core.content.IntentCompat
 import org.json.JSONArray
 import org.json.JSONObject
@@ -21,6 +20,7 @@ import java.net.URL
 import java.security.KeyFactory
 import java.security.Signature
 import java.security.spec.RSAPublicKeySpec
+import java.util.Base64
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** A published release newer than this build: its version, notes as plain text, and its signed APK. */
@@ -72,8 +72,11 @@ object Updates {
 
     private val running = AtomicBoolean(false)
 
-    /** The asset this build updates from: a beta's has its own name, so a release build never sees it. */
-    fun assetName(installed: String): String = if (isBeta(installed)) "Nebula-Beta-Android.apk" else "Nebula-Android.apk"
+    /** The asset of a release of [version]: a beta's has its own name, so a release build never sees it. */
+    fun assetName(version: String): String = if (isBeta(version)) "Nebula-Beta-Android.apk" else "Nebula-Android.apk"
+
+    /** A release install takes releases; a beta install takes betas and the releases after them (P-092). */
+    fun takes(installed: String, version: String): Boolean = isBeta(installed) || !isBeta(version)
 
     /** The check runs: the player has not turned it off, and no store installed the app. */
     fun enabled(context: Context): Boolean =
@@ -137,15 +140,13 @@ object Updates {
     private fun offered(context: Context, release: Release?): Release? {
         if (release == null) return null
         val installed = BuildConfig.VERSION_NAME
-        if (compareVersions(release.version, installed) <= 0 || isBeta(release.version) != isBeta(installed)) return null
+        if (compareVersions(release.version, installed) <= 0 || !takes(installed, release.version)) return null
         val skipped = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(SKIPPED, null)
         return if (skipped.isNullOrEmpty() || compareVersions(release.version, skipped) > 0) release else null
     }
 
-    // The release list: the newest of this build's channel newer than it, with its APK and signature over HTTPS.
+    // The release list: the newest release this build takes newer than it, with its APK and signature over HTTPS.
     internal fun selectNewer(json: String, installed: String): Release? {
-        val beta = isBeta(installed)
-        val asset = assetName(installed)
         val list = JSONArray(json)
         var best: Release? = null
         for (i in 0 until list.length()) {
@@ -153,8 +154,9 @@ object Updates {
             if (release.optBoolean("draft")) continue
             val tag = release.text("tag_name")
             val version = tag.removePrefix("v")
-            if (isBeta(version) != beta) continue
+            if (!takes(installed, version)) continue
             if (compareVersions(version, best?.version ?: installed) <= 0) continue
+            val asset = assetName(version)
             var apk: String? = null
             var signature: String? = null
             var bytes = 0L
@@ -276,7 +278,7 @@ object Updates {
         val file = cacheFile(context)
         val temp = File(file.path + ".tmp")
         temp.writeText(o.toString())
-        if (!temp.renameTo(file)) temp.delete()
+        if (!replaceFile(temp, file)) temp.delete()
     }
 
     private fun readCache(context: Context): Pair<Release?, Long>? = runCatching {
@@ -396,14 +398,20 @@ object Updates {
         }
     }
 
-    /** RSA PKCS#1 v1.5 SHA-256 over the whole file, the signature file being its base64 (build-native-setup.ps1). */
-    internal fun verifySignature(file: File, signatureFile: ByteArray): Boolean = runCatching {
-        val signature = Base64.decode(String(signatureFile, Charsets.US_ASCII).trim(), Base64.DEFAULT)
+    /**
+     * RSA PKCS#1 v1.5 SHA-256 over the whole file, the signature file being its base64 (build-native-setup.ps1), by
+     * the release key (or the key given: the test's own).
+     */
+    internal fun verifySignature(
+        file: File,
+        signatureFile: ByteArray,
+        modulus: String = RELEASE_MODULUS,
+        exponent: String = RELEASE_EXPONENT,
+    ): Boolean = runCatching {
+        val base64 = Base64.getMimeDecoder()
+        val signature = base64.decode(String(signatureFile, Charsets.US_ASCII).trim())
         val key = KeyFactory.getInstance("RSA").generatePublic(
-            RSAPublicKeySpec(
-                BigInteger(1, Base64.decode(RELEASE_MODULUS, Base64.DEFAULT)),
-                BigInteger(1, Base64.decode(RELEASE_EXPONENT, Base64.DEFAULT)),
-            ),
+            RSAPublicKeySpec(BigInteger(1, base64.decode(modulus)), BigInteger(1, base64.decode(exponent))),
         )
         val verifier = Signature.getInstance("SHA256withRSA")
         verifier.initVerify(key)

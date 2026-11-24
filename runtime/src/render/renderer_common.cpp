@@ -2,6 +2,7 @@
 // What both renderers share (renderer_common.h).
 
 #include "galaxy/render/renderer_common.h"
+#include "galaxy/render/post_process_settings.h"
 #include "galaxy/platform_time.h"
 
 #if defined(_WIN32)
@@ -100,20 +101,18 @@ float4 main(float4 pos : SV_Position) : SV_Target {
 }
 )HLSL";
 
-// Screen probes: each point's depth, 0 near to 1 far (the depth buffer is reversed), at the frame pixel the CPU found
-// for it (ScreenProbePixel); a point the game did not ask about (~0u) reads 0.
-static constexpr char kScreenProbeCs[] = R"HLSL(
+// The constants watch (d3d11::ConstantsWatch, P-332): the three words of the piece bound at b0, as this dispatch reads
+// them, into u0.
+static constexpr char kConstantsWatchCs[] = R"HLSL(
 cbuffer C : register(b0) {
-    uint count;
+    uint3 words;
 };
-Texture2D<float> depth : register(t0);
-StructuredBuffer<uint2> pixels : register(t1);
-RWStructuredBuffer<float> values : register(u0);
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= count) return;
-    const uint2 pixel = pixels[id.x];
-    values[id.x] = pixel.x == 0xffffffffu ? 0.0 : saturate(1.0 - depth.Load(int3(int2(pixel), 0)));
+RWStructuredBuffer<uint> seen : register(u0);
+[numthreads(1, 1, 1)]
+void main() {
+    seen[0] = words.x;
+    seen[1] = words.y;
+    seen[2] = words.z;
 }
 )HLSL";
 
@@ -206,23 +205,14 @@ std::string_view layer_merge_shader_source() noexcept {
     return std::string_view{kLayerMergePs, sizeof(kLayerMergePs) - 1u};
 }
 
-std::string_view screen_probe_shader_source() noexcept {
-    return std::string_view{kScreenProbeCs, sizeof(kScreenProbeCs) - 1u};
-}
-
 SceneConversionShaderConstants make_scene_conversion_constants(std::uint8_t channels, float src_x, float src_y,
                                                                float step_x, float step_y, float limit_x,
                                                                float limit_y) noexcept {
     return SceneConversionShaderConstants{{src_x, src_y, step_x, step_y}, channels, limit_x, limit_y};
 }
 
-ScreenProbePixel screen_probe_pixel(const ScreenProbe& probe, const FrameMap& map) noexcept {
-    // Not a number fails both tests too.
-    if (!(probe.x >= 0.0f) || !(probe.y >= 0.0f) || map.empty()) return {~0u, ~0u};
-    const auto pixel = [](float at, float scale, unsigned size) {
-        return static_cast<std::uint32_t>(std::min(at * scale, static_cast<float>(size - 1u)));
-    };
-    return {pixel(probe.x, map.sx, map.width), pixel(probe.y, map.sy, map.height)};
+std::string_view constants_watch_shader_source() noexcept {
+    return std::string_view{kConstantsWatchCs, sizeof(kConstantsWatchCs) - 1u};
 }
 
 SceneClearValues make_scene_clear_values(std::uint32_t rgba, std::uint8_t frame_format) noexcept {
@@ -434,6 +424,121 @@ void write_ppm_async(std::string path, std::vector<std::uint8_t> rgb, unsigned w
         --g_picture_files_open;
         g_picture_files_done.notify_all();
     }).detach();
+}
+
+// The scene's words (post_process_settings.h): here beside write_capture_rows, since the shader tools build this
+// file without post_process_settings.cpp.
+void rgba8_to_ten_bit(const std::uint8_t* rgba, std::uint8_t* words, unsigned width, unsigned height,
+                      unsigned pitch) noexcept {
+    for (unsigned y = 0u; y < height; ++y) {
+        const std::uint8_t* from = rgba + static_cast<std::size_t>(y) * pitch;
+        std::uint8_t* to = words + static_cast<std::size_t>(y) * pitch;
+        for (unsigned x = 0u; x < width; ++x) {
+            const auto wide = [](std::uint8_t v) { return (static_cast<std::uint32_t>(v) * 1023u + 127u) / 255u; };
+            const std::uint32_t word = wide(from[x * 4u]) | wide(from[x * 4u + 1u]) << 10u |
+                                       wide(from[x * 4u + 2u]) << 20u |
+                                       static_cast<std::uint32_t>(from[x * 4u + 3u] >> 6u) << 30u;
+            std::memcpy(to + x * 4u, &word, 4u);
+        }
+    }
+}
+
+void ten_bit_to_rgba8(const std::uint8_t* words, std::uint8_t* rgba, unsigned width, unsigned height,
+                      unsigned word_pitch, unsigned rgba_pitch) noexcept {
+    for (unsigned y = 0u; y < height; ++y) {
+        const std::uint8_t* from = words + static_cast<std::size_t>(y) * word_pitch;
+        std::uint8_t* to = rgba + static_cast<std::size_t>(y) * rgba_pitch;
+        for (unsigned x = 0u; x < width; ++x) {
+            std::uint32_t word = 0u;
+            std::memcpy(&word, from + x * 4u, 4u);
+            const auto narrow = [](std::uint32_t v) {
+                return static_cast<std::uint8_t>(((v & 1023u) * 255u + 511u) / 1023u);
+            };
+            to[x * 4u] = narrow(word);
+            to[x * 4u + 1u] = narrow(word >> 10u);
+            to[x * 4u + 2u] = narrow(word >> 20u);
+            to[x * 4u + 3u] = static_cast<std::uint8_t>((word >> 30u) * 85u);
+        }
+    }
+}
+
+void half4_to_ten_bit(const std::uint8_t* halves, std::uint8_t* words, unsigned width, unsigned height,
+                      unsigned half_pitch, unsigned word_pitch) noexcept {
+    // IEEE 754 binary16 to float: subnormals, infinities and NaN (NaN reads as 0 below) kept.
+    const auto to_float = [](std::uint16_t h) {
+        const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000u) << 16u;
+        std::uint32_t exponent = (h >> 10u) & 31u;
+        std::uint32_t mantissa = h & 1023u;
+        std::uint32_t bits = 0u;
+        if (exponent == 31u) {
+            bits = sign | 0x7F800000u | mantissa << 13u;
+        } else if (exponent != 0u) {
+            bits = sign | (exponent + 112u) << 23u | mantissa << 13u;
+        } else if (mantissa != 0u) {
+            exponent = 113u;
+            while ((mantissa & 1024u) == 0u) {
+                mantissa <<= 1u;
+                --exponent;
+            }
+            bits = sign | exponent << 23u | (mantissa & 1023u) << 13u;
+        } else {
+            bits = sign;
+        }
+        return std::bit_cast<float>(bits);
+    };
+    const auto quantise = [](float v, float levels) {
+        return static_cast<std::uint32_t>(std::clamp(v, 0.0f, 1.0f) * levels + 0.5f);
+    };
+    for (unsigned y = 0u; y < height; ++y) {
+        const std::uint8_t* from = halves + static_cast<std::size_t>(y) * half_pitch;
+        std::uint8_t* to = words + static_cast<std::size_t>(y) * word_pitch;
+        for (unsigned x = 0u; x < width; ++x) {
+            std::uint16_t h[4];
+            std::memcpy(h, from + x * 8u, 8u);
+            float v[4];
+            for (unsigned c = 0u; c < 4u; ++c) {
+                const float f = to_float(h[c]);
+                v[c] = f == f ? f : 0.0f;
+            }
+            const std::uint32_t word = quantise(v[0], 1023.0f) | quantise(v[1], 1023.0f) << 10u |
+                                       quantise(v[2], 1023.0f) << 20u | quantise(v[3], 3.0f) << 30u;
+            std::memcpy(to + x * 4u, &word, 4u);
+        }
+    }
+}
+
+void write_capture_rows(std::string path, const std::uint8_t* rows, unsigned width, unsigned height, unsigned pitch,
+                        CaptureForm form) {
+    const std::size_t count = static_cast<std::size_t>(width) * height;
+    const unsigned packed = width * 4u;
+    std::vector<std::uint8_t> rgba;
+    if (form == CaptureForm::Half) {
+        // The halves as the 10-bit target's words (the capture's range ends at 1, as the SDR view), then as RGBA8.
+        std::vector<std::uint8_t> words(count * 4u);
+        half4_to_ten_bit(rows, words.data(), width, height, pitch, packed);
+        rgba.resize(count * 4u);
+        ten_bit_to_rgba8(words.data(), rgba.data(), width, height, packed, packed);
+    } else if (form == CaptureForm::TenBit) {
+        rgba.resize(count * 4u);
+        ten_bit_to_rgba8(rows, rgba.data(), width, height, pitch, packed);
+    }
+    if (!rgba.empty()) {
+        rows = rgba.data();
+        pitch = packed;
+    }
+    const unsigned red = form == CaptureForm::Bgra8 ? 2u : 0u;
+    const unsigned blue = 2u - red;
+    std::vector<std::uint8_t> rgb(count * 3u);
+    for (unsigned y = 0u; y < height; ++y) {
+        const std::uint8_t* in = rows + static_cast<std::size_t>(y) * pitch;
+        std::uint8_t* out = rgb.data() + static_cast<std::size_t>(y) * width * 3u;
+        for (unsigned x = 0u; x < width; ++x, in += 4, out += 3) {
+            out[0] = in[red];
+            out[1] = in[1];
+            out[2] = in[blue];
+        }
+    }
+    write_ppm_async(std::move(path), std::move(rgb), width, height);
 }
 
 void wait_picture_files() {

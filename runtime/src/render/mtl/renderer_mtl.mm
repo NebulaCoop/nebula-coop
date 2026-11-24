@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // The Metal renderer (mtl/renderer_mtl.h): device, the window's layer, frames and present. The scene target, draws,
-// copies and screen probes are renderer_mtl_scene.mm and renderer_mtl_draw.mm.
+// and copies are renderer_mtl_scene.mm and renderer_mtl_draw.mm.
 #include "renderer_mtl_internal.h"
+#include "galaxy/pacing_recorder.h"
 
 #include "galaxy/benchmark.h"
+#include "galaxy/frame_timeline.h"
 #include "galaxy/content_viewport.h"
 #include "galaxy/display_aspect.h"
+#include "galaxy/render/present_clock.h"
+#include "galaxy/render/device_memory.h"
 #include "galaxy/launch_args.h"
+#include "galaxy/whole_lines.h"
 #include "galaxy/platform_time.h"
 #include "galaxy/render/program_table.h"
 #include "galaxy/render/texture_store.h"
@@ -44,7 +49,7 @@ unsigned vendor_of(const std::string& name) {
 }  // namespace
 
 void RendererMtl::lose_device() {
-    std::cerr << "[Renderer] Metal has no device loss to rehearse\n";
+    mtl::Context::get().simulate_device_loss();
 }
 
 bool RendererMtl::initialize(int window_width, int window_height, const FrameMap& frame) {
@@ -84,7 +89,7 @@ bool RendererMtl::initialize(int window_width, int window_height, const FrameMap
         }
         for (Frame& made : frames_) {
             made.gpu_time = std::make_shared<std::array<std::atomic<double>, 2>>();
-            made.pass_time = std::make_shared<std::array<std::atomic<double>, static_cast<std::size_t>(GpuPass::Count) + 1u>>();
+            made.pass_time = std::make_shared<std::array<std::atomic<double>, kGpuPassCount>>();
         }
         // The rings are Metal buffers with addresses in the renderer's own space; their sizes follow the other
         // renderers'. The vertex and row rings keep the last frame readable for motion.
@@ -174,15 +179,6 @@ bool RendererMtl::create_layouts() {
         depth.depthCompareFunction = MTLCompareFunctionGreaterEqual;
         depth.depthWriteEnabled = NO;
         depth_uses_[static_cast<std::size_t>(DepthUse::TestNearer)] = own([metal newDepthStencilStateWithDescriptor:depth]);
-        NSError* error = nil;
-        id<MTLComputePipelineState> const probe =
-            [metal newComputePipelineStateWithFunction:(__bridge id<MTLFunction>)utility_function(mtl::UtilityShader::ScreenProbeCs)
-                                                 error:&error];
-        if (probe == nil) {
-            throw std::runtime_error(std::string("the screen probe pipeline: ") +
-                                     (error != nil ? error.localizedDescription.UTF8String : ""));
-        }
-        probe_pipeline_ = own(probe);
     }
     if (bindless_) {
         sampler_array_slots_ = std::min<std::uint32_t>(kSamplerHeapSlots, caps.sampler_array_max);
@@ -200,7 +196,8 @@ void RendererMtl::report_adapter() {
     const std::string& name = context.device_name();
     const unsigned vendor = vendor_of(name);
     host_window::rtx_adapter.store(false, std::memory_order_relaxed);
-    record_render_adapter(name.c_str(), vendor, 0u, 0u, false);
+    set_device_unified_memory(context.caps().unified_memory);
+    record_render_adapter(name.c_str(), vendor, 0u, 0u);
     RenderFeatureCaps caps{};
     caps.adapter_vendor_id = vendor;
     std::snprintf(caps.adapter_description.data(), caps.adapter_description.size(), "%s", name.c_str());
@@ -209,7 +206,6 @@ void RendererMtl::report_adapter() {
                                            msaa ? "the scene target is multisampled"
                                                 : "the GPU has no multisampled scene target formats");
     caps.taa = make_render_feature_status(false, false, false, false, "motion vectors, jitter, and history resources are not built");
-    caps.dxr = make_render_feature_status(false, false, false, false, "ray tracing runs on Direct3D 12");
     caps.streamline_bridge_built = false;
     caps.streamline = make_render_feature_status(false, false, false, false, "NVIDIA Streamline is not running");
     caps.reflex = make_render_feature_status(false, false, false, false, "Streamline Reflex integration is not built");
@@ -378,10 +374,7 @@ void RendererMtl::shutdown() {
         pictures_.clear();
         frame_pass_targets_.clear();
         capture_target_.reset();
-        scene_capture_ = backbuffer_capture_ = display_capture_ = Readback{};
-        probe_slots_.clear();
-        held_probe_slots_.clear();
-        pass_visibility_.reset();
+        captures_.clear();
         for (Frame& frame : frames_) {
             if (frame.upload_blit != nullptr) {
                 [(__bridge id<MTLBlitCommandEncoder>)frame.upload_blit endEncoding];
@@ -400,8 +393,6 @@ void RendererMtl::shutdown() {
             frame.retired_objects.clear();
             frame.tables.clear();
             frame.tables_used = 0u;
-            frame.visibility.clear();
-            frame.visibility_used = 0u;
             frame.fence = 0u;
         }
         commands_ = nullptr;
@@ -413,7 +404,6 @@ void RendererMtl::shutdown() {
         for (mtl::Object& function : utility_functions_) {
             drop(function);
         }
-        drop(probe_pipeline_);
         for (mtl::Object& state : depth_uses_) {
             drop(state);
         }
@@ -430,9 +420,7 @@ void RendererMtl::shutdown() {
         persistent_tables_.clear();
         retired_tables_.clear();
         free_tables_.clear();
-        for (TextureListBuffer& list : texture_lists_) {
-            list = TextureListBuffer{};
-        }
+        texture_list_chunks_.clear();
         zero_vertices_.reset();
         zero_stream_bytes_ = 0u;
         zero_stream_address_ = 0u;
@@ -461,21 +449,25 @@ void RendererMtl::shutdown() {
 void RendererMtl::grow_rings() {
     // A ring whose frames took over half their budget (or spilled) grows; one whose last 30 seconds (and 600 frames)
     // stayed under a quarter of it gives half of its memory back on a frame without the scene (UploadRing::kQuietNs).
-    // Only that ring is made again.
+    // Only that ring is made again; --diagnostics ring-stress makes them all again every kRingStressFrames frames.
     const UploadRingSlot rings[] = {{&vertex_ring_, "vertex", kRingSegments, true},
                                     {&index_ring_, "index", kFramesInFlight, true},
                                     {&constant_ring_, "constant", kFramesInFlight, true},
                                     {&matrix_ring_, "matrix", kRingSegments, false}};
-    if (ring_growth_failed_ || std::none_of(std::begin(rings), std::end(rings),
-                                            [](const UploadRingSlot& s) { return s.ring->wants_new_size(); })) {
+    const RingRemake due = upload_rings_due(rings, frame_index_, ring_growth_failed_);
+    if (due == RingRemake::None) {
         return;
     }
+    const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::RingResize);
     // No wait for the GPU: a ring is made again as a new buffer. The old buffer and its chunks are released here,
     // which hands them to the context to release once the work committed so far has completed.
     std::vector<gpu::BufferRef> old;
-    if (remake_upload_rings(device(), rings, false, ring_growth_failed_, old)) {
-        history_segment_ = 0u;
-        history_segment_fence_.fill(0u);
+    if (remake_upload_rings(device(), rings, due == RingRemake::All, ring_growth_failed_, old)) {
+        // The vertex and matrix rings share one segment counter and one fence for each segment (history_segment_,
+        // history_segment_fence_). A ring made again is a new buffer, every segment of which is free; a ring that was not made
+        // again (the vertex ring, when only the matrix ring grew) keeps the segments the frames in flight write and read, so
+        // the counter and the fences stay as they are: with the counter at 0 and the fences gone, the next frame wrote the
+        // segment a frame in flight was still drawing from (P-339).
         history_used_ = true;
     }
 }
@@ -528,21 +520,17 @@ namespace mtl {
 void pipeline_compile_stats(std::uint64_t out[5]) noexcept;  // pipelines_mtl.mm
 }
 
-namespace {
-constexpr const char* kPassTimeNames[] = {"scene", "resolve", "frame read", "display copy", "bloom", "scene aa", "scene ao",
-                                          "upscale", "ray tracing", "present", "camera", "ao distance", "ao occlusion",
-                                          "ao denoise", "ao upsample", "ao apply", "uploads"};
-}  // namespace
 
 void RendererMtl::next_command_buffer(GpuPass pass) {
     @autoreleasepool {
         id<MTLCommandBuffer> const made = [queue() commandBuffer];
         if (made == nil) {
-            throw std::runtime_error("no command buffer");
+            // The queue gives none only when the device is gone (P-008).
+            throw std::runtime_error("device lost: the Metal queue gave no command buffer");
         }
         list_pass_ = pass == GpuPass::Count ? GpuPass::Scene : pass;
         if (profile_frame_) {
-            made.label = @(kPassTimeNames[static_cast<std::size_t>(list_pass_)]);
+            made.label = @(kGpuPassPageNames[static_cast<std::size_t>(list_pass_)]);
             const auto times = frame_->pass_time;
             const std::size_t at = static_cast<std::size_t>(list_pass_);
             [made addCompletedHandler:^(id<MTLCommandBuffer> done) {
@@ -559,15 +547,18 @@ void RendererMtl::next_command_buffer(GpuPass pass) {
 }
 
 void RendererMtl::begin_frame() {
-    host_window::poll_render_config_file();
+    host_window::watch_render_config_file();
     follow_window_and_resize();
     apply_window_size();
     grow_rings();
     prepare_temporal_upscaler();
     apply_dynamic_resolution();
-    if (temporal_interp_suspended_ && temporal_interp_key() != temporal_interp_key_) {
-        // The settings changed: decided again.
-        temporal_interp_suspended_ = false;
+    // A hold of the temporal upscaler on generated frames: decided again when its settings changed, tried again
+    // when its wait passed (the governor then measures generated frames again, not by the cost that held it).
+    if (temporal_interp_hold_.lift_at_frame_start([this] { return temporal_interp_key() != temporal_interp_key_; },
+                                                  galaxy::qpc_to_ns(galaxy::qpc_now()))) {
+        frame_gpu_.reset_generated_ema();
+        std::cerr << "[interp] temporal upscaling of generated frames tried again\n";
     }
     sync_post_process();
     bloom_.poll_ready();
@@ -578,38 +569,28 @@ void RendererMtl::begin_frame() {
     frame_ = &frame;
     mtl::Context& context = mtl::Context::get();
     if (frame.fence != 0u) {
+        // --diagnostics timeline: a wait for the slot's last frame, as Direct3D 12 records it (a = its fence value).
+        const bool timeline_slot_wait = galaxy::timeline::enabled() && completed_fence_value() < frame.fence;
+        if (timeline_slot_wait) {
+            galaxy::timeline::record(galaxy::timeline::Event::SlotWaitBegin, frame.fence);
+        }
         wait_for_fence_value(frame.fence);
+        if (timeline_slot_wait) {
+            galaxy::timeline::record(galaxy::timeline::Event::SlotWaitEnd, frame.fence);
+        }
         // The GPU's time on the slot's last frame: from its first command buffer's start to its last one's end.
         const double start = (*frame.gpu_time)[0].exchange(0.0, std::memory_order_acq_rel);
         const double end = (*frame.gpu_time)[1].exchange(0.0, std::memory_order_acq_rel);
         if (start > 0.0 && end >= start) {
             const double gpu_ms = (end - start) * 1000.0;
-            if (frame_scene_drawn_[frame_slot_]) {
-                native_scene_gpu_ema_ms_ = native_scene_gpu_ema_ms_ == 0.0 ? gpu_ms
-                                           : native_scene_gpu_ema_ms_ + (gpu_ms - native_scene_gpu_ema_ms_) * 0.1;
-            }
-            if (frame_generated_[frame_slot_]) {
-                generated_gpu_ms_ += gpu_ms;
-                ++generated_gpu_samples_;
-                generated_gpu_ema_ms_ = generated_gpu_ema_ms_ == 0.0 ? gpu_ms : generated_gpu_ema_ms_ * 0.9 + gpu_ms * 0.1;
-            }
+            frame_gpu_.add(gpu_ms, frame_scene_drawn_[frame_slot_], frame_generated_[frame_slot_]);
             if (frame.pass_timed) {
-                // The slot's last frame by pass; the page's running average of each over the frames that ran it.
-                std::array<double, std::size(kPassTimeNames)> frame_ms{};
-                for (std::size_t pass = 0u; pass < frame.pass_time->size(); ++pass) {
-                    const double ms = (*frame.pass_time)[pass].exchange(0.0, std::memory_order_acq_rel) * 1000.0;
-                    if (pass < frame_ms.size()) frame_ms[pass] = ms;
-                    pass_window_ms_[pass] += ms;
-                    if (ms > 0.0 && pass < pass_ema_ms_.size()) {
-                        const float before = pass_ema_ms_[pass].load(std::memory_order_relaxed);
-                        const float value = static_cast<float>(ms);
-                        pass_ema_ms_[pass].store(before == 0.0f ? value : before + (value - before) * 0.1f,
-                                                 std::memory_order_relaxed);
-                    }
+                // The slot's last frame by pass (gpu_pass_times.h).
+                GpuPassMs frame_ms{};
+                for (std::size_t pass = 0u; pass < kGpuPassCount; ++pass) {
+                    frame_ms[pass] = (*frame.pass_time)[pass].exchange(0.0, std::memory_order_acq_rel) * 1000.0;
                 }
-                galaxy::bench::note_gpu_frame(kPassTimeNames, frame_ms.data(),
-                                              std::min(frame_ms.size(), frame.pass_time->size()));
-                ++pass_window_frames_;
+                pass_times_.add_frame(frame_ms, frame_scene_drawn_[frame_slot_] && !frame_generated_[frame_slot_]);
             }
             stats_.gpu_ms += gpu_ms;
             ++stats_.gpu_samples;
@@ -632,13 +613,6 @@ void RendererMtl::begin_frame() {
     }
     frame.retired_objects.clear();
     frame.tables_used = 0u;
-    // The slot's probe results are read (their fence passed with the slot's): zero for the passes of this frame.
-    for (std::size_t i = 0; i < frame.visibility_used; ++i) {
-        std::memset(frame.visibility[i]->mapped, 0, frame.visibility[i]->size);
-    }
-    frame.visibility_used = 0u;
-    pass_visibility_.reset();
-    pass_visibility_used_ = 0u;
     trim_idle_effect_targets();
     // Once a second of the game (target slots age on idle_clock).
     if (idle_clock() - target_swept_step_ >= kTargetSweepSteps) {
@@ -647,12 +621,8 @@ void RendererMtl::begin_frame() {
     }
     reset_sampler_frame();
     // Passes are timed only when asked for; with neither asked nothing is split or read.
-    const bool timed = ::galaxy::diagnosing(::galaxy::kDiagnoseGpuPasses) || gpu_timing_wanted_.load(std::memory_order_relaxed);
-    if (!timed && profile_frame_) {
-        for (std::atomic<float>& average : pass_ema_ms_) {
-            average.store(0.0f, std::memory_order_relaxed);
-        }
-    }
+    const bool timed = pass_times_.begin_frame(::galaxy::diagnosing(::galaxy::kDiagnoseGpuPasses) ||
+                                               gpu_timing_wanted_.load(std::memory_order_relaxed));
     profile_frame_ = timed;
     frame.pass_timed = timed;
     @autoreleasepool {
@@ -662,7 +632,8 @@ void RendererMtl::begin_frame() {
             const auto times = frame.pass_time;
             [uploads addCompletedHandler:^(id<MTLCommandBuffer> done) {
                 if (done.GPUEndTime > done.GPUStartTime && done.GPUStartTime > 0.0) {
-                    times->back().fetch_add(done.GPUEndTime - done.GPUStartTime, std::memory_order_relaxed);
+                    (*times)[static_cast<std::size_t>(GpuPass::Uploads)].fetch_add(done.GPUEndTime - done.GPUStartTime,
+                                                                                  std::memory_order_relaxed);
                 }
             }];
         }
@@ -684,7 +655,6 @@ void RendererMtl::begin_frame() {
     history_begin_matrix_ = matrix_ring_.cursor();
     index_ring_.begin_frame(frame_slot_);
     constant_ring_.begin_frame(frame_slot_);
-    texture_lists_used_ = 0u;
     encoder_.attach(nullptr, 0u, 0u);
     reset_draw_bindings();
     scene_pass_open_ = false;
@@ -727,10 +697,12 @@ std::uint64_t RendererMtl::end_frame(bool present_swap_chain, SubmissionCallback
         }];
         if (presenting) {
             // On a variable refresh display with VSync on the pacer holds presents under the refresh
-            // (paced_present_rate); a frame under the cap goes out as soon as it is ready.
+            // (paced_present_rate); a frame under the cap goes out as soon as it is ready. Interpolated pictures are paced
+            // by their slot clock (RenderCore), as on Direct3D.
             const RenderConfig cfg = get_render_config();
             const float paced_fps = paced_present_rate(presented_max_fps(cfg), cfg.vsync_interval, variable_refresh_, display_refresh_hz_);
-            pace_wait_ms = present_pacer_.pace(variable_refresh_ ? 0u : cfg.vsync_interval, paced_fps);
+            pace_wait_ms = interpolation_mode() ? 0.0
+                                                : present_pacer_.pace(variable_refresh_ ? 0u : cfg.vsync_interval, paced_fps);
             present_start = galaxy::qpc_now();
             if (trace_present_stats_enabled()) {
                 // Where in a refresh the picture is handed over.
@@ -763,8 +735,23 @@ std::uint64_t RendererMtl::end_frame(bool present_swap_chain, SubmissionCallback
                     ++shown->count;
                 }];
             }
+            // The pacing recorder: when the drawable reached the display, or that it never did.
+            const std::uint64_t pacing_id = ++pacing_present_id_;
+            {
+                const std::int64_t refresh_qpc =
+                    display_refresh_hz_ > 1.0 ? static_cast<std::int64_t>(std::llround(1e9 / static_cast<double>(display_refresh_hz_))) : 0;
+                [(__bridge id<CAMetalDrawable>)drawable_ addPresentedHandler:^(id<MTLDrawable> drawable) {
+                    const double at = drawable.presentedTime;
+                    if (at <= 0.0) {
+                        galaxy::pacing::not_shown(pacing_id);
+                    } else {
+                        galaxy::pacing::displayed(pacing_id, static_cast<std::int64_t>(std::llround(at * 1e9)), refresh_qpc);
+                    }
+                }];
+            }
             // Shown as soon as the frame's commands are scheduled: never at a time asked for.
             [commands_of(frame.lists.back()) presentDrawable:(__bridge id<CAMetalDrawable>)drawable_];
+            galaxy::pacing::presented(pacing_id);
         }
         for (std::size_t i = 0; i + 1u < frame.lists.size(); ++i) {
             (void)context.commit(frame.lists[i]);
@@ -784,20 +771,7 @@ std::uint64_t RendererMtl::end_frame(bool present_swap_chain, SubmissionCallback
     history_segment_fence_[history_segment_] = fence;
     frame_generated_[frame_slot_] = generated;
     frame_scene_drawn_[frame_slot_] = scene_drawn_;
-    for (ProbeSlot& probes : probe_slots_) {
-        if (probes.fence == kProbesInFrame) {
-            probes.fence = fence;
-        }
-    }
-    if (scene_capture_.buffer && scene_capture_.fence == 0u && !scene_capture_pending_path_.empty()) {
-        scene_capture_.fence = fence;
-    }
-    if (backbuffer_capture_.buffer && backbuffer_capture_.fence == 0u && !backbuffer_capture_pending_path_.empty()) {
-        backbuffer_capture_.fence = fence;
-    }
-    if (display_capture_.buffer && display_capture_.fence == 0u && !display_capture_pending_path_.empty()) {
-        display_capture_.fence = fence;
-    }
+    captures_.submitted(fence);
     if (on_submitted != nullptr) {
         on_submitted(submission_context, fence);
     }
@@ -843,23 +817,21 @@ std::uint64_t RendererMtl::end_frame(bool present_swap_chain, SubmissionCallback
                          gpu_window_.ms / frames, gpu_window_.max_ms, static_cast<double>(gpu_window_.passes) / gpu_window_.recorded,
                          static_cast<double>(gpu_window_.copies) / gpu_window_.recorded, scene_extent_.width, scene_extent_.height, layer_.width,
                          layer_.height);
-            std::fprintf(stderr, "[metal-gpu] scene target opened a frame (closed by > opened by):");
+            galaxy::whole_lines::Line line;
+            line.add("[metal-gpu] scene target opened a frame (closed by > opened by):");
             for (const GpuWindow::Open& open : gpu_window_.opens) {
                 if (open.count != 0u) {
-                    std::fprintf(stderr, " %s > %s%s %.2f;", open.closed, open.opened, open.cleared ? " (clear)" : "",
-                                 static_cast<double>(open.count) / gpu_window_.recorded);
+                    line.add(" %s > %s%s %.2f;", open.closed, open.opened, open.cleared ? " (clear)" : "",
+                             static_cast<double>(open.count) / gpu_window_.recorded);
                 }
             }
-            std::fprintf(stderr, "\n");
+            line.write(stderr);
         }
-        if (pass_window_frames_ != 0u) {
-            std::fprintf(stderr, "[metal-gpu] passes, ms a frame:");
-            for (std::size_t pass = 0u; pass < pass_window_ms_.size(); ++pass) {
-                if (pass_window_ms_[pass] > 0.0) {
-                    std::fprintf(stderr, " %s=%.3f", kPassTimeNames[pass], pass_window_ms_[pass] / pass_window_frames_);
-                }
-            }
-            std::fprintf(stderr, "\n");
+        if (pass_times_.window_frames() != 0u) {
+            galaxy::whole_lines::Line line;
+            line.add("[metal-gpu] passes, ms a frame:");
+            line.add("%s", pass_times_.take_window_list().c_str());
+            line.write(stderr);
         }
         {
             std::uint64_t compiled[5]{};
@@ -869,8 +841,7 @@ std::uint64_t RendererMtl::end_frame(bool present_swap_chain, SubmissionCallback
                          static_cast<double>(compiled[1]) / 1e6, static_cast<unsigned long long>(compiled[2]),
                          static_cast<double>(compiled[3]) / 1e6);
         }
-        pass_window_ms_.fill(0.0);
-        pass_window_frames_ = 0u;
+        (void)pass_times_.take_window_list();
         gpu_window_ = GpuWindow{};
     }
     return fence;
@@ -952,13 +923,7 @@ void RendererMtl::gpu_pass(GpuPass pass) {
 }
 
 std::size_t RendererMtl::gpu_pass_times(GpuPassTime* out, std::size_t capacity) const noexcept {
-    std::size_t count = 0u;
-    for (std::size_t pass = 0u; pass < pass_ema_ms_.size() && count < capacity; ++pass) {
-        if (const float ms = pass_ema_ms_[pass].load(std::memory_order_relaxed); ms > 0.0f) {
-            out[count++] = {kPassTimeNames[pass], ms};
-        }
-    }
-    return count;
+    return pass_times_.page_times(out, capacity);
 }
 
 void RendererMtl::sync_post_process() {
@@ -1003,6 +968,7 @@ void RendererMtl::refresh_display_rate() {
         }
     }
     variable_refresh_ = variable;
+    g_variable_refresh.store(variable, std::memory_order_relaxed);
     if (std::abs(hz - display_refresh_hz_) >= 0.1) {
         if (!variable) {
             std::cerr << "[display] refresh-hz=" << hz << '\n';
@@ -1148,6 +1114,12 @@ bool RendererMtl::present(const DisplayTexture* source, bool capture_backbuffer,
         surface_lock_ = {};
         return false;  // followed at the next frame boundary
     }
+    if (!capture_backbuffer && unseen_.now(window_, window_shown_)) {
+        // No drawable while the window cannot be seen (a hidden start, minimised, covered): the frame is drawn, nothing
+        // is presented, as Direct3D's on DXGI_STATUS_OCCLUDED. A frame that takes a test picture still presents.
+        surface_lock_ = {};
+        return false;
+    }
     const mtl::Texture& shown = *source->texture;
     if (capture_backbuffer && !present_black_) {
         // A test snapshot also keeps the picture itself, before the post chain scales it.
@@ -1166,7 +1138,9 @@ bool RendererMtl::present(const DisplayTexture* source, bool capture_backbuffer,
     @autoreleasepool {
         // The drawable is taken as late as the frame allows: it is one of a few, and held until it is shown.
         const std::int64_t asked = galaxy::qpc_now();
+        galaxy::timeline::record_at(galaxy::timeline::Event::AcquireBegin, static_cast<std::uint64_t>(asked));
         id<CAMetalDrawable> const drawable = [(__bridge CAMetalLayer*)layer_.layer nextDrawable];
+        galaxy::timeline::record(galaxy::timeline::Event::AcquireEnd, 0u, drawable == nil ? 1u : 0u);
         const double waited = static_cast<double>(galaxy::qpc_now() - asked) * 1000.0 / static_cast<double>(galaxy::qpc_frequency());
         stats_.drawable_wait_ms += waited;
         stats_.drawable_wait_max_ms = std::max(stats_.drawable_wait_max_ms, waited);
@@ -1197,7 +1171,7 @@ bool RendererMtl::present(const DisplayTexture* source, bool capture_backbuffer,
     host_window::native_settings_present();
     reset_draw_bindings();
     // Screenshots and test pictures: the same picture drawn again into a texture that can be read (a drawable is not).
-    if (capture_backbuffer && !backbuffer_capture_path_.empty() && backbuffer_capture_pending_path_.empty()) {
+    if (capture_backbuffer && !backbuffer_capture_path_.empty()) {
         const std::uint32_t width = layer_.width;
         const std::uint32_t height = layer_.height;
         capture_used_step_ = idle_clock();
@@ -1209,11 +1183,9 @@ bool RendererMtl::present(const DisplayTexture* source, bool capture_backbuffer,
                                                                  mtl::kUseTarget | mtl::kUseSample, mtl::Storage::Private,
                                                                  "presented picture capture");
         }
-        const std::uint64_t bytes = static_cast<std::uint64_t>(width) * height * 4u;
-        if (!backbuffer_capture_.buffer || backbuffer_capture_.buffer->size < bytes) {
-            backbuffer_capture_.buffer = mtl::Context::get().create_buffer(bytes, mtl::Storage::Shared, "backbuffer capture");
-        }
-        if (capture_target_ && backbuffer_capture_.buffer) {
+        std::shared_ptr<mtl::Buffer> readback =
+            capture_target_ ? capture_buffer(static_cast<std::uint64_t>(width) * height * 4u, "backbuffer capture") : nullptr;
+        if (readback) {
             draw_presented_picture(capture_target_->texture, mtl::Format::Rgba8, shown, content, true);
             @autoreleasepool {
                 id<MTLBlitCommandEncoder> const blit = [commands_of(commands_) blitCommandEncoder];
@@ -1223,16 +1195,14 @@ bool RendererMtl::present(const DisplayTexture* source, bool capture_backbuffer,
                                  sourceLevel:0
                                 sourceOrigin:MTLOriginMake(0, 0, 0)
                                   sourceSize:MTLSizeMake(width, height, 1)
-                                    toBuffer:buffer_of(backbuffer_capture_.buffer)
+                                    toBuffer:buffer_of(readback)
                            destinationOffset:0
                       destinationBytesPerRow:NSUInteger{width} * 4u
                     destinationBytesPerImage:NSUInteger{width} * height * 4u];
                 [blit endEncoding];
             }
-            backbuffer_capture_.fence = 0u;
-            backbuffer_capture_pending_path_ = backbuffer_capture_path_;
-            backbuffer_capture_width_ = width;
-            backbuffer_capture_height_ = height;
+            captures_.recorded({std::move(readback), 0u, backbuffer_capture_path_, width, height, width * 4u,
+                                Captures::Form::Rgba8});
             return true;
         }
     }

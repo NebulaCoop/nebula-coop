@@ -11,6 +11,7 @@
 #include "Game/MapObj.hpp"
 #include "Game/NPC.hpp"
 #include "Game/NameObj/NameObjFactoryStubs.hpp"
+#include "Game/System/NebulaOnce.hpp"
 #include "Game/Player/MarioActor.hpp"
 #include "Game/Ride.hpp"
 #include "Game/Screen.hpp"
@@ -4805,7 +4806,9 @@ namespace {
     const u32 cCreateIndexRoom = 4096;
     static_assert(ARRAY_SIZEU(cCreateTable) * 2 <= cCreateIndexRoom, "the index stays at most half full");
     u16 sCreateIndex[cCreateIndexRoom];
-    bool sCreateIndexBuilt = false;
+    // The first lookup builds the index, on whichever thread it comes (a scene load, the mod loader); a lookup on
+    // another thread meanwhile waits the few microseconds it takes (P-183).
+    NebulaOnce sCreateIndexOnce;
 
     u32 hashNameCase(const char* pName) {
         u32 hash = 2166136261u;
@@ -4834,8 +4837,9 @@ namespace {
                 sCreateIndex[slot] = static_cast< u16 >(i + 1);
             }
         }
-        sCreateIndexBuilt = true;
     }
+
+    void ensureCreateIndex() { sCreateIndexOnce.run(buildCreateIndex); }
 };  // namespace
 
 namespace NameObjFactory {
@@ -4876,9 +4880,7 @@ namespace NameObjFactory {
     }
 
     const Name2CreateFunc* getName2CreateFunc(const char* pName) {
-        if (!::sCreateIndexBuilt) {
-            ::buildCreateIndex();
-        }
+        ::ensureCreateIndex();
 
         for (u32 slot = ::hashNameCase(pName) & (::cCreateIndexRoom - 1); ::sCreateIndex[slot] != 0; slot = (slot + 1) & (::cCreateIndexRoom - 1)) {
             const Name2CreateFunc* const pName2CreateFunc = &::cCreateTable[::sCreateIndex[slot] - 1];

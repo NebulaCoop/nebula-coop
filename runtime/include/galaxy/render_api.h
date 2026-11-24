@@ -19,10 +19,7 @@
 
 struct NebulaFrameList;
 
-struct NebulaScreenProbe;
-
 namespace galaxy::render {
-using ScreenProbe = ::NebulaScreenProbe;
 
 class TextureStore;
 namespace core {
@@ -88,9 +85,11 @@ bool finish_pictures(std::uint32_t limit_ms);
 
 // The services' registries and texture store; any thread.
 [[nodiscard]] core::Registries& registries() noexcept;
-// The pipelines made, and those the settings in use still want.
+// The pipelines made, and those the settings in use still want; warm: every one the start wants is in the driver's cache
+// from an earlier run (a load, not a compile), so nothing need wait for them.
 struct PipelineProgress {
     std::uint32_t done = 0u, left = 0u;
+    bool warm = false;
 };
 [[nodiscard]] PipelineProgress pipeline_progress() noexcept;
 [[nodiscard]] TextureStore& textures() noexcept;
@@ -104,8 +103,6 @@ void attach_frame_list(NebulaFrameList* list) noexcept;
 void attach_movie_frame(const char* name, std::int32_t frame, float frame_rate, const void* data, std::uint64_t size,
                         std::uint32_t width, std::uint32_t height);
 
-// Channel `channel`'s latest finished probes (nebula_game_api.h NebulaHostServices::screen_probe_results).
-[[nodiscard]] std::uint32_t screen_probe_results(std::uint32_t channel, ScreenProbe* probes, std::uint32_t capacity);
 
 
 // Pumps window messages; the host's main loop calls it periodically.
@@ -211,6 +208,8 @@ void native_settings_files_dropped(std::vector<std::filesystem::path> files);
 void native_settings_window_resized(unsigned width, unsigned height);
 // The graphics device lost at the renderer's next frame, as a driver reset loses it (an extension's lose_gpu_device).
 void lose_gpu_device() noexcept;
+// True while the renderer makes a new graphics device after a loss (a test run's stall watchdog leaves that time out).
+[[nodiscard]] bool device_rebuilding() noexcept;
 // Delivers an overlay key to the window thread (controller navigation).
 void native_settings_post_key(std::uintptr_t virtual_key) noexcept;
 // The PLAYER page's name is being typed: the window's typing goes to it (native_settings_type), and its keys to the
@@ -223,6 +222,8 @@ bool native_settings_type(char32_t character);
 void native_settings_post_keyboard_key(std::uintptr_t virtual_key) noexcept;
 // The bit the SDL and Apple hosts' menu-key queues mark a keyboard key with (above every key code).
 inline constexpr std::uintptr_t kMenuKeyKeyboard = std::uintptr_t{1} << 30;
+// The bit a controller's menu key carries when it is a held direction's repeat (native_settings_pad_step), not a press.
+inline constexpr std::uintptr_t kMenuKeyRepeat = std::uintptr_t{1} << 29;
 // The mods saved differ from the ones this run started with.
 [[nodiscard]] bool native_settings_mods_changed();
 
@@ -264,7 +265,6 @@ enum class NativeSettingsStatus : unsigned {
     Leave,            // leaving with changes not applied: apply or discard them first
     ModsRestartAsk,   // mod changes applied: restart now? (yes: Apply, later: Close)
     JoyCon,           // Pair Joy-Con: status_number has the halves (kJoyCon* bits); Close leaves
-    RtRestartAsk,     // ray tracing turned on before its shaders are prepared: restart now? (yes: Apply, later: Close)
     DiagnosticsAsk,   // restart and record a diagnostics run? (yes: Apply, no: Close)
     ModsCodeAsk,      // a mod turned on brings code: allow it? (status_text: its name; yes: Apply, no: Close)
     XessAsk,          // download XeSS? (yes: Apply, its license: Revert, no: Close)

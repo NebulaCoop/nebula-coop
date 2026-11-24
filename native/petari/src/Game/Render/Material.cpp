@@ -3,7 +3,6 @@
 #include "Game/Render/FrameList.hpp"
 #include "Game/Render/Model.hpp"
 #include "Game/Render/ModelData.hpp"
-#include "Game/Render/RenderTexture.hpp"
 #include "Game/Render/Transform.hpp"
 #include "Game/Render/GameTexture.hpp"
 #include <nebula_format.h>
@@ -177,8 +176,8 @@ void MaterialSlots::grow(u32 count) {
     mCount = count;
 }
 
-const NebulaModelSlot* Material::fileSlots() const {
-    return reinterpret_cast< const NebulaModelSlot* >(mData->at(mFile->slots_at));
+const NebulaModelSlot& Material::fileSlot(u32 slot) const {
+    return mData->getSlot(mFile->first_slot + slot);
 }
 
 void Material::setCoordMatrix(u32 index, const CoordMatrix& rMatrix) {
@@ -192,8 +191,10 @@ void Material::setCoordMatrix(u32 index, const CoordMatrix& rMatrix) {
 }
 
 void Material::init(ModelData* pData, u32 index) {
-    const NebulaModelMaterial* pFile = reinterpret_cast< const NebulaModelMaterial* >(pData->at(pData->mFile->materials_at)) + index;
+    const NebulaModelMatl* pFile = pData->getMaterialFile(index);
+    const NebulaModelGx* pGx = pData->getGx(pFile->gx);
     mFile = pFile;
+    mGx = pGx;
     mData = pData;
     mNext = nullptr;
     mMesh = pFile->mesh != NEBULA_MODEL_NONE && pData->mMeshes != nullptr ? &pData->mMeshes[pFile->mesh] : nullptr;
@@ -206,38 +207,36 @@ void Material::init(ModelData* pData, u32 index) {
     mFollowsView = false;
 
     mSlots.grow(pFile->slot_count);
-    const NebulaModelSlot* pFileSlots = fileSlots();
     for (u32 i = 0; i < pFile->slot_count; i++) {
-        mSlots.at(i).mTextureIndex = pFileSlots[i].texture;
+        mSlots.at(i).mTextureIndex = fileSlot(i).texture;
     }
     for (u32 i = 0; i < 2; i++) {
-        memcpy(&mMaterialColor[i], pFile->material_color[i], 4);
-        memcpy(&mAmbientColor[i], pFile->ambient_color[i], 4);
+        memcpy(&mMaterialColor[i], pGx->material_color[i], 4);
+        memcpy(&mAmbientColor[i], pGx->ambient_color[i], 4);
     }
     for (u32 i = 0; i < 4; i++) {
-        mRegisters[i].r = pFile->registers[i][0];
-        mRegisters[i].g = pFile->registers[i][1];
-        mRegisters[i].b = pFile->registers[i][2];
-        mRegisters[i].a = pFile->registers[i][3];
-        memcpy(&mConstants[i], pFile->constants[i], 4);
+        mRegisters[i].r = pGx->registers[i][0];
+        mRegisters[i].g = pGx->registers[i][1];
+        mRegisters[i].b = pGx->registers[i][2];
+        mRegisters[i].a = pGx->registers[i][3];
+        memcpy(&mConstants[i], pGx->constants[i], 4);
     }
-    mFog.mType = pFile->fog.type;
-    mFog.mStartZ = pFile->fog.start;
-    mFog.mEndZ = pFile->fog.end;
-    mFog.mNearZ = pFile->fog.near_z;
-    mFog.mFarZ = pFile->fog.far_z;
-    memcpy(&mFog.mColor, pFile->fog.color, 4);
+    mFog.mType = pGx->fog.type;
+    mFog.mStartZ = pGx->fog.start;
+    mFog.mEndZ = pGx->fog.end;
+    mFog.mNearZ = pGx->fog.near_z;
+    mFog.mFarZ = pGx->fog.far_z;
+    memcpy(&mFog.mColor, pGx->fog.color, 4);
 
-    const NebulaModelCoord* pCoords = reinterpret_cast< const NebulaModelCoord* >(pData->at(pFile->coords_at));
-    for (u32 i = 0; i < pFile->coord_count; i++) {
+    for (u32 i = 0; i < pGx->coord_count; i++) {
+        const NebulaModelCoord& rFile = pData->getCoord(pGx->first_coord + i);
         MaterialCoord& rCoord = mSlots.at(i).mCoord;
-        rCoord.mType = pCoords[i].type;
-        rCoord.mSource = pCoords[i].source;
-        rCoord.mMatrix = pCoords[i].matrix;
+        rCoord.mType = rFile.type;
+        rCoord.mSource = rFile.source;
+        rCoord.mMatrix = rFile.matrix;
     }
-    const NebulaModelCoordMatrix* pMatrices = reinterpret_cast< const NebulaModelCoordMatrix* >(pData->at(pFile->matrices_at));
-    for (u32 i = 0; i < pFile->matrix_count; i++) {
-        const NebulaModelCoordMatrix& rFile = pMatrices[i];
+    for (u32 i = 0; i < pGx->matrix_count; i++) {
+        const NebulaModelCoordMatrix& rFile = pData->getCoordMatrix(pGx->first_matrix + i);
         MaterialSlot& rSlot = mSlots.at(rFile.slot);
         if (rSlot.mMatrix == nullptr) {
             rSlot.mMatrix = new CoordMatrix();
@@ -254,7 +253,7 @@ void Material::init(ModelData* pData, u32 index) {
         rMatrix.mInfo.mSRT.mTranslationX = rFile.translation[0];
         rMatrix.mInfo.mSRT.mTranslationY = rFile.translation[1];
         memcpy(rMatrix.mInfo.mEffectMtx, rFile.effect, sizeof(rFile.effect));
-        mFollowsView = mFollowsView || rMatrix.followsView() || ((pFile->flags & NEBULA_MATERIAL_ON_BILLBOARD) != 0 && rMatrix.readsEye());
+        mFollowsView = mFollowsView || rMatrix.followsView() || ((pFile->flags & NEBULA_MATL_ON_BILLBOARD) != 0 && rMatrix.readsEye());
     }
     calc();
 }
@@ -276,12 +275,11 @@ void Material::calc() {
 }
 
 s32 Material::findForm(const FormKey& rKey) const {
-    const NebulaModelForm* pForms = reinterpret_cast< const NebulaModelForm* >(mData->at(mFile->forms_at));
     const u8 flags = static_cast< u8 >((rKey.mNormalCoord ? NEBULA_FORM_NORMAL_COORD : 0) | (rKey.mLit ? NEBULA_FORM_LIT : 0) |
                                        (rKey.mFogLinear ? NEBULA_FORM_FOG_LINEAR : 0));
     const u8 mask = NEBULA_FORM_NORMAL_COORD | NEBULA_FORM_LIT | NEBULA_FORM_FOG_LINEAR;
     for (u32 i = 0; i < mFile->form_count; i++) {
-        const NebulaModelForm& rForm = pForms[i];
+        const NebulaModelFormEntry& rForm = mData->getForm(mFile->first_form + i);
         if (rForm.replace == rKey.mReplace && rForm.pass == rKey.mPass && (rForm.flags & mask) == flags) {
             return static_cast< s32 >(i);
         }
@@ -289,12 +287,12 @@ s32 Material::findForm(const FormKey& rKey) const {
     return -1;
 }
 
-const NebulaModelForm* Material::getForm(s32 index) const {
-    return reinterpret_cast< const NebulaModelForm* >(mData->at(mFile->forms_at)) + index;
+const NebulaModelFormEntry* Material::getForm(s32 index) const {
+    return &mData->getForm(mFile->first_form + static_cast< u32 >(index));
 }
 
 void Material::fillRow(u32 row, f32* pOut) const {
-    const bool stageColors = (mFile->flags & NEBULA_MATERIAL_HAS_STAGE_COLORS) != 0;
+    const bool stageColors = (mGx->flags & NEBULA_MATERIAL_HAS_STAGE_COLORS) != 0;
     if (row >= NEBULA_ROW_COORD) {
         const u32 at = row - NEBULA_ROW_COORD;
         const u32 coord = at / 3;
@@ -310,7 +308,7 @@ void Material::fillRow(u32 row, f32* pOut) const {
             CoordMatrix* pMatrix = getCoordMatrix(number);
             if (pMatrix != nullptr) {
                 memcpy(pOut, pMatrix->getMtx()[r], sizeof(f32) * 4);
-                if ((mFile->flags & NEBULA_MATERIAL_ON_BILLBOARD) != 0 && pMatrix->readsEye()) {
+                if ((mFile->flags & NEBULA_MATL_ON_BILLBOARD) != 0 && pMatrix->readsEye()) {
                     // A billboard's eye rows have turned to the eye; the coordinate reads the joint before that: world
                     // input, under this view. A direction takes no translation of it.
                     const f32 (*pView)[4] = ModelSys::mViewMtx;
@@ -331,17 +329,17 @@ void Material::fillRow(u32 row, f32* pOut) const {
         const u32 warp = at / 2;
         const u32 r = at % 2;
         pOut[3] = 0.0f;
-        if ((mFile->flags & NEBULA_MATERIAL_HAS_INDIRECT) == 0) {
+        if ((mGx->flags & NEBULA_MATERIAL_HAS_INDIRECT) == 0) {
             pOut[0] = r == 0 ? 1.0f : 0.0f;
             pOut[1] = r == 1 ? 1.0f : 0.0f;
             pOut[2] = 0.0f;
             return;
         }
-        if (warp >= mFile->warp_count) {
+        if (warp >= mGx->warp_count) {
             pOut[0] = pOut[1] = pOut[2] = 0.0f;
             return;
         }
-        const NebulaModelWarp& rWarp = reinterpret_cast< const NebulaModelWarp* >(mData->at(mFile->warps_at))[warp];
+        const NebulaModelWarp& rWarp = mData->getWarp(mGx->first_warp + warp);
         for (u32 c = 0; c < 3; c++) {
             pOut[c] = rWarp.rows[r][c];
         }
@@ -354,13 +352,13 @@ void Material::fillRow(u32 row, f32* pOut) const {
             if (number == NEBULA_NONE32) {
                 pSize[0] = pSize[1] = 1.0f;
             } else {
-                const ResTIMG* pTexture = mData->getTexture(number);
+                const ModelTexture* pTexture = mData->getTexture(number);
                 pSize[0] = pTexture->mWidth;
                 pSize[1] = pTexture->mHeight;
             }
         };
         sizeOf(coord, pOut + 2);
-        const u32 map = coord < mFile->slot_count ? fileSlots()[coord].scale_map : NEBULA_SLOT_NO_MAP;
+        const u32 map = coord < mFile->slot_count ? fileSlot(coord).scale_map : NEBULA_SLOT_NO_MAP;
         if (map != NEBULA_SLOT_NO_MAP) {
             sizeOf(map, pOut);
         } else {
@@ -374,14 +372,14 @@ void Material::fillRow(u32 row, f32* pOut) const {
         return;
     }
     if (row == NEBULA_ROW_ALPHA_REF) {
-        pOut[0] = mFile->alpha_ref0 / 255.0f;
-        pOut[1] = mFile->alpha_ref1 / 255.0f;
+        pOut[0] = mGx->alpha_ref0 / 255.0f;
+        pOut[1] = mGx->alpha_ref1 / 255.0f;
         pOut[2] = 0.0f;
         pOut[3] = 0.0f;
         return;
     }
     if (row == NEBULA_ROW_FOG_COLOR) {
-        const bool has = (mFile->flags & NEBULA_MATERIAL_HAS_FOG) != 0;
+        const bool has = (mGx->flags & NEBULA_MATERIAL_HAS_FOG) != 0;
         pOut[0] = has ? mFog.mColor.r / 255.0f : 0.0f;
         pOut[1] = has ? mFog.mColor.g / 255.0f : 0.0f;
         pOut[2] = has ? mFog.mColor.b / 255.0f : 0.0f;
@@ -389,7 +387,7 @@ void Material::fillRow(u32 row, f32* pOut) const {
         return;
     }
     if (row == NEBULA_ROW_FOG) {
-        const bool has = (mFile->flags & NEBULA_MATERIAL_HAS_FOG) != 0;
+        const bool has = (mGx->flags & NEBULA_MATERIAL_HAS_FOG) != 0;
         pOut[0] = has ? mFog.mStartZ : 0.0f;
         pOut[1] = has ? mFog.mEndZ : 0.0f;
         pOut[2] = has ? mFog.mNearZ : 0.0f;
@@ -423,12 +421,12 @@ void Material::fillRow(u32 row, f32* pOut) const {
     }
 }
 
-void Material::fillRows(const NebulaModelForm& rForm, f32 (*pOut)[4]) const {
-    const u32* pVertex = reinterpret_cast< const u32* >(mData->at(rForm.vertex_rows_at));
+void Material::fillRows(const NebulaModelFormEntry& rForm, f32 (*pOut)[4]) const {
+    const u32* pVertex = mData->getFormRows(rForm.first_vertex_row);
     for (u32 i = 0; i < rForm.vertex_row_count; i++) {
         fillRow(pVertex[i], *pOut++);
     }
-    const u32* pPixel = reinterpret_cast< const u32* >(mData->at(rForm.pixel_rows_at));
+    const u32* pPixel = mData->getFormRows(rForm.first_pixel_row);
     for (u32 i = 0; i < rForm.pixel_row_count; i++) {
         fillRow(pPixel[i], *pOut++);
     }
@@ -601,7 +599,7 @@ void MaterialDraw::setFog(f32 start, f32 end, f32 nearZ, f32 farZ, NebulaColor8 
     mFogValues[1][2] = color.b / 255.0f;
     mFogValues[1][3] = 2.0f;
     mEdits |= Edit_Fog;
-    mKey.mFogLinear = (mMaterial->mFile->flags & NEBULA_MATERIAL_HAS_FOG) == 0;
+    mKey.mFogLinear = (mMaterial->mGx->flags & NEBULA_MATERIAL_HAS_FOG) == 0;
     mForm = -1;
 }
 
@@ -693,14 +691,14 @@ namespace {
         return rows;
     }
 
-    bool readsAmbient(const NebulaModelForm& rForm, const ModelData* pData) {
-        const u32* pPixel = reinterpret_cast< const u32* >(pData->at(rForm.pixel_rows_at));
+    bool readsAmbient(const NebulaModelFormEntry& rForm, const ModelData* pData) {
+        const u32* pPixel = pData->getFormRows(rForm.first_pixel_row);
         for (u32 i = 0; i < rForm.pixel_row_count; i++) {
             if (pPixel[i] == NEBULA_ROW_AMBIENT_COLOR || pPixel[i] == NEBULA_ROW_AMBIENT_COLOR + 1) {
                 return true;
             }
         }
-        const u32* pVertex = reinterpret_cast< const u32* >(pData->at(rForm.vertex_rows_at));
+        const u32* pVertex = pData->getFormRows(rForm.first_vertex_row);
         for (u32 i = 0; i < rForm.vertex_row_count; i++) {
             if (pVertex[i] == NEBULA_ROW_AMBIENT_COLOR || pVertex[i] == NEBULA_ROW_AMBIENT_COLOR + 1) {
                 return true;
@@ -710,7 +708,7 @@ namespace {
     }
 }  // namespace
 
-u32 MaterialDraw::constantsOf(s32 formIndex, const NebulaModelForm& rForm) {
+u32 MaterialDraw::constantsOf(s32 formIndex, const NebulaModelFormEntry& rForm) {
     Material* pMaterial = getMaterial();
     Material::FormState* pState = pMaterial->formState(formIndex);
     const u32 rowCount = rForm.vertex_row_count + rForm.pixel_row_count;
@@ -719,7 +717,7 @@ u32 MaterialDraw::constantsOf(s32 formIndex, const NebulaModelForm& rForm) {
     if (!pState->mAnalysed) {
         pState->mAnalysed = true;
         pState->mReadsAmbient = readsAmbient(rForm, pMaterial->mData);
-        pState->mCoordRows = coordRowsOf(reinterpret_cast< const u32* >(pMaterial->mData->at(rForm.vertex_rows_at)), rForm.vertex_row_count, &pState->mCoordRowCount);
+        pState->mCoordRows = coordRowsOf(pMaterial->mData->getFormRows(rForm.first_vertex_row), rForm.vertex_row_count, &pState->mCoordRowCount);
     }
 
     if (pMaterial->mFollowsView) {
@@ -754,8 +752,8 @@ u32 MaterialDraw::constantsOf(s32 formIndex, const NebulaModelForm& rForm) {
     f32 (*pRows)[4] = static_cast< f32 (*)[4] >(Frame::arena(rowCount * 16, 16));
     pMaterial->fillRows(rForm, pRows);
     if (!plain) {
-        applyEdits(reinterpret_cast< const u32* >(pMaterial->mData->at(rForm.vertex_rows_at)), rForm.vertex_row_count, pRows);
-        applyEdits(reinterpret_cast< const u32* >(pMaterial->mData->at(rForm.pixel_rows_at)), rForm.pixel_row_count, pRows + rForm.vertex_row_count);
+        applyEdits(pMaterial->mData->getFormRows(rForm.first_vertex_row), rForm.vertex_row_count, pRows);
+        applyEdits(pMaterial->mData->getFormRows(rForm.first_pixel_row), rForm.pixel_row_count, pRows + rForm.vertex_row_count);
     }
     const u32 index = Frame::addConstants(NEBULA_NONE32, rForm.vertex_row_count, rForm.pixel_row_count, pRows, pState->mCoordRows, pState->mCoordRowCount);
     if (plain) {
@@ -767,7 +765,7 @@ u32 MaterialDraw::constantsOf(s32 formIndex, const NebulaModelForm& rForm) {
     return index;
 }
 
-u32 MaterialDraw::tableOf(s32 formIndex, const NebulaModelForm& rForm) {
+u32 MaterialDraw::tableOf(s32 formIndex, const NebulaModelFormEntry& rForm) {
     Material* pMaterial = getMaterial();
     Material::FormState* pState = pMaterial->formState(formIndex);
     ModelData* pData = pMaterial->mData;
@@ -777,24 +775,15 @@ u32 MaterialDraw::tableOf(s32 formIndex, const NebulaModelForm& rForm) {
     }
 
     NebulaFrameTexture* list = rForm.texture_count != 0 ? Frame::alloc< NebulaFrameTexture >(rForm.texture_count) : nullptr;
-    const u8* pNumbers = reinterpret_cast< const u8* >(pData->at(rForm.textures_at));
+    const u8* pNumbers = pData->getFormMaps(rForm.first_texture);
     for (u32 i = 0; i < rForm.texture_count; i++) {
         const u32 map = pNumbers[i];
         NebulaFrameTexture& rOut = list[i];
         memset(&rOut, 0, sizeof(rOut));
         const u32 number = pMaterial->getTextureIndex(map);
         if (number != NEBULA_NONE32) {
-            const ResTIMG* pTexture = pData->getTexture(number);
-            rOut.texture = RenderTexture::idOf(pTexture->image());
-            rOut.wrap_s = pTexture->mWrapS;
-            rOut.wrap_t = pTexture->mWrapT;
-            rOut.min_linear = pTexture->mMinType == 1 || pTexture->mMinType == 3 || pTexture->mMinType == 5;
-            rOut.mag_linear = pTexture->mMagType != 0;
-            rOut.mip_filter = pTexture->mMinType < 2 ? 0 : pTexture->mMinType < 4 ? 1 : 2;
-            rOut.anisotropy = pTexture->mMaxAnisotropy;
-            rOut.min_lod = pTexture->mMinLod;
-            rOut.max_lod = pTexture->mMaxLod;
-            rOut.lod_bias = pTexture->mLodBias;
+            rOut.texture = pData->getTextureId(number);
+            setFrameSampler(rOut, pData->getTexture(number)->mSampler);
         }
         const ImageEdit* pImage = findImage(map);
         if (pImage != nullptr) {
@@ -872,12 +861,6 @@ void meshLayoutInput(NebulaPipelineDesc* pDesc, NebulaLayoutInput* pInputs, u16 
                 return;
             }
             break;
-        case NEBULA_INPUT_GAIN:
-            if ((rMesh.attributes & NEBULA_MESH_GAIN) != 0) {
-                further(3, static_cast< u32 >(afterColor + ((rMesh.attributes & NEBULA_MESH_TANGENTS) != 0 ? 24 : 0)));
-                return;
-            }
-            break;
         default: {
             const u32 number = semantic - NEBULA_INPUT_COORD0;
             if (number < rMesh.coord_count && pCoords[number].stream != NEBULA_MESH_NO_COORD) {
@@ -896,7 +879,6 @@ void meshLayoutInput(NebulaPipelineDesc* pDesc, NebulaLayoutInput* pInputs, u16 
         place(NEBULA_STREAM_ZERO,
               semantic >= NEBULA_INPUT_COORD0                                    ? 1
               : semantic == NEBULA_INPUT_COLOR0 || semantic == NEBULA_INPUT_COLOR1 ? 2
-              : semantic == NEBULA_INPUT_GAIN                                    ? 3
                                                                                  : 0,
               0, 0);
     }
@@ -921,7 +903,7 @@ u64 meshLayoutKey(const NebulaModelMesh& rMesh) {
     return key | 1ull << 63;
 }
 
-u32 MaterialDraw::pipelineOf(s32 formIndex, const NebulaModelForm& rForm, const Mesh* pMesh) {
+u32 MaterialDraw::pipelineOf(s32 formIndex, const NebulaModelFormEntry& rForm, const Mesh* pMesh) {
     Material* pMaterial = getMaterial();
     Material::FormState* pState = pMaterial->formState(formIndex);
     const u32 state = Frame::finishState(getState());
@@ -934,7 +916,7 @@ u32 MaterialDraw::pipelineOf(s32 formIndex, const NebulaModelForm& rForm, const 
     desc.vertex = rForm.vertex;
     desc.pixel = rForm.pixel;
     desc.state = state;
-    const u8* pInputs = reinterpret_cast< const u8* >(pMaterial->mData->at(rForm.inputs_at));
+    const u8* pInputs = pMaterial->mData->getFormInputs(rForm.first_input);
     u16 programCoord = 0;
     NebulaLayoutInput* pRoom = Frame::layoutRoom(Frame::cLayoutRoomBuild, rForm.input_count);
     for (u32 i = 0; i < rForm.input_count; i++) {
@@ -960,8 +942,8 @@ void MaterialDraw::bind(TypedDraw& rDraw) {
             return;
         }
     }
-    const NebulaModelForm& rForm = *pMaterial->getForm(mForm);
-    rDraw.setForm(rForm.vertex, rForm.pixel, reinterpret_cast< const u8* >(pMaterial->mData->at(rForm.inputs_at)), rForm.input_count,
+    const NebulaModelFormEntry& rForm = *pMaterial->getForm(mForm);
+    rDraw.setForm(rForm.vertex, rForm.pixel, pMaterial->mData->getFormInputs(rForm.first_input), rForm.input_count,
                   constantsOf(mForm, rForm), tableOf(mForm, rForm), getState());
     rDraw.setSource(pMaterial->mSourceHash);
 }
@@ -980,7 +962,7 @@ void MaterialDraw::draw(Model* pModel, Mesh* pMesh) {
             return;
         }
     }
-    const NebulaModelForm& rForm = *pMaterial->getForm(mForm);
+    const NebulaModelFormEntry& rForm = *pMaterial->getForm(mForm);
     NebulaFrameItem& rItem = Frame::addItem();
     rItem.mesh = pMesh->mGpuMesh;
     rItem.pipeline = pipelineOf(mForm, rForm, pMesh);
@@ -1010,7 +992,7 @@ void MaterialDraw::drawUnder(TypedDraw& rDraw, Mesh* pMesh) {
             return;
         }
     }
-    const NebulaModelForm& rForm = *pMaterial->getForm(mForm);
+    const NebulaModelFormEntry& rForm = *pMaterial->getForm(mForm);
     const u32 block = rDraw.currentBlock();
     NebulaFrameItem& rItem = Frame::addItem();
     rItem.mesh = pMesh->mGpuMesh;

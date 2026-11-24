@@ -99,7 +99,7 @@ def open_folder(folder, out, opener):
     return counts
 
 
-SCHEMA = 2  # benchmark_stats.h kResultSchema: reports of another schema are counted and left out
+SCHEMA = 3  # benchmark_stats.h kResultSchema: reports of another schema are counted and left out
 
 
 def load_reports(folder):
@@ -134,8 +134,7 @@ STUTTER_MS = 25.0  # benchmark_stats.h kStutterMs
 
 
 def scene_rows(report_id, bench):
-    """One row per measured scene of each part (the player's settings, the standard settings): the facts the summary
-    and the CSV are made of."""
+    """One row per measured scene of each part: the facts the summary and the CSV are made of."""
     device = bench.get("device") or {}
     rows = []
     for run in bench.get("runs") or []:
@@ -176,6 +175,8 @@ def scene_rows(report_id, bench):
                 "p95_ms": frame_ms.get("p95"),
                 "p99_ms": frame_ms.get("p99"),
                 "stutters": scene.get("stutters"),
+                "steps_per_s": (scene.get("game_steps") or {}).get("average_per_s"),
+                "steps_low_1": (scene.get("game_steps") or {}).get("low_1_per_s"),
                 "limiter": scene.get("limiter", ""),
                 "gpu_ms": average(scene.get("gpu_ms")),
                 "top_pass": top_pass,
@@ -197,22 +198,22 @@ def number(value):
 
 
 def summarise(reports, top=20):
-    """Text of the summary, and the CSV's rows. Devices are compared on the standard part, where every device ran the
-    same settings: per GPU class and back end, the median 1% low, what limits the frame and the worst scene; then the
+    """Text of the summary, and the CSV's rows. Devices are compared on the part at the player's settings, uncapped:
+    per GPU class and back end, the median 1% low, what limits the frame and the worst scene; then the
     top costs (GPU passes by their share of the GPU's frame, and what the stutters came with); then the slowest devices
     first."""
     rows = [row for report_id, bench in reports for row in scene_rows(report_id, bench)]
-    standard = [row for row in rows if row["part"] == "standard"]
-    lines = [f"{len(reports)} reports, {len(rows)} scenes ({len(standard)} at the standard settings)"]
+    yours = [row for row in rows if row["part"] == "yours"]
+    lines = [f"{len(reports)} reports, {len(rows)} scenes ({len(yours)} at the player's settings)"]
     groups = defaultdict(list)
-    for row in standard:
+    for row in yours:
         groups[(row["gpu_class"], row["backend"])].append(row)
 
     def group_low(item):
         return statistics.median(number(r["low_1_fps"]) for r in item[1])
 
     lines.append("")
-    lines.append("By GPU class and back end, standard settings (lowest median 1% low first):")
+    lines.append("By GPU class and back end, the player's settings (lowest median 1% low first):")
     for (klass, backend), members in sorted(groups.items(), key=group_low):
         limiters = defaultdict(int)
         for r in members:
@@ -224,11 +225,12 @@ def summarise(reports, top=20):
             f"  {klass} / {backend}: {devices} devices, median 1% low {group_low(((klass, backend), members)):.1f} FPS,"
             f" median average {statistics.median(number(r['average_fps']) for r in members):.1f} FPS;"
             f" limited by {limiter} in {limiters[limiter]} of {len(members)} scenes;"
-            f" worst scene {worst['stage']}, 1% low {number(worst['low_1_fps']):.1f} FPS"
+            f" worst scene {worst['stage']}, 1% low {number(worst['low_1_fps']):.1f} FPS,"
+            f" game steps 1% low {number(worst['steps_low_1']):.1f} a second"
         )
 
     lines.append("")
-    lines.append("Top costs, both parts (GPU passes by mean share of the GPU's frame; stutters by what came with them; the"
+    lines.append("Top costs, every part (GPU passes by mean share of the GPU's frame; stutters by what came with them; the"
                  " slowest frames by the render thread's largest part):")
     by_group = defaultdict(list)
     for row in rows:
@@ -251,9 +253,9 @@ def summarise(reports, top=20):
         lines.append(f"  {klass} / {backend}: passes {passes}; stutters {stutters}; slowest frames {slow}")
 
     lines.append("")
-    lines.append(f"Slowest devices (lowest 1% low at the standard settings), top {top}:")
+    lines.append(f"Slowest devices (lowest 1% low at the player's settings), top {top}:")
     worst_by_report = {}
-    for row in standard:
+    for row in yours:
         if row["report"] not in worst_by_report or number(row["low_1_fps"]) < number(worst_by_report[row["report"]]["low_1_fps"]):
             worst_by_report[row["report"]] = row
     for row in sorted(worst_by_report.values(), key=lambda r: number(r["low_1_fps"]))[:top]:

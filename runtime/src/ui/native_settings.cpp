@@ -6,6 +6,7 @@
 #include "galaxy/content_viewport.h"
 #include "galaxy/desktop_window.h"
 #include "galaxy/discord_presence.h"
+#include "galaxy/render/present_clock.h"
 #include "galaxy/render/host_window.h"
 #include "galaxy/coop_menu.h"
 #include "galaxy/ui/benchmark_menu.h"
@@ -50,6 +51,11 @@
 #include "galaxy/ui/settings_display_page.h"
 #include "galaxy/ui/settings_advanced_page.h"
 #include "galaxy/ui/settings_system_page.h"
+#include "galaxy/ui/settings_tabs.h"
+#include "galaxy/mod_support.h"
+#include "galaxy/achievements.h"
+#include "galaxy/host_extension.h"
+#include "galaxy/stats.h"
 #include "galaxy/save_transfer.h"
 #if defined(NEBULA_UPDATE_CHECK)
 #include "galaxy/update.h"
@@ -81,6 +87,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <thread>
 #include <string>
 #include <utility>
@@ -98,7 +105,7 @@ std::atomic<bool> rtx_adapter{false};
 }  // namespace host_window
 
 using host_window::flush_native_settings_if_dirty;
-using host_window::poll_render_config_file;
+using host_window::watch_render_config_file;
 using host_window::hidden_window_mode_enabled;
 
 namespace {
@@ -241,15 +248,12 @@ bool s_hdr_calibration_due = false;
 std::atomic<bool> s_settings_held{false};
 // Apply saved mod changes this session did not start with: the menu asks whether to restart now.
 std::atomic<bool> s_mods_restart_ask{false};
-// RAY TRACING turned on (applied) before its shaders are prepared: the menu asks to restart, which prepares them.
-std::atomic<bool> s_rt_restart_ask{false};
 // SYSTEM > DIAGNOSTICS > RECORD: the menu asks to restart into a recorded session (the launcher's recording).
 std::atomic<bool> s_diagnostics_ask{false};
 
-// A restart question is up (the mods', ray tracing's, the diagnostics run's).
+// A restart question is up (the mods', the diagnostics run's).
 bool restart_asking() {
-    return s_mods_restart_ask.load(std::memory_order_acquire) || s_rt_restart_ask.load(std::memory_order_acquire) ||
-           s_diagnostics_ask.load(std::memory_order_acquire);
+    return s_mods_restart_ask.load(std::memory_order_acquire) || s_diagnostics_ask.load(std::memory_order_acquire);
 }
 // The pages, in order.
 constexpr const char* kNativeSettingsTabNames[] = {"DISPLAY", "GRAPHICS", "CONTROLS", "AUDIO", "GENERAL", "MODS", "SYSTEM",
@@ -266,7 +270,9 @@ struct ShownTabs {
 
 ShownTabs shown_tabs() {
     ShownTabs shown;
+    // MODS only where the program has mod support (galaxy/mod_support.h); ONLINE (the old ADVANCED) always.
     for (const unsigned tab : kPages) {
+        if (tab == kModsTab && !::galaxy::mod_support()) continue;
         shown.tabs[shown.count++] = tab;
     }
     return shown;
@@ -283,7 +289,7 @@ unsigned shown_position(unsigned tab) {
 // The GRAPHICS page's rows for what is not built natively yet. Each goes with its feature.
 bool graphics_row_hidden(const char* label) {
     static constexpr const char* kHidden[] = {
-        "RAY TRACING", "RAY TRACING QUALITY", "TEXTURE PACKS", "  REPLACEMENTS", "DUMP TEXTURES", "TEXTURE DUMPS FOLDER",
+        "TEXTURE PACKS", "  REPLACEMENTS", "DUMP TEXTURES", "TEXTURE DUMPS FOLDER",
     };
     for (const char* hidden : kHidden) {
         if (std::strcmp(label, hidden) == 0) return true;
@@ -294,10 +300,11 @@ bool graphics_row_hidden(const char* label) {
 // Rows of the shown pages for what is not there yet or not on this platform.
 bool row_hidden(const char* label) {
     static constexpr const char* kHidden[] = {
-        "POST-PROCESS", "RAY TRACING HARDWARE", "NVIDIA STREAMLINE", "NVIDIA REFLEX", "DLSS", "DLSS FRAME GENERATION",
+        "POST-PROCESS", "NVIDIA STREAMLINE", "NVIDIA REFLEX", "DLSS", "DLSS FRAME GENERATION",
 #if defined(__ANDROID__)
-        // MONITOR, DISPLAY MODE and RESOLUTION: the display page has none on a phone (fullscreen_only).
-        "REFRESH RATE", "VSYNC", "DISCORD STATUS",
+        // MONITOR, DISPLAY MODE and RESOLUTION: the display page has none on a phone (fullscreen_only). VSYNC stays: off,
+        // the swap chain keeps only the newest picture (mailbox) and runs uncapped; on, it shows every picture.
+        "REFRESH RATE", "DISCORD STATUS",
 #endif
     };
     for (const char* hidden : kHidden) {
@@ -410,6 +417,8 @@ std::string s_controls_message;
 std::uint64_t s_controls_message_until_ms = 0u;
 // The window thread's left/right-resolved code for the key being handled.
 std::uint32_t s_handled_key_normalized = 0u;
+// The controller key being handled is a held direction's repeat (native_settings_pad_key): the rows stop at the ends.
+bool s_pad_key_repeat = false;
 
 constexpr unsigned kNativeSettingsTabCount = 9;
 
@@ -444,7 +453,8 @@ ui::FrameRateCaps settings_frame_rate_caps(const RenderConfig& render, bool offe
     return {settings_refresh_hz(render), offer && frame_generation_offered(),
             host_window::upscaler_caps().frame_generation, host_window::upscaler_caps().frame_generation_dynamic,
             host_window::upscaler_caps().frame_generation_max, host_window::upscaler_caps().fsr_frame_generation,
-            render.vsync_interval == 0u && !vsync_fixed, vsync_fixed};
+            render.vsync_interval == 0u && !vsync_fixed, vsync_fixed,
+            galaxy::render::g_variable_refresh.load(std::memory_order_relaxed)};
 }
 Interpolation interpolation_of(const RenderConfig& render) { return ui::interpolation_of(render); }
 std::vector<unsigned> interpolation_targets(const RenderConfig& render, Interpolation mode) {
@@ -685,16 +695,12 @@ unsigned pending_settings_changes() {
     changes += d.anisotropic_filtering != live.anisotropic_filtering;
     changes += d.curved_surfaces != live.curved_surfaces;
     changes += lighting_mode(d) != lighting_mode(live);
-    changes += d.ambient_occlusion != live.ambient_occlusion;
-    changes += d.ambient_occlusion_ssao != live.ambient_occlusion_ssao;
+    // One row (off, SSAO, GTAO): one change.
+    changes += d.ambient_occlusion != live.ambient_occlusion ||
+        (d.ambient_occlusion && d.ambient_occlusion_ssao != live.ambient_occlusion_ssao);
     changes += d.bloom != live.bloom;
     changes += d.hud_output_resolution != live.hud_output_resolution;
     changes += d.hud_internal_resolution != live.hud_internal_resolution;
-    changes += d.ray_tracing_enabled != live.ray_tracing_enabled;
-    changes += d.rt_quality != live.rt_quality;
-    changes += d.rt_parts != live.rt_parts;
-    changes += d.rt_lens_bloom != live.rt_lens_bloom;
-    changes += d.rt_landing_shadow != live.rt_landing_shadow;
     changes += d.texture_packs != live.texture_packs ||
         (d.texture_packs && d.texture_pack_preload != live.texture_pack_preload);
     changes += d.texture_dump != live.texture_dump;
@@ -1175,12 +1181,6 @@ void apply_native_settings_draft() {
     applied.bloom = next.bloom;
     applied.hud_output_resolution = next.hud_output_resolution;
     applied.hud_internal_resolution = next.hud_internal_resolution;
-    applied.ray_tracing_enabled = next.ray_tracing_enabled;
-    applied.rt_quality = next.rt_quality;
-    applied.rt_parts = next.rt_parts;
-    applied.rt_chosen = next.rt_chosen;
-    applied.rt_lens_bloom = next.rt_lens_bloom;
-    applied.rt_landing_shadow = next.rt_landing_shadow;
     applied.texture_packs = next.texture_packs;
     applied.texture_pack_preload = next.texture_pack_preload;
     applied.texture_dump = next.texture_dump;
@@ -1488,7 +1488,8 @@ void adjust_native_setting_unlogged(int delta) {
     }
 }
 
-void move_native_setting_row(int delta) {
+// The selection a row on, past headings. `wrap`: from the last row to the first and back; else it stays at the end.
+void move_native_setting_row(int delta, bool wrap) {
     end_controls_capture();
     s_native_settings_button_row.store(~0u, std::memory_order_relaxed);
     const unsigned tab =
@@ -1499,11 +1500,15 @@ void move_native_setting_row(int delta) {
         s_native_settings_row.store(0u, std::memory_order_relaxed);
         return;
     }
-    int row = static_cast<int>(s_native_settings_row.load(std::memory_order_relaxed));
+    const int from = static_cast<int>(s_native_settings_row.load(std::memory_order_relaxed));
+    int row = from;
     for (unsigned tries = 0u; tries < count; ++tries) {
-        row = (row + delta) % static_cast<int>(count);
-        if (row < 0) {
-            row += static_cast<int>(count);
+        row += delta;
+        if (row < 0 || row >= static_cast<int>(count)) {
+            if (!wrap) {
+                return;  // no row past the end: the selection stays
+            }
+            row = row < 0 ? static_cast<int>(count) - 1 : 0;
         }
         if (!native_settings_heading(tab, static_cast<unsigned>(row))) {
             break;
@@ -2065,10 +2070,9 @@ bool handle_native_settings_key(std::uintptr_t key, bool was_down, bool from_pad
         cycle_native_settings_tab(-1);
         return true;
     case VK_UP:
-        move_native_setting_row(-1);
-        return true;
     case VK_DOWN:
-        move_native_setting_row(1);
+        // A press goes round from the last row to the first; a held key's repeats stop at the end.
+        move_native_setting_row(key == VK_UP ? -1 : 1, !was_down && !s_pad_key_repeat);
         return true;
     case VK_LEFT:
     case VK_RIGHT:
@@ -2188,8 +2192,6 @@ public:
         state.dlss_installed = dlss_installed_now();
         state.xess_supported = host_window::upscaler_caps().xess;
         state.xess_installed = xess_installed_now();
-        state.ray_tracing_offered = host_window::ray_tracing_offered.load(std::memory_order_relaxed);
-        state.traced_temporal = fsr3_available();
         state.temporal_upscaling = temporal_upscaler(render) != 0u;
         state.spatial_upscaling = spatial_quality_mode(render);
         state.curved_surfaces_offered = curved_surfaces_offered();
@@ -2497,7 +2499,15 @@ void confirm_saves_import(bool whole) {
         return;
     }
     std::thread([plan] {
-        finish_saves_import(galaxy::save_transfer::commit_import(*plan, galaxy::save_transfer::game_save_root()));
+        const galaxy::save_transfer::ImportResult result =
+            galaxy::save_transfer::commit_import(*plan, galaxy::save_transfer::game_save_root());
+        if (result.error == galaxy::save_transfer::Error::kNone) {
+            // The archive's unlocks and counters (P-119), merged once its saves are in place.
+            const unsigned unlocks = galaxy::achievements::merge(plan->achievements);
+            const unsigned counters = galaxy::stats::merge(plan->stats);
+            std::cerr << "[settings] save import: " << unlocks << " achievements and " << counters << " stats merged\n";
+        }
+        finish_saves_import(result);
     }).detach();
 }
 
@@ -2509,8 +2519,9 @@ void start_saves_export() {
         const std::filesystem::path folder = galaxy::runtime_settings_folder() / ".export";
         std::error_code error;
         std::filesystem::remove_all(folder, error);
-        const galaxy::save_transfer::ExportResult made =
-            galaxy::save_transfer::export_saves(galaxy::save_transfer::game_save_root(), folder, NEBULA_VERSION);
+        const galaxy::save_transfer::ExportResult made = galaxy::save_transfer::export_saves(
+            galaxy::save_transfer::game_save_root(), folder, NEBULA_VERSION,
+            galaxy::save_transfer::Progress{galaxy::achievements::text(), galaxy::stats::text()});
         if (made.error != galaxy::save_transfer::Error::kNone) {
             {
                 const std::lock_guard<std::mutex> lock(s_saves_mutex);
@@ -2555,6 +2566,20 @@ bool s_consent_choosing = false;
 bool s_consent_focus = false;
 std::map<std::string, bool> s_consent_chosen;
 std::string s_consent_facts_for;
+// The question after a crash that named a mod (when-a-mod-fails.md, "The next start after a crash"): keep it off, turn it on again or
+// remove it. Shown instead of the lists the first time they would show this run; `asked`: answered or closed (not
+// again this run); `showing`: the page built last was the question; `focus`: the focus goes to Keep it off when it
+// next builds; `facts`: its harness fact was written. Under s_mods_mutex.
+bool s_crash_asked = false;
+bool s_crash_showing = false;
+bool s_crash_focus = true;
+bool s_crash_facts = false;
+// The question about a library whose code failed under two mods' calls (when-a-mod-fails.md, "A library that fails
+// under two mods"): turn it off, or turn the two on again. Shown as the crash question is, once per library a run;
+// `common`: the library it is about while it shows; `asked`: the libraries answered or closed. Under s_mods_mutex.
+std::string s_common;
+std::set<std::string> s_common_asked;
+bool s_common_focus = true;
 
 // The Mods screen's lines about each mod as the harness facts `modscreen.<id>` (test-harness.md 4): its line in its
 // list, and each row of its page while that shows, written when what they say changes (a page each time it opens).
@@ -2906,6 +2931,115 @@ void commit_mods_locked(bool ask) {
 void commit_mods_draft() {
     const std::lock_guard<std::mutex> lock(s_mods_mutex);
     commit_mods_locked(true);
+}
+
+// With s_mods_mutex held: the mod the last run's crash named (mods.h crashed_mod), as the lists hold it; null when
+// none was named or it is gone (removed since).
+galaxy::mods::ModInfo* crashed_mod_locked() {
+    const galaxy::mods::CrashedMod crashed = galaxy::mods::crashed_mod();
+    if (crashed.id.empty()) return nullptr;
+    for (galaxy::mods::ModInfo& mod : s_mods) {
+        if (mod.id == crashed.id && !galaxy::mods::built_in(mod)) return &mod;
+    }
+    return nullptr;
+}
+
+void ask_mod_remove();
+void select_mods_row(const RenderConfig& render, const std::string& key);
+
+enum class CrashAnswer { KeepOff, TurnOn, Remove, Closed };
+
+// The player's answer to the crash question. Keep it off: off in the saved mods (it stays off at the next start).
+// Turn it on again: on in the saved mods (the restart is offered: it starts with the next start). Remove: the mod's
+// page with REMOVE's question. Closed (Escape): nothing changes. Not asked again this run. The lists come back with
+// that mod selected.
+void answer_crash(CrashAnswer answer) {
+    std::string id;
+    bool remove = false;
+    {
+        const std::lock_guard<std::mutex> lock(s_mods_mutex);
+        s_crash_asked = true;
+        s_crash_showing = false;
+        galaxy::mods::ModInfo* const mod = crashed_mod_locked();
+        if (mod == nullptr) return;
+        id = mod->id;
+        if (answer == CrashAnswer::KeepOff || answer == CrashAnswer::TurnOn) {
+            const bool on = answer == CrashAnswer::TurnOn;
+            if (mod->enabled != on) {
+                mod->enabled = on;
+                save_mods();
+            }
+            if (galaxy::mods::mods_differ_from_session(s_mods)) {
+                s_mods_restart_ask.store(true, std::memory_order_release);
+            }
+            s_mods_scanned = false;
+        } else if (answer == CrashAnswer::Remove) {
+            s_mod_options = id;
+            remove = true;
+        }
+    }
+    const char* const said = answer == CrashAnswer::KeepOff  ? "off"
+                             : answer == CrashAnswer::TurnOn ? "on"
+                             : answer == CrashAnswer::Remove ? "remove"
+                                                             : "closed";
+    galaxy::modlog::fact("crash.answer." + id, std::string("{\"answer\":\"") + said + "\"}");
+    if (remove) {
+        ask_mod_remove();
+        return;
+    }
+    select_mods_row(s_settings_draft, "mod:" + id);
+}
+
+enum class CommonAnswer { TurnOff, TurnOn, Closed };
+
+// The player's answer to the common-place question about the library s_common. Turn it off: off in the saved mods
+// (from the next start; the restart is offered). Turn them on again: the two mods it faulted under are loaded again
+// now (galaxy::mods::reload_later). Closed: nothing changes. Not asked again this run about it.
+void answer_common(CommonAnswer answer) {
+    std::string id;
+    std::optional<galaxy::modlog::FaultsUnder> under;
+    {
+        const std::lock_guard<std::mutex> lock(s_mods_mutex);
+        id = s_common;
+        if (id.empty()) return;
+        s_common.clear();
+        s_common_asked.insert(id);
+        s_common_focus = true;
+        if (answer == CommonAnswer::TurnOff) {
+            for (galaxy::mods::ModInfo& mod : s_mods) {
+                if (mod.id != id || !mod.enabled) continue;
+                mod.enabled = false;
+                save_mods();
+            }
+            if (galaxy::mods::mods_differ_from_session(s_mods)) {
+                s_mods_restart_ask.store(true, std::memory_order_release);
+            }
+            s_mods_scanned = false;
+        }
+    }
+    if (answer == CommonAnswer::TurnOn) {
+        under = galaxy::modlog::faults_under(id);
+        if (under.has_value()) {
+            if (!under->first.empty()) galaxy::mods::reload_later(under->first);
+            if (!under->second.empty()) galaxy::mods::reload_later(under->second);
+        }
+    }
+    const char* const said = answer == CommonAnswer::TurnOff ? "off" : answer == CommonAnswer::TurnOn ? "on" : "closed";
+    galaxy::modlog::fact("common.answer." + id, std::string("{\"answer\":\"") + said + "\"}");
+    select_mods_row(s_settings_draft, "mod:" + id);
+}
+
+// With s_mods_mutex held: the first library, on this start and not yet asked about, whose code failed under two
+// different mods' calls, and those two; null when none.
+galaxy::mods::ModInfo* common_place_locked(galaxy::modlog::FaultsUnder* under) {
+    for (galaxy::mods::ModInfo& mod : s_mods) {
+        if (!mod.enabled || s_common_asked.count(mod.id) != 0u) continue;
+        const std::optional<galaxy::modlog::FaultsUnder> faults = galaxy::modlog::faults_under(mod.id);
+        if (!faults.has_value() || faults->second.empty()) continue;
+        *under = *faults;
+        return &mod;
+    }
+    return nullptr;
 }
 
 void revert_mods_draft() {
@@ -3540,6 +3674,13 @@ void add_log_rows(std::vector<SettingsRow>& rows, const std::vector<galaxy::modl
     }
 }
 
+// A safe start's notice, on the Mods lists and on the log's page: every mod is off for this start, and why.
+const char* safe_start_notice(galaxy::mods::SafeStart safe) {
+    return safe == galaxy::mods::SafeStart::kAsked
+               ? "SAFE START: EVERY MOD IS OFF UNTIL THE NEXT START"
+               : "NEBULA CLOSED UNEXPECTEDLY WITH MODS ON. EVERY MOD IS OFF UNTIL THE NEXT START";
+}
+
 // The log page (the LOG button): a safe start's notice, what removed mods keep (add_kept_rows_locked), then the entries
 // grouped under each mod, in the MODS lists' order (the mods the lists do not have, a .luma that could not be read or
 // Nebula's own lines, after them, in the log's order); Done goes back. In a harness
@@ -3548,10 +3689,7 @@ std::vector<SettingsRow> log_page(const std::vector<galaxy::mods::ModInfo>& mods
     std::vector<SettingsRow> rows;
     // A safe start on top: every mod is off for this start, and why; the lists keep the player's choices.
     if (const galaxy::mods::SafeStart safe = galaxy::mods::safe_start(); safe != galaxy::mods::SafeStart::kNo) {
-        rows.push_back(SettingsRow{safe == galaxy::mods::SafeStart::kAsked
-                                       ? "SAFE START: EVERY MOD IS OFF UNTIL THE NEXT START"
-                                       : "NEBULA CLOSED UNEXPECTEDLY WITH MODS ON. EVERY MOD IS OFF UNTIL THE NEXT START",
-                                   {}, nullptr, {}, true});
+        rows.push_back(SettingsRow{safe_start_notice(safe), {}, nullptr, {}, true});
         modscreen_facts_locked("nebula", "log", rows.data(), rows.size());
     }
     add_kept_rows_locked(rows);
@@ -3773,6 +3911,86 @@ std::vector<SettingsRow> consent_page(const galaxy::mods::ModInfo& mod) {
         galaxy::modlog::append_json_text(json, buttons.back());
         json += '}';
         galaxy::modlog::fact("consent.shown." + id, json);
+    }
+    return rows;
+}
+
+// The question after a crash that named `mod` (when-a-mod-fails.md, "The next start after a crash"): its name, what happened, what the
+// next start does, then Keep it off (the focus), Turn it on again and Remove. With s_mods_mutex held.
+std::vector<SettingsRow> crash_page(const galaxy::mods::ModInfo& mod) {
+    std::vector<SettingsRow> rows;
+    const bool twice = galaxy::mods::crashed_mod().twice;
+    const std::string title = mod_title(mod);
+    const auto line = [&rows](std::string text) {
+        SettingsRow row{std::move(text), {}, nullptr, {}, true};
+        row.names = 1u;
+        rows.push_back(std::move(row));
+    };
+    line(title);
+    line(galaxy::modlog::row_words(twice ? "Mods.CrashedTwice" : "Mods.Crashed", mod.id, {{"mod", title}}));
+    line(galaxy::modlog::row_words(twice ? "Mods.CrashedAskTwice" : "Mods.CrashedAskOnce", mod.id, {}));
+    const std::vector<std::string> buttons = {"KEEP IT OFF", "TURN IT ON AGAIN", "REMOVE"};
+    SettingsRow choice = button_row({}, buttons,
+                                    [](RenderConfig&, unsigned pressed) {
+                                        constexpr CrashAnswer kAnswers[] = {CrashAnswer::KeepOff, CrashAnswer::TurnOn,
+                                                                            CrashAnswer::Remove};
+                                        if (pressed < std::size(kAnswers)) answer_crash(kAnswers[pressed]);
+                                    },
+                                    {});
+    choice.key = "crash-buttons";
+    rows.push_back(std::move(choice));
+    if (s_crash_focus) {
+        s_crash_focus = false;
+        s_native_settings_row.store(static_cast<unsigned>(rows.size() - 1u), std::memory_order_relaxed);
+        select_settings_button(0u);
+    }
+    if (!s_crash_facts) {
+        s_crash_facts = true;
+        std::string json = std::string("{\"twice\":") + (twice ? "true" : "false") + ",\"enabled\":" +
+                           (mod.enabled ? "true" : "false") + ",\"text\":";
+        galaxy::modlog::append_json_text(json, rows[1].label);
+        json += ",\"focus\":";
+        galaxy::modlog::append_json_text(json, buttons.front());
+        json += '}';
+        s_modscreen_pending.emplace_back("crash.shown." + mod.id, std::move(json));
+    }
+    return rows;
+}
+
+// The common-place question about `mod` (when-a-mod-fails.md): its name, what happened (Guard.CommonPlace), then Turn
+// it off (the focus) and Turn them on again. With s_mods_mutex held.
+std::vector<SettingsRow> common_page(const galaxy::mods::ModInfo& mod, const galaxy::modlog::FaultsUnder& under) {
+    std::vector<SettingsRow> rows;
+    const std::string title = mod_title(mod);
+    const auto line = [&rows](std::string text) {
+        SettingsRow row{std::move(text), {}, nullptr, {}, true};
+        row.names = 1u;
+        rows.push_back(std::move(row));
+    };
+    line(title);
+    line(galaxy::modlog::row_words("Guard.CommonPlace", mod.id, {{"mod", title}, {"first", under.first}, {"second", under.second}}));
+    const std::vector<std::string> buttons = {"TURN IT OFF", "TURN THEM ON AGAIN"};
+    SettingsRow choice = button_row({}, buttons,
+                                    [](RenderConfig&, unsigned pressed) {
+                                        if (pressed < 2u) answer_common(pressed == 0u ? CommonAnswer::TurnOff : CommonAnswer::TurnOn);
+                                    },
+                                    {});
+    choice.key = "common-buttons";
+    rows.push_back(std::move(choice));
+    if (s_common_focus) {
+        s_common_focus = false;
+        s_native_settings_row.store(static_cast<unsigned>(rows.size() - 1u), std::memory_order_relaxed);
+        select_settings_button(0u);
+        std::string json = "{\"first\":";
+        galaxy::modlog::append_json_text(json, under.first);
+        json += ",\"second\":";
+        galaxy::modlog::append_json_text(json, under.second);
+        json += ",\"text\":";
+        galaxy::modlog::append_json_text(json, rows[1].label);
+        json += ",\"focus\":";
+        galaxy::modlog::append_json_text(json, buttons.front());
+        json += '}';
+        s_modscreen_pending.emplace_back("common.shown." + mod.id, std::move(json));
     }
     return rows;
 }
@@ -4449,7 +4667,9 @@ bool screens_screen_up() {
         if (s_install_ask || s_offer_ask) return true;
     }
     const std::lock_guard<std::mutex> lock(s_mods_mutex);
-    return s_consent_open;
+    const bool on_mods = s_native_settings_visible.load(std::memory_order_relaxed) &&
+                         s_native_settings_tab.load(std::memory_order_relaxed) % kNativeSettingsTabCount == kModsTab;
+    return s_consent_open || ((s_crash_showing || !s_common.empty()) && on_mods);
 }
 
 // The menu on MODS over the paused game, on `row` of the request's page.
@@ -4547,6 +4767,24 @@ std::vector<SettingsRow> mods_page_rows(const RenderConfig&) {
     if (s_import_page_open.load(std::memory_order_acquire)) {
         return import_page();
     }
+    // The crash question, as the lists would first show (nothing drafted, no mod's page open): before the consent
+    // question, which the crashed mod's answer may change.
+    s_crash_showing = false;
+    if (!s_crash_asked && !s_mod_log_open && s_mod_options.empty() && mods_draft_changes_locked() == 0u) {
+        if (const galaxy::mods::ModInfo* crashed = crashed_mod_locked()) {
+            s_crash_showing = true;
+            return crash_page(*crashed);
+        }
+    }
+    // The common-place question, as the crash question is shown (after it).
+    s_common.clear();
+    if (!s_mod_log_open && s_mod_options.empty() && mods_draft_changes_locked() == 0u) {
+        galaxy::modlog::FaultsUnder under;
+        if (const galaxy::mods::ModInfo* library = common_place_locked(&under)) {
+            s_common = library->id;
+            return common_page(*library, under);
+        }
+    }
     if (s_consent_open) {
         if (galaxy::mods::ModInfo* asked = first_code_to_allow_locked()) return consent_page(*asked);
         s_consent_open = false;  // answered elsewhere (turned off, removed)
@@ -4564,6 +4802,22 @@ std::vector<SettingsRow> mods_page_rows(const RenderConfig&) {
     for (auto it = s_modscreen_shown.begin(); it != s_modscreen_shown.end();) {
         it = it->first.compare(0u, 5u, "page:") == 0 ? s_modscreen_shown.erase(it) : std::next(it);
     }
+    // A safe start says so over both lists: every mod is off for this start, and why. The lists keep the player's
+    // choices for the next start; the log has the notice too.
+    if (const galaxy::mods::SafeStart safe = galaxy::mods::safe_start(); safe != galaxy::mods::SafeStart::kNo) {
+        rows.push_back(SettingsRow{safe_start_notice(safe), {}, nullptr, {}, true});
+        modscreen_facts_locked("nebula", "list", &rows.back(), 1u);
+    } else if (const galaxy::mods::ModInfo* crashed = crashed_mod_locked()) {
+        // The mod the last run's crash named is off for this start (off until turned on when it crashed at two of
+        // its starts running and is still off).
+        const bool twice = galaxy::mods::crashed_mod().twice && !crashed->enabled;
+        SettingsRow notice{galaxy::modlog::row_words(twice ? "Mods.CrashedTwice" : "Mods.Crashed", crashed->id,
+                                                     {{"mod", mod_title(*crashed)}}),
+                           {}, nullptr, {}, true};
+        notice.names = 1u;
+        rows.push_back(std::move(notice));
+        modscreen_facts_locked("nebula", "list", &rows.back(), 1u);
+    }
     SettingsRow off{"DISABLED", {}, nullptr, {}, true};
     off.list = 1u;
     rows.push_back(std::move(off));
@@ -4571,10 +4825,7 @@ std::vector<SettingsRow> mods_page_rows(const RenderConfig&) {
     for (const galaxy::mods::ModInfo& mod : mods) {
         if (!mod.enabled && !galaxy::mods::built_in(mod)) rows.push_back(mod_row(mod));
     }
-    // A safe start says so over the mods on, which stay the player's choice for the next start; the log says why.
-    SettingsRow on{galaxy::mods::safe_start() != galaxy::mods::SafeStart::kNo ? "ENABLED (OFF UNTIL THE NEXT START)"
-                                                                              : "ENABLED (TOP HAS PRIORITY)",
-                   {}, nullptr, {}, true};
+    SettingsRow on{"ENABLED (TOP HAS PRIORITY)", {}, nullptr, {}, true};
     on.list = 2u;
     rows.push_back(std::move(on));
     for (const galaxy::mods::ModInfo& mod : mods) {
@@ -4688,10 +4939,26 @@ bool mods_page_key(std::uintptr_t key, bool accept, bool was_down) {
             if (!was_down) close_import_page(s_settings_draft);
             return true;
         }
+        bool crash = false;
+        bool common = false;
         bool asking = false;
         {
             const std::lock_guard<std::mutex> lock(s_mods_mutex);
+            crash = s_crash_showing;
+            common = !s_common.empty();
             asking = s_consent_open;
+        }
+        if (common && !crash) {
+            // The common-place question: Escape, Backspace or B closes it, nothing changed.
+            if (key != VK_ESCAPE && key != VK_BACK) return false;
+            if (!was_down) answer_common(CommonAnswer::Closed);
+            return true;
+        }
+        if (crash) {
+            // The crash question: Escape, Backspace or B closes it, nothing changed; the rest are the rows' own.
+            if (key != VK_ESCAPE && key != VK_BACK) return false;
+            if (!was_down) answer_crash(CrashAnswer::Closed);
+            return true;
         }
         if (asking) {
             // The consent question: Escape, Backspace or B is Not now (consent.md 2.4); the rest are the rows' own.
@@ -5786,7 +6053,7 @@ bool dlss_prompt_key(std::uintptr_t key, bool was_down) {
     return true;
 }
 
-// After changes that take a restart were applied (mods; ray tracing turned on before its shaders are prepared): Enter,
+// After changes that take a restart were applied (mods): Enter,
 // Space or Y restarts the game now; Escape, Backspace or B keeps them for the next start. Every other key waits for
 // the answer.
 bool restart_ask_key(std::uintptr_t key, bool was_down) {
@@ -5794,7 +6061,6 @@ bool restart_ask_key(std::uintptr_t key, bool was_down) {
     if (was_down) return true;
     if (key == VK_RETURN || key == VK_SPACE) {
         s_mods_restart_ask.store(false, std::memory_order_release);
-        s_rt_restart_ask.store(false, std::memory_order_release);
         const bool record = s_diagnostics_ask.exchange(false, std::memory_order_acq_rel);
         if (host_window::restart_game(record ? host_window::Restart::Diagnostics : host_window::Restart::Start)) {
             std::cerr << (record ? "[settings] restarting into a diagnostics run\n" : "[settings] restarting\n");
@@ -5803,7 +6069,6 @@ bool restart_ask_key(std::uintptr_t key, bool was_down) {
         }
     } else if (key == VK_ESCAPE || key == VK_BACK || key == VK_F1) {
         s_mods_restart_ask.store(false, std::memory_order_release);
-        s_rt_restart_ask.store(false, std::memory_order_release);
         s_diagnostics_ask.store(false, std::memory_order_release);
     }
     return true;
@@ -6100,8 +6365,6 @@ bool native_settings_mods_changed() {
 
 namespace host_window {
 
-// DXR 1.1 with shader model 6.6 and resource binding tier 3 on an adapter with dedicated memory (the RAY TRACING row).
-std::atomic<bool> ray_tracing_offered{false};
 // Queues a save of the settings files when something changed; never waits on the disk.
 bool flush_native_settings_if_dirty() {
     return s_settings_save.queue();
@@ -6114,18 +6377,13 @@ float upscaler_render_fraction(const RenderConfig& render, unsigned output_width
 // Exit paths: waits for a queued or running save (at most 5 s), then writes what is still unsaved here.
 void save_native_settings_now() { s_settings_save.save_now(); }
 
+namespace {
 // Nebula Settings can save config.ini while the game runs. The game takes the file's settings as the menu's
-// apply does, so the next save from the game writes them back rather than over them. Checked twice a second,
-// and not while the menu is open: its draft and display confirmation belong to the settings it opened with, and
-// a change made meanwhile lands once it closes.
-void poll_render_config_file() {
-    static std::uint64_t s_next_check_ms = 0u;
-    const std::uint64_t now = galaxy::steady_ms();
-    if (now < s_next_check_ms) {
-        return;
-    }
-    s_next_check_ms = now + 500u;
-    // A save of the game's own still in flight would read back as a change made outside it.
+// apply does, so the next save from the game writes them back rather than over them. Checked twice a second on the
+// settings' own thread (s_settings_save), between its saves, and not while the menu is open: its draft and display
+// confirmation belong to the settings it opened with, and a change made meanwhile lands once it closes.
+void look_at_render_config_file() {
+    // A save asked for since would read back as a change made outside the game.
     if (s_settings_save.pending()) {
         return;
     }
@@ -6142,6 +6400,17 @@ void poll_render_config_file() {
     if (const std::string gpu = next_start_gpu(); gpu != gpu_before) {
         std::cerr << "[settings] gpu=" << gpu << " applies at the next start\n";
     }
+}
+}  // namespace
+
+// The render thread's only part: starting the watch, once (a flag's load after that). It never takes the settings'
+// lock or reads their files.
+void watch_render_config_file() {
+    static std::atomic<bool> s_watching{false};
+    if (s_watching.load(std::memory_order_relaxed) || s_watching.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+    s_settings_save.watch(look_at_render_config_file, std::chrono::milliseconds(500));
 }
 
 // A renderer chosen in Nebula Settings during the session that is not the one the game runs on.
@@ -6165,9 +6434,20 @@ NativeSettingsView build_native_settings_view();
 
 void open_native_settings(unsigned page) {
     const std::lock_guard<std::recursive_mutex> lock(s_native_settings_mutex);
+    if (page % kNativeSettingsTabCount == kModsTab && !::galaxy::mod_support()) page = 0u;
     s_native_settings_tab.store(page % kNativeSettingsTabCount, std::memory_order_relaxed);
     s_native_settings_row.store(0u, std::memory_order_relaxed);
     set_native_settings_visible(true);
+}
+
+bool open_native_settings_for_waiting_code() {
+    {
+        const std::lock_guard<std::mutex> lock(s_mods_mutex);
+        (void)mods_list();
+        if (first_code_to_allow_locked() == nullptr) return false;
+    }
+    open_native_settings(kModsTab);
+    return true;
 }
 
 void open_native_settings_results(const std::filesystem::path& result) {
@@ -6415,8 +6695,6 @@ NativeSettingsView build_native_settings_view() {
         view.status_number = static_cast<int>(pending_settings_changes());
     } else if (s_mods_restart_ask.load(std::memory_order_acquire)) {
         view.status = NativeSettingsStatus::ModsRestartAsk;
-    } else if (s_rt_restart_ask.load(std::memory_order_acquire)) {
-        view.status = NativeSettingsStatus::RtRestartAsk;
     } else if (s_diagnostics_ask.load(std::memory_order_acquire)) {
         view.status = NativeSettingsStatus::DiagnosticsAsk;
     } else if (controls_capturing()) {
@@ -6439,7 +6717,10 @@ NativeSettingsView build_native_settings_view() {
         view.status_number = static_cast<int>(pending);
     } else if (s_settings_applied_ms != 0u && now_ms - s_settings_applied_ms < 2500u) {
         view.status = NativeSettingsStatus::Applied;
-    } else if (const PipelineProgress pipelines = pipeline_progress(); pipelines.left != 0u) {
+    } else if (const PipelineProgress pipelines = pipeline_progress();
+               pipelines.left != 0u && (galaxy::extensions::flags() & NEBULA_EXT_FIXED_STEPS) == 0u) {
+        // Not in fixed steps (deterministic test mode): the workers' pace is the machine's, so the line would differ run
+        // to run; the title does not wait for them there either, and a draw makes its own pipeline when it needs one.
         view.status = NativeSettingsStatus::Preparing;
         view.status_number = static_cast<int>(std::uint64_t{pipelines.done} * 100u / (std::uint64_t{pipelines.done} + pipelines.left));
     } else if (GameLanguage running{}; tab == kGeneralTab && running_game_language(running) &&
@@ -6526,29 +6807,27 @@ bool native_settings_text_wanted() noexcept {
 }
 
 bool native_settings_pad_key(std::uintptr_t virtual_key) {
-    return handle_native_settings_key(virtual_key, false, true);
+    // A held direction's repeat (native_settings_pad_step) comes marked: the rows stop at the page's ends for it.
+    const bool repeat = (virtual_key & kMenuKeyRepeat) != 0u;
+    s_pad_key_repeat = repeat;
+    const bool taken = handle_native_settings_key(virtual_key & ~kMenuKeyRepeat, false, true);
+    s_pad_key_repeat = false;
+    return taken;
 }
 
 bool native_settings_capture_mouse(galaxy::input::MouseButton button) {
     return native_settings_capture_mouse_button(button);
 }
 
-// The wheel moves the selection a row a notch, as the arrow keys, never while a binding waits for its input; false
-// while the menu is closed: the game's own screens take it.
-bool native_settings_wheel(int delta) {
+// The wheel scrolls what the menu shows, as a page scrolls: the game takes it (pointer_wheel) and moves its list, never
+// the selection, and stops at the list's ends. Taken here, and dropped, while a binding waits for its input (the
+// wheel is no binding). False otherwise: the window gives it to the game.
+bool native_settings_wheel(int) {
     if (!s_native_settings_visible.load(std::memory_order_relaxed)) {
         return false;
     }
     const std::lock_guard<std::recursive_mutex> lock(s_native_settings_mutex);
-    if (controls_capturing()) {
-        return true;
-    }
-    static int s_wheel = 0;
-    constexpr int kNotch = 120;
-    s_wheel += delta;
-    for (; s_wheel >= kNotch; s_wheel -= kNotch) (void)handle_native_settings_key(VK_UP, false);
-    for (; s_wheel <= -kNotch; s_wheel += kNotch) (void)handle_native_settings_key(VK_DOWN, false);
-    return true;
+    return controls_capturing();
 }
 
 namespace {
@@ -6608,7 +6887,10 @@ void open_saves_rows() {
 void route_dropped_files(std::vector<std::filesystem::path> files) {
     DroppedFiles sorted = sort_dropped_files(std::move(files));
     std::vector<std::filesystem::path>& mods = sorted.mods;
-    const bool link = sorted.link;
+    std::vector<std::filesystem::path>& miis = sorted.miis;
+    // A program with no mod support takes no mod: its files and links are left (no MODS page to show them on).
+    if (!::galaxy::mod_support()) mods.clear();
+    const bool link = sorted.link && ::galaxy::mod_support();
     if (sorted.save) {
         if (sorted.more_saves != 0u) {
             std::cerr << "[settings] save import (dropped): " << sorted.more_saves << " more saves left out\n";

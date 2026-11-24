@@ -124,11 +124,18 @@ struct RenderLayout {
     unsigned max_samples = 1u;
 };
 
+// Whether an adapter with `dedicated_bytes` of video memory of its own (DXGI_ADAPTER_DESC1::DedicatedVideoMemory) shares
+// the system's memory: an integrated GPU reserves at most a few hundred megabytes, WARP none.
+[[nodiscard]] constexpr bool unified_memory(std::uint64_t dedicated_bytes) noexcept {
+    return dedicated_bytes < (std::uint64_t{512} << 20u);
+}
+
 struct DeviceCaps {
     D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
     bool tearing = false;               // DXGI_FEATURE_PRESENT_ALLOW_TEARING
     bool flip_model = false;            // DXGI 1.4+: FLIP_DISCARD swap chains
     bool unified_memory = false;        // the adapter has no video memory of its own (DXGI: DedicatedVideoMemory small)
+    bool no_overwrite_constants = false;  // a dynamic constant buffer can be mapped NO_OVERWRITE (D3D11.1 options)
     unsigned max_samples = 1u;          // the most samples a pixel the scene's formats take (MSAA)
     std::uint64_t dedicated_bytes = 0u;
     std::uint32_t vendor = 0u;
@@ -173,6 +180,32 @@ public:
     // Every upload buffer's bytes written since the last call reach the GPU (render thread, before draws that read them).
     void upload_written();
 
+    // Constants the renderer's own draws and dispatches read (render thread): the constant ring. Each piece is written
+    // once, at a place no command still waiting to run reads: before a place comes round again the ring waits on the
+    // frame fence for the commands recorded while it held the last piece there (and grows instead, while it is smaller
+    // than kConstantRingMostBytes). Where the device maps a dynamic constant buffer NO_OVERWRITE (Direct3D 11.1) the CPU
+    // writes the ring in place, else a piece is copied in (UpdateSubresource1, D3D11_COPY_NO_OVERWRITE). Nothing is
+    // written with D3D11_MAP_WRITE_DISCARD: one buffer DISCARDed for each of several commands in flight leaves it to the
+    // driver to keep every command's copy, and a driver short of video memory gave a queued dispatch a later DISCARD's
+    // values (P-242: the sun test's count).
+    struct ConstantPlace {
+        ID3D11Buffer* buffer = nullptr;  // null: the piece could not be written
+        UINT first = 0u;                 // in 16-byte constants (a multiple of 16: 256-byte steps)
+        UINT count = 0u;                 // in 16-byte constants (a multiple of 16)
+    };
+    static constexpr std::size_t kConstantRingBytes = std::size_t{8} << 20u;       // the first ring
+    static constexpr std::size_t kConstantRingMostBytes = std::size_t{128} << 20u;  // grown no further: waits instead
+    // Room for `bytes` (rounded up to 256 bytes; at most a quarter of the ring, which grows for a larger piece) to write
+    // until end_constants; null when it cannot be had. `place` names it; a range bound from it is at most 4096
+    // constants (64 KB, the most one binding takes).
+    [[nodiscard]] std::byte* begin_constants(std::size_t bytes, ConstantPlace& place);
+    void end_constants();
+    // `bytes` of `data` (at most 64 KB) as one piece, its rounding up to 256 bytes zeroed.
+    [[nodiscard]] ConstantPlace put_constants(const void* data, std::size_t bytes);
+    // The ring's generation: one more each time a ring is made (the first, and each growth). A piece's place names a
+    // byte of the ring of its generation (ConstantsWatch reports it).
+    [[nodiscard]] std::uint32_t ring_generation() const noexcept { return ring_generation_; }
+
     // The address space (gpu::Address): an address's top bits name a buffer and its low kAddressShift bits a byte in it.
     static constexpr unsigned kAddressShift = 40;
     struct BufferOffset {
@@ -199,6 +232,25 @@ private:
     };
     friend struct Buffer;  // its destructor leaves the upload list
     [[nodiscard]] std::uint64_t register_address(Buffer* buffer);
+    [[nodiscard]] bool make_constant_ring(std::size_t bytes);
+
+    // The constant ring. Places count up through every byte ever handed out (ring_written_), a place's offset in the
+    // buffer is its count modulo the size. A mark: the count reached by the pieces of the commands a fence value covers.
+    struct RingMark {
+        std::uint64_t fence = 0u;
+        std::uint64_t written = 0u;
+    };
+    ComPtr<ID3D11Buffer> ring_;
+    std::size_t ring_bytes_ = 0u;
+    std::uint32_t ring_generation_ = 0u;
+    bool ring_mapped_writes_ = false;  // Map NO_OVERWRITE; else ring_copy_ copied in by UpdateSubresource1
+    bool ring_fresh_ = true;           // not yet mapped: the first Map is DISCARD (nothing reads it yet)
+    std::uint64_t ring_written_ = 0u;
+    std::uint64_t ring_done_ = 0u;     // every byte before this count is read by commands that have run
+    std::vector<RingMark> ring_marks_;  // oldest first
+    std::size_t ring_piece_at_ = 0u;    // the open piece (begin_constants to end_constants): its offset and size
+    std::size_t ring_piece_bytes_ = 0u;
+    std::vector<std::byte> ring_copy_;
 
     ComPtr<IDXGIFactory2> factory_;
     ComPtr<IDXGIAdapter1> adapter_;
@@ -215,10 +267,54 @@ private:
     std::string failure_;
     std::mutex buffers_mutex_;
     std::vector<Buffer*> upload_buffers_;  // every buffer with a system-memory copy
+    std::vector<void*> written_pages_;     // upload_written's page list, made once (P-064)
     std::array<std::atomic<AddressPage*>, kAddressIds / kAddressPageSize> address_pages_{};
     std::mutex address_mutex_;
     std::vector<std::uint32_t> free_address_ids_;
     std::uint32_t next_address_id_ = 1;  // 0 is the null address
+};
+
+// The stages bind_place binds at. The compute stage's constants are bound by ComputeConstants alone.
+inline constexpr unsigned kVertexConstants = 1u;
+inline constexpr unsigned kPixelConstants = 2u;
+
+// `place` (Context::put_constants) at constant slot `slot` of each stage in `stages`; a place without a buffer unbinds
+// the slot.
+inline void bind_place(ID3D11DeviceContext1* context, unsigned stages, UINT slot, const Context::ConstantPlace& place) {
+    const bool any = place.buffer != nullptr;
+    const UINT* const first = any ? &place.first : nullptr;
+    const UINT* const count = any ? &place.count : nullptr;
+    if ((stages & kVertexConstants) != 0u) {
+        context->VSSetConstantBuffers1(slot, 1u, &place.buffer, first, count);
+    }
+    if ((stages & kPixelConstants) != 0u) {
+        context->PSSetConstantBuffers1(slot, 1u, &place.buffer, first, count);
+    }
+}
+
+// `place` at constant slot 0 of the compute stage for the dispatches recorded while this lives, and nothing bound there
+// before or after them (P-332): the slot is emptied with the plain call, the piece bound with the offset call (the
+// runtime's documented way to have an offset binding taken whatever was bound before), and the slot emptied again when
+// this goes. No compute constant stays bound between the renderer's dispatches. A place without a buffer leaves the
+// slot empty.
+class ComputeConstants {
+public:
+    ComputeConstants(ID3D11DeviceContext1* context, const Context::ConstantPlace& place) noexcept : context_(context) {
+        ID3D11Buffer* const none = nullptr;
+        context_->CSSetConstantBuffers(0u, 1u, &none);
+        if (place.buffer != nullptr) {
+            context_->CSSetConstantBuffers1(0u, 1u, &place.buffer, &place.first, &place.count);
+        }
+    }
+    ~ComputeConstants() {
+        ID3D11Buffer* const none = nullptr;
+        context_->CSSetConstantBuffers(0u, 1u, &none);
+    }
+    ComputeConstants(const ComputeConstants&) = delete;
+    ComputeConstants& operator=(const ComputeConstants&) = delete;
+
+private:
+    ID3D11DeviceContext1* context_;
 };
 
 }  // namespace galaxy::render::d3d11

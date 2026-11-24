@@ -105,6 +105,33 @@ int main() {
             std::cerr << "present rate must follow the cap, the display rate and VSync\n";
             passed = false;
         }
+        {
+            // The DXGI sync interval (Direct3D 12 and 11 share it, P-022).
+            using galaxy::render::dxgi_sync_interval;
+            int asked = 0;
+            const auto on = [&asked] { ++asked; return true; };
+            const auto off = [&asked] { ++asked; return false; };
+            const bool sync_ok =
+                dxgi_sync_interval(0u, false, 120.0, 0.0f, true, on) == 0u &&   // VSync off stays off
+                dxgi_sync_interval(2u, false, 120.0, 0.0f, true, on) == 2u &&   // 2 asked stays 2
+                dxgi_sync_interval(1u, true, 120.0, 30.0f, true, on) == 1u &&   // a variable refresh: as asked
+                dxgi_sync_interval(1u, false, 0.0, 30.0f, true, on) == 1u &&    // an unknown display rate
+                asked == 0 &&                                                    // none of these asks
+                dxgi_sync_interval(1u, false, 120.0, 0.0f, true, on) == 1u &&   // a game frame at 60 goes out at once
+                dxgi_sync_interval(1u, false, 240.0, 0.0f, true, off) == 1u &&
+                asked == 0 &&                                                    // a game frame never asks
+                dxgi_sync_interval(1u, false, 120.0, 30.0f, true, on) == 4u &&  // 30 on 120: four refreshes each
+                dxgi_sync_interval(1u, false, 144.0, 30.0f, true, on) == 1u &&  // 30 on 144: no whole multiple
+                dxgi_sync_interval(1u, false, 60.0, 30.0f, true, on) == 2u &&   // 30 on 60: two
+                dxgi_sync_interval(1u, false, 240.0, 120.0f, false, on) == 2u && // in-between pictures at half the rate
+                dxgi_sync_interval(1u, false, 119.0, 59.94f, false, on) == 2u && // 119 for 119.88: within 1.5 %
+                dxgi_sync_interval(1u, false, 120.0, 0.0f, false, off) == 1u &&  // no in-between pictures, 120: at once
+                asked == 3;
+            if (!sync_ok) {
+                std::cerr << "the DXGI sync interval must keep whole refreshes only for a rate that is a part of the display's\n";
+                passed = false;
+            }
+        }
         using galaxy::render::interpolated_frames_per_game_frame;
         if (interpolated_frames_per_game_frame(30.0) != 0u ||
             interpolated_frames_per_game_frame(60.0) != 0u ||
@@ -221,28 +248,6 @@ int main() {
             passed &= expect(value.max_fps == 60.0f && value.texture_lod_bias == 8u &&
                 value.anisotropic_filtering == 1u, "direct config applies the same numeric boundary checks");
         }
-#if !defined(NEBULA_GPU_METAL)
-        {
-            // The tracer running: the scene single-sampled, anti-aliased by FSR 3; the player's choices kept.
-            galaxy::render::RenderConfig chosen{};
-            chosen.msaa_samples = 4u;
-            chosen.upscaler = 1u;
-            chosen.spatial_quality = 3u;
-            galaxy::render::set_render_config(chosen);
-            galaxy::render::set_render_tracing(true, true);
-            const auto traced = galaxy::render::get_render_config();
-            const auto kept = galaxy::render::get_render_config_chosen();
-            galaxy::render::set_render_tracing(true, false);
-            const auto no_fsr3 = galaxy::render::get_render_config();
-            galaxy::render::set_render_tracing(false, false);
-            const auto after = galaxy::render::get_render_config();
-            passed &= expect(traced.msaa_samples == 1u && traced.upscaler == 2u && traced.temporal_quality == 3u &&
-                    kept.msaa_samples == 4u && kept.upscaler == 1u && no_fsr3.msaa_samples == 1u && no_fsr3.upscaler == 1u &&
-                    after == galaxy::render::get_render_config_chosen() && after.msaa_samples == 4u,
-                "with the tracer running the scene is single-sampled and FSR 3 anti-aliases it; off, the choices return");
-            galaxy::render::set_render_config(galaxy::render::RenderConfig{});
-        }
-#endif
         for (float rate : {1.0f, 30.0f, 59.940002f, 60.0f, 10000000.0f, galaxy::render::kUnlimitedFrameRate}) {
             galaxy::render::RenderConfig original{};
             original.max_fps = rate;
@@ -254,33 +259,14 @@ int main() {
                 "frame-rate caps survive exact float round trips");
         }
         {
-            // The bloom's strength and ray tracing's parts, each away from its default.
-            using galaxy::render::RtPart;
+            // The bloom's strength, away from its default.
             galaxy::render::RenderConfig original{};
             original.bloom = 140u;
-            original.rt_lens_bloom = false;
-            original.rt_quality = galaxy::render::kRtPresetCustom;
-            original.rt_parts = {3u, 0u, 1u, 2u, 3u, 0u};
-            original.rt_probe_ms = 0.75f;
-            original.rt_chosen = true;
             galaxy::render::set_render_config(original);
-            passed &= expect(galaxy::render::save_render_config_to_file(), "bloom and parts fixture saves");
+            passed &= expect(galaxy::render::save_render_config_to_file(), "bloom fixture saves");
             galaxy::render::set_render_config(galaxy::render::RenderConfig{});
             galaxy::render::load_render_config_from_file();
-            const auto loaded = galaxy::render::get_render_config();
-            passed &= expect(loaded.bloom == 140u && !loaded.rt_lens_bloom && loaded.rt_quality == galaxy::render::kRtPresetCustom &&
-                                 loaded.rt_parts == original.rt_parts && galaxy::render::rt_part(loaded, RtPart::Lights) == 0u &&
-                                 loaded.rt_probe_ms == 0.75f && loaded.rt_chosen,
-                             "the bloom's strength, a custom set of parts and the tracer's measure survive a save");
-            galaxy::render::RenderConfig low{};
-            low.rt_quality = 2u;
-            galaxy::render::set_render_config(low);
-            const auto set_low = galaxy::render::get_render_config();
-            const galaxy::render::RenderConfig defaults{};
-            passed &= expect(set_low.rt_parts == std::array<std::uint8_t, 6>{1u, 1u, 1u, 0u, 1u, 1u} && defaults.rt_quality == 0u &&
-                                 defaults.rt_parts == std::array<std::uint8_t, 6>{2u, 2u, 2u, 2u, 2u, 2u} && defaults.rt_lens_bloom &&
-                                 defaults.rt_probe_ms == 0.0f && !defaults.rt_chosen,
-                             "a preset sets every part; medium by default");
+            passed &= expect(galaxy::render::get_render_config().bloom == 140u, "the bloom's strength survives a save");
             galaxy::render::set_render_config(galaxy::render::RenderConfig{});
         }
         {
@@ -368,9 +354,6 @@ int main() {
 
     galaxy::render::RenderConfig config{};
     config.msaa_samples = 8;
-    config.ray_tracing_enabled = true;
-    config.rt_quality = galaxy::render::kRtPresetCustom;
-    config.rt_parts[static_cast<std::size_t>(galaxy::render::RtPart::Reflect)] = 0u;
     galaxy::render::set_render_config(config);
 
     const galaxy::render::RenderConfig sanitized =
@@ -378,11 +361,6 @@ int main() {
     passed &= expect(
         sanitized.msaa_samples == 8,
         "set_render_config keeps MSAA 8x");
-    passed &= expect(
-        sanitized.ray_tracing_enabled &&
-            galaxy::render::rt_part(sanitized, galaxy::render::RtPart::Reflect) == 0u &&
-            sanitized.rt_quality == galaxy::render::kRtPresetCustom,
-        "set_render_config keeps ray tracing and its reflections choice");
 
     {
         const std::filesystem::path root = galaxy::test_temp_path("galaxy_render_config_tests");
@@ -554,12 +532,8 @@ int main() {
         };
         const galaxy::render::RenderConfig loaded = load(
             "msaa_samples=8\ntaa_enabled=1\nray_tracing_enabled=1\nrt_quality=custom\nrt_reflect=off\nrt_sun=high\n");
-        passed &= expect(
-            loaded.msaa_samples == 8 &&
-                loaded.ray_tracing_enabled &&
-                galaxy::render::rt_part(loaded, galaxy::render::RtPart::Reflect) == 0u &&
-                galaxy::render::rt_part(loaded, galaxy::render::RtPart::Sun) == 3u,
-            "the file's render config enables ray tracing and takes its parts by name; an old key it no longer has is ignored");
+        passed &= expect(loaded.msaa_samples == 8 && loaded == load("msaa_samples=8\n"),
+                         "a file's keys it no longer has (taa, ray tracing's) are ignored");
 
         const galaxy::render::RenderConfig quality =
             load("texture_lod_bias=99\nanisotropic_filtering=99\nenhanced_mipmaps=1\n");
@@ -570,9 +544,6 @@ int main() {
             quality.anisotropic_filtering == 16,
             "anisotropic filtering is clamped to the supported range");
 
-        passed &= expect(
-            !load("frame_rate_decouple=1\n").frame_rate_decouple,
-            "frame-rate decoupling stays off");
         std::filesystem::remove_all(root);
     }
 
@@ -589,15 +560,13 @@ int main() {
         caps.adapter_description.data(),
         caps.adapter_description.size(),
         "Synthetic RTX Adapter");
-    caps.dxr_device5_supported = true;
-    caps.dxr_raytracing_tier = 11;
     caps.streamline_bridge_built = false;
-    caps.dxr = galaxy::render::make_render_feature_status(
-        false,
+    caps.msaa = galaxy::render::make_render_feature_status(
         true,
-        false,
-        false,
-        "DXR runtime is available; native RT effects are not built");
+        true,
+        true,
+        true,
+        "scene target targets multisampled");
     caps.reflex = galaxy::render::make_render_feature_status(
         false,
         false,
@@ -632,15 +601,13 @@ int main() {
             std::strcmp(
                 readback.adapter_description.data(),
                 "Synthetic RTX Adapter") == 0 &&
-            readback.dxr_device5_supported &&
-            readback.dxr_raytracing_tier == 11 &&
-            readback.dxr.runtime_supported &&
-            !readback.dxr.implemented &&
-            !readback.dxr.renderer_ready &&
-            !readback.dxr.settings_exposed,
-        "render feature caps preserve DXR runtime/support status");
+            readback.msaa.runtime_supported &&
+            readback.msaa.implemented &&
+            readback.msaa.renderer_ready &&
+            readback.msaa.settings_exposed,
+        "render feature caps preserve a feature's status");
     passed &= expect(
-        std::strstr(readback.dxr.reason.data(), "native RT effects") != nullptr,
+        std::strstr(readback.msaa.reason.data(), "multisampled") != nullptr,
         "render feature caps keep diagnostic reason text");
     passed &= expect(
             !readback.streamline_bridge_built &&
@@ -662,7 +629,6 @@ int main() {
     caps.adapter_description.fill('x');
     caps.msaa.reason.fill('x');
     caps.taa.reason.fill('x');
-    caps.dxr.reason.fill('x');
     caps.streamline.reason.fill('x');
     caps.reflex.reason.fill('x');
     caps.dlss_super_resolution.reason.fill('x');
@@ -671,7 +637,7 @@ int main() {
     const auto terminated = galaxy::render::get_render_feature_caps();
     passed &= expect(terminated.adapter_description.back() == '\0' &&
         terminated.msaa.reason.back() == '\0' && terminated.taa.reason.back() == '\0' &&
-        terminated.dxr.reason.back() == '\0' && terminated.streamline.reason.back() == '\0' &&
+        terminated.streamline.reason.back() == '\0' &&
         terminated.reflex.reason.back() == '\0' && terminated.dlss_super_resolution.reason.back() == '\0' &&
         terminated.dlss_frame_generation.reason.back() == '\0',
         "direct capability strings are always terminated before UI snapshots");
@@ -709,41 +675,12 @@ int main() {
         passed &= expect(preset.internal_height == 480u && preset.upscaler == 0u && preset.aa_mode == 0u && preset.msaa_samples == 1u &&
                              !preset.ambient_occlusion && preset.bloom == 0u && !preset.enhanced_lighting && !preset.per_pixel_lighting &&
                              preset.max_fps == 0.0f && preset.dynamic_resolution && preset.frame_generation == 0u &&
-                             !preset.ray_tracing_enabled && !preset.hdr &&
+                             !preset.hdr &&
                              preset.sharpness == 0u && preset.anisotropic_filtering == 1u,
                          "the performance preset turns every optional pass off at 480 lines, at the display's rate with "
                          "dynamic resolution");
         passed &= expect(!preset.hud_output_resolution && preset.hud_internal_resolution && !galaxy::render::render_hud_at_output(preset),
                          "the performance preset draws the 2D layer at 480 lines and enlarges once at present");
-        {
-            // Two very different players' settings end at one standard: only the window, display and GPU stay theirs.
-            galaxy::render::RenderConfig a{};
-            a.internal_height = 2160u;
-            a.upscaler = 2u;
-            a.dynamic_resolution = true;
-            a.frame_generation = 2u;
-            a.ray_tracing_enabled = true;
-            a.hdr = true;
-            a.vsync_interval = 1u;
-            a.max_fps = 144.0f;
-            a.aspect_mode = 6u;
-            a.window_width = 2560u;
-            galaxy::render::RenderConfig b{};
-            galaxy::render::apply_performance_preset(b);
-            b.window_width = 1280u;
-            galaxy::render::apply_benchmark_standard(a);
-            galaxy::render::apply_benchmark_standard(b);
-            passed &= expect(a.internal_height == 1080u && a.aspect_mode == 4u && a.upscaler == 0u && !a.dynamic_resolution &&
-                                 a.frame_generation == 0u && !a.ray_tracing_enabled && !a.hdr && a.vsync_interval == 0u &&
-                                 galaxy::render::unlimited_frame_rate(a.max_fps) && a.msaa_samples == 4u &&
-                                 a.aa_mode == 1u && a.smaa_quality == 2u &&
-                                 a.ambient_occlusion && a.enhanced_lighting && a.per_pixel_lighting && a.bloom == 100u &&
-                                 a.anisotropic_filtering == 16u,
-                             "the benchmark standard: 1920 x 1080, high settings, nothing that changes with the device");
-            b.window_width = a.window_width;
-            passed &= expect(a == b && a.window_width == 2560u,
-                             "the benchmark standard is the same from any settings; the window stays the player's");
-        }
         galaxy::render::RenderConfig exact{};
         exact.internal_height = 720u;
         const bool before = galaxy::render::render_hud_at_output(exact);

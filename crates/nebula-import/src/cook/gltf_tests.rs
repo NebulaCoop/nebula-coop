@@ -196,9 +196,12 @@ fn twelve_texture_layers_cook_without_losing_slots_or_coordinates() {
     let block = super::super::model_write::write(&ir, "fixture", &super::super::programs::Written::unknown(), &mut Default::default()).unwrap();
     let word = |at| u32::from_le_bytes(block[at..at + 4].try_into().unwrap());
     assert_eq!(word(4), super::super::model_write::VERSION);
-    let at = word(24 * 4) as usize;
-    assert_eq!(word(at + 36), 12);
-    let slots = word(at + super::super::model_write::MATERIAL_BYTES - 16) as usize;
+    let table = super::super::model_write::sections(&block).unwrap();
+    let at = super::super::model_write::section(&table, b"MATL").unwrap().at as usize;
+    assert_eq!(word(at + 40), 12); // MATL slot_count
+    // MATL's first_slot (word 9) in SLOT.
+    let slots = super::super::model_write::section(&table, b"SLOT").unwrap().at as usize
+        + word(at + 36) as usize * super::super::model_write::SLOT_BYTES;
     for n in 0..12 {
         let slot = slots + n * super::super::model_write::SLOT_BYTES;
         assert_eq!(word(slot), n as u32);
@@ -654,7 +657,7 @@ fn a_gltf_metre_is_a_hundred_units() {
 }
 
 #[test]
-fn the_metal_smooth_sphere_is_metal_to_a_ray() {
+fn the_metal_smooth_sphere_is_lit_as_metal() {
     // The conformance model metal-smooth (docs/modding/how-tos/writing-material-shaders.md): a 1 m sphere, metal 1, roughness
     // 0.05.
     let source = include_bytes!("../../data/metal-smooth.gltf");
@@ -664,19 +667,15 @@ fn the_metal_smooth_sphere_is_metal_to_a_ray() {
     // A metre across: every vertex 50 units from the joint, and the joint's bounds from 0 to 100 up.
     assert!(ir.arrays.positions.iter().all(|p| ((p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt() - 50.0).abs() < 1e-3));
     assert!((ir.joints[0].min[1] - 0.0).abs() < 1e-3 && (ir.joints[0].max[1] - 100.0).abs() < 1e-3, "{:?} {:?}", ir.joints[0].min, ir.joints[0].max);
-    let (model, _) = to_files(source, None, "metal-smooth").unwrap();
-    let word = |at: usize| u32::from_le_bytes(model[at..at + 4].try_into().unwrap());
-    let float = |at: usize| f32::from_le_bytes(model[at..at + 4].try_into().unwrap());
-    // Its NebulaModelHit (hits_at, header word 28): class METAL, no stages, lit; roughness 0.05, metal 1, base 0.95.
-    let at = word(28 * 4) as usize;
-    assert_eq!((model[at], model[at + 1], model[at + 2]), (2, 0, 1));
-    assert_eq!((float(at + 4), float(at + 8), [float(at + 20), float(at + 24), float(at + 28)]), (0.05, 1.0, [0.95; 3]));
+    // Its lit form takes metal 1 and roughness 0.05 (program_pbr.hlsli).
+    let lit = ir.materials[0].pbr.expect("a lit glTF material");
+    assert_eq!((lit.metal, lit.roughness), (1.0, 0.05));
 }
 
-/// A glTF material's `extras.nebula.ray` (the ray placeholders): checked, then cooked into its hit record
-/// (NebulaModelHit at hits_at, header word 28); none given, `{}` or `auto`, the model is the same byte for byte.
+/// A glTF material's `extras.nebula.ray` (ray tracing's rows; this game has none): checked as before, so a valid file
+/// stays valid, then used for nothing: the model is the same byte for byte, and the cook notes Cook.RayData once.
 #[test]
-fn a_materials_ray_values_are_checked_and_set_its_hit_record() {
+fn a_materials_ray_values_are_checked_and_change_nothing() {
     // The test takes what the cook notes (refuse::reading).
     let _reading = crate::cook::refuse::reading();
     let mut document = document_of(&triangle(1));
@@ -688,33 +687,24 @@ fn a_materials_ray_values_are_checked_and_set_its_hit_record() {
         d
     };
     let model_of = |d: &Value| to_files(&serde_json::to_vec(d).unwrap(), None, "raymat").unwrap().0;
+    let notes = || crate::cook::refuse::take_notes().into_iter().filter(|f| f.args.first().is_some_and(|(_, a)| matches!(a, luma_validate::Arg::Phrase("Cook.RayData")))).count();
+    crate::cook::refuse::take_notes();
     let plain = model_of(&document);
-    for same in [serde_json::json!({}), Value::Null, serde_json::json!({"vertex_colour": "auto"})] {
-        assert!(model_of(&with(same.clone())) == plain, "{same}");
+    assert_eq!(notes(), 0);
+    for given in [
+        serde_json::json!({}),
+        serde_json::json!({"vertex_colour": "auto"}),
+        serde_json::json!({"vertex_colour": "albedo"}),
+        serde_json::json!({"vertex_colour": "light"}),
+        serde_json::json!({"ior": 1.33, "thickness": 40.0, "body": 0.5, "shine": 2.0, "tint_keep": 0.25, "traced": "hidden",
+            "sun_through": 0.5, "metal_kind": "gold", "glow": {"color": [1.0, 0.5, 0.0], "candela": 100.0}}),
+        serde_json::json!({"glow": {"color": "own", "luminance": 30.0}}),
+    ] {
+        assert!(model_of(&with(given.clone())) == plain, "{given}");
+        assert_eq!(notes(), 1, "{given}");
     }
-    let (ir, _, _) = cook(&with(Value::Null), None).unwrap();
-    assert_eq!(ir.materials[0].ray, crate::cook::model_ir::RayRows::default());
-    // The numbers in the record, the rest as without them.
-    let model = model_of(&with(serde_json::json!({"ior": 1.33, "thickness": 40.0, "body": 0.5, "shine": 2.0, "tint_keep": 0.25,
-        "glow": {"color": [1.0, 0.5, 0.0], "candela": 100.0}})));
-    let word = |m: &[u8], at: usize| u32::from_le_bytes(m[at..at + 4].try_into().unwrap());
-    let float = |m: &[u8], at: usize| f32::from_le_bytes(m[at..at + 4].try_into().unwrap());
-    let (at, plain_at) = (word(&model, 28 * 4) as usize, word(&plain, 28 * 4) as usize);
-    assert_eq!((float(&model, at + 12), float(&model, at + 68)), (1.33, 40.0));
-    assert_eq!([104, 108, 112].map(|k| float(&model, at + k)), [0.5, 2.0, 0.25]);
-    assert_eq!([72, 76, 80, 84].map(|k| float(&model, at + k)), [1.0, 0.5, 0.0, 100.0]);
-    assert_eq!(model[at..at + 12], plain[plain_at..plain_at + 12]);
-    // A vertex colour that is albedo (glTF's own meaning): no environment share, no painted-shadow bit, no gain.
-    let albedo = with(serde_json::json!({"vertex_colour": "albedo"}));
-    let (ir, _, _) = cook(&albedo, None).unwrap();
-    let (plain_ir, _, _) = cook(&document, None).unwrap();
-    assert!(ir.materials[0].ray.vertex_albedo() && !super::super::model_write::debakes(&ir.materials[0]));
-    assert_eq!(super::super::model_write::debakes(&plain_ir.materials[0]), super::super::hit_record::read(&plain_ir.materials[0]).signals.vertex_colour);
-    let model = model_of(&albedo);
-    let at = word(&model, 28 * 4) as usize;
-    assert_eq!((model[at + 2] & 1 << 3, model[at + 2] & 1 << 6, float(&model, at + 44)), (1 << 3, 0, 0.0));
-    // `light` says the cook's rule.
-    assert!(model_of(&with(serde_json::json!({"vertex_colour": "light"}))) == plain);
+    assert!(model_of(&with(Value::Null)) == plain);
+    assert_eq!(notes(), 0);
     // A key the material does not take (its factors are glTF's own), one out of range, or no object: refused.
     for (ray, key) in [
         (serde_json::json!({"class": "metal"}), "/materials/0/extras/nebula/ray/class"),
@@ -851,12 +841,13 @@ fn a_hidden_model_keeps_every_joint_and_draws_nothing() {
     let (block, _, _) = to_files_for(&serde_json::to_vec(&arm(true, [0.0, 1.0], 0.5)).unwrap(), None, "Kuribo", None).unwrap();
     let read = GameModel::read(&game.path, &block).unwrap();
     assert_eq!(read.joints, game.joints);
-    // Hidden: the same joints in the same order, no meshes or materials (header words 4, 11, 12: nebula_model.h).
+    // Hidden: the same joints in the same order, no meshes or materials (the section table's counts: nebula_model.h).
     let skeleton = skeleton_gltf(&read, &block).unwrap();
     let (hidden, facts) = hidden_files_for(&skeleton, "Kuribo", &read).unwrap();
     assert_eq!(GameModel::read(&game.path, &hidden).unwrap().joints, game.joints);
-    let word = |at: usize| u32::from_le_bytes(hidden[at * 4..at * 4 + 4].try_into().unwrap());
-    assert_eq!((word(4), word(11), word(12)), (3, 0, 0));
+    let table = super::super::model_write::sections(&hidden).unwrap();
+    let count = |name: &[u8; 4]| super::super::model_write::section(&table, name).unwrap().count;
+    assert_eq!((count(b"JNTS"), count(b"MESH"), count(b"MATL")), (3, 0, 0));
     assert_eq!((facts.joints, facts.extra_joints, facts.meshes), (3, 0, 0));
     // An ordinary model with no triangles is still refused.
     let bare = to_files_for(&skeleton, None, "Kuribo", Some(&read)).err().unwrap();
@@ -1070,22 +1061,12 @@ fn a_lit_material_keeps_every_factor_and_map() {
     assert_eq!(numbers.len(), 3);
     assert!(numbers.iter().all(|n| (*n as usize) < ir.textures.len()), "{numbers:?} of {}", ir.textures.len());
 
-    // What a ray reads of it (NebulaModelHit at hits_at, header word 28; MOD-MATERIALS-FC.md 2): the maps are white,
-    // so the factors stand; its glow outshines what light shows of its base, so it is emissive.
+    // The model file: this version, its header and every block inside the file.
     let (model, _) = to_files(&serde_json::to_vec(&lit_document()).unwrap(), None, "Shell").unwrap();
     let word = |at: usize| u32::from_le_bytes(model[at..at + 4].try_into().unwrap());
-    let float = |at: usize| f32::from_le_bytes(model[at..at + 4].try_into().unwrap());
-    let floats = |at: usize| [float(at), float(at + 4), float(at + 8)];
-    assert_eq!(word(4), super::super::model_write::VERSION);
-    let at = word(28 * 4) as usize;
-    assert_eq!(at % 4, 0);
-    // Class EMISSIVE, no stages, lit + two-sided + alpha test.
-    assert_eq!((model[at], model[at + 1], model[at + 2]), (6, 0, 1 | 2 | 4));
-    assert_eq!([float(at + 4), float(at + 8), float(at + 12), float(at + 16)], [0.6, 0.2, 1.5, 0.0]);
-    assert_eq!((floats(at + 20), floats(at + 32)), ([1.0, 0.5, 0.25], [2.0, 1.0, 0.0]));
-    // No painted reflection: env_map 255, its tint 0 (white).
-    assert_eq!((model[at + 100], floats(at + 88)), (255, [0.0; 3]));
-    assert!(at + super::super::model_write::HIT_BYTES <= model.len());
+    assert_eq!((word(0), word(4), word(8) as usize), (super::super::model_write::MAGIC, super::super::model_write::VERSION, model.len()));
+    let table = super::super::model_write::sections(&model).unwrap();
+    assert!(table.iter().all(|s| (s.at + s.size) as usize <= model.len()));
 
     // A material with nothing said is glTF's default; a file with no material has no glTF materials.
     let (plain, _, _) = cook(&document_of(&triangle(1)), None).unwrap();
@@ -1110,7 +1091,7 @@ fn a_lit_material_is_drawn_by_the_pbr_template() {
     for form in &forms {
         let t = generate(m, *form, false, &Registers::of(m)).unwrap();
         let px = &t.pixel;
-        for wanted in ["#include \"program_pbr.hlsli\"", "pbr_begin(", "pbr_add_light(i.lit_light, 0u", "TRACED_LEVEL(pbr_level())",
+        for wanted in ["#include \"program_pbr.hlsli\"", "pbr_begin(", "pbr_add_light(i.lit_light, 0u",
                        "ENV_FETCH(pbr_reflection(", "pbr_finish(prev.rgb", "pbr_metal *= pbr_mr.b", "pbr_ao = 1.0 + 0.7"] {
             assert!(px.contains(wanted), "{form:?} lacks {wanted}:\n{px}");
         }
@@ -1264,8 +1245,11 @@ fn a_normal_map_turns_the_lit_form_s_pixel_normal() {
     // Its slot is marked as read, so its texture is bound.
     let block = super::super::model_write::write(&ir, "fixture", &super::super::programs::Written::unknown(), &mut Default::default()).unwrap();
     let word = |at: usize| u32::from_le_bytes(block[at..at + 4].try_into().unwrap());
-    let at = word(24 * 4) as usize;
-    let slots = word(at + super::super::model_write::MATERIAL_BYTES - 16) as usize;
+    let table = super::super::model_write::sections(&block).unwrap();
+    let at = super::super::model_write::section(&table, b"MATL").unwrap().at as usize;
+    // MATL's first_slot (word 9) in SLOT.
+    let slots = super::super::model_write::section(&table, b"SLOT").unwrap().at as usize
+        + word(at + 36) as usize * super::super::model_write::SLOT_BYTES;
     let slot = slots + 2 * super::super::model_write::SLOT_BYTES;
     assert_eq!(block[slot + 6], super::super::model_write::SLOT_USES_MAP | super::super::model_write::SLOT_USES_COORD);
 }

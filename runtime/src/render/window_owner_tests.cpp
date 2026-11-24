@@ -1,11 +1,15 @@
-// WindowOwner: the window is created and destroyed on its own thread, also when stop() ends a modal loop.
+// WindowOwner: the window is created and destroyed on its own thread, also when stop() ends a modal loop; a window made with
+// no_focus (--no-focus 1, a test's visible run) is shown without being activated.
 #include "galaxy/render/window_owner.h"
+#include "galaxy/test_wait.h"
 #include <atomic>
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
 
 namespace {
+// The owner thread's events are waited for themselves; the deadline only reports that one never came (N-1073).
+constexpr DWORD kEventWaitMs = 60000u;
 constexpr UINT kBlock = WM_APP + 1;
 constexpr UINT kNested = WM_APP + 2;
 HANDLE entered{};
@@ -13,12 +17,13 @@ HANDLE release_owner{};
 std::atomic<DWORD> created_on{};
 std::atomic<DWORD> destroyed_on{};
 std::atomic<unsigned> destroyed_count{};
+std::atomic<unsigned> activations{};  // WM_ACTIVATE to active, WM_ACTIVATEAPP to active, WM_SETFOCUS: any of them is a window that asked for the focus
 
 LRESULT CALLBACK test_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     if (message == WM_CREATE) created_on.store(GetCurrentThreadId());
     if (message == kBlock) {
         SetEvent(entered);
-        (void)WaitForSingleObject(release_owner, 5000);
+        (void)WaitForSingleObject(release_owner, kEventWaitMs);
         return 0;
     }
     if (message == kNested) {
@@ -31,6 +36,10 @@ LRESULT CALLBACK test_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         // A native modal loop propagates WM_QUIT to its enclosing owner loop.
         PostQuitMessage(static_cast<int>(next.wParam));
         return 0;
+    }
+    if ((message == WM_ACTIVATE && LOWORD(wp) != WA_INACTIVE) || (message == WM_ACTIVATEAPP && wp != FALSE) ||
+        message == WM_SETFOCUS) {
+        activations.fetch_add(1);
     }
     if (message == WM_DESTROY) {
         destroyed_on.store(GetCurrentThreadId());
@@ -74,12 +83,11 @@ int main() {
 
         okay &= expect(PostMessageW(window, kBlock, 0, 0) != FALSE,
                        "blocking UI work submitted");
-        okay &= expect(WaitForSingleObject(entered, 2000) == WAIT_OBJECT_0,
+        okay &= expect(WaitForSingleObject(entered, kEventWaitMs) == WAIT_OBJECT_0,
                        "owner entered blocked handler");
-        unsigned consumer_steps = 0;
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds(100);
-        while (std::chrono::steady_clock::now() < deadline) ++consumer_steps;
+        // This thread does work while the owner's handler is blocked: a count of steps, not a time.
+        volatile unsigned consumer_steps = 0;
+        while (consumer_steps < 1'000'000u) ++consumer_steps;
         okay &= expect(consumer_steps > 100 && destroyed_count.load() == 0,
                        "consumer progresses while UI owner is blocked");
         SetEvent(release_owner);
@@ -93,7 +101,7 @@ int main() {
         window = owner.start(config);
         okay &= expect(window != nullptr, "owner can restart after stop");
         okay &= expect(PostMessageW(window, kNested, 0, 0) != FALSE &&
-                           WaitForSingleObject(entered, 2000) == WAIT_OBJECT_0,
+                           WaitForSingleObject(entered, kEventWaitMs) == WAIT_OBJECT_0,
                        "owner entered nested message loop");
         owner.stop();
         okay &= expect(!IsWindow(window) && destroyed_count.load() == 2 &&
@@ -109,6 +117,26 @@ int main() {
     }
     okay &= expect(destroyed_count.load() == 3,
                    "destructor joins and destroys remaining HWND");
+    // A visible window made with no_focus: shown, never the foreground window, with the no-activate style, and no message of
+    // an activation or of the focus ever reaches it (the three calls and SW_SHOWNORMAL are not made).
+    {
+        galaxy::render::WindowOwnerConfig visible{
+            window_class.lpszClassName, L"No focus test", WS_OVERLAPPEDWINDOW, WS_EX_APPWINDOW | WS_EX_NOACTIVATE, 0, 0, 160, 120,
+            true, false, true};
+        activations.store(0);
+        galaxy::render::WindowOwner owner;
+        HWND window = owner.start(visible);
+        okay &= expect(window != nullptr, "the no-focus window is created");
+        if (window != nullptr) {
+            // A round trip through the owner's queue: what the owner did before it is all delivered.
+            (void)SendMessageW(window, WM_NULL, 0, 0);
+            okay &= expect(galaxy::test_wait([&] { return IsWindowVisible(window) != FALSE; }), "the no-focus window is visible");
+            okay &= expect(GetForegroundWindow() != window, "the no-focus window is not the foreground window");
+            okay &= expect((GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_NOACTIVATE) != 0, "it has the no-activate style");
+            okay &= expect(activations.load() == 0, "it received no activation and no focus message");
+        }
+        owner.stop();
+    }
     UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
     CloseHandle(entered);
     CloseHandle(release_owner);

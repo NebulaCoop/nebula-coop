@@ -15,6 +15,7 @@ pub mod formats;
 pub mod flac;
 pub mod fur;
 pub mod material;
+pub mod material_marks;
 pub mod kcl;
 pub mod layout_anim;
 pub mod layout_json;
@@ -31,7 +32,6 @@ mod proof_tests;
 #[cfg(feature = "proof-tools")]
 pub use proof_tests::{clip_census, model_census};
 pub mod programs;
-pub mod hit_record;
 pub mod curves;
 pub mod mesh_order;
 pub mod model_ir;
@@ -82,6 +82,9 @@ pub struct Stats {
     pub left_out: Vec<LeftOut>,
     /// The pipelines the files cooked draw with (NebulaData/Pipelines.bin).
     pub pipelines: pipeline_list::Pipelines,
+    /// The disc's collision models cooked and proved (kcl::proof), and the octree leaves the proof walked.
+    pub collision_models: u64,
+    pub octree_leaves: u64,
 }
 
 impl Stats {
@@ -100,31 +103,30 @@ impl Stats {
         self.bytes_out += other.bytes_out;
         self.left_out.extend(other.left_out);
         self.pipelines.merge(other.pipelines);
+        self.collision_models += other.collision_models;
+        self.octree_leaves += other.octree_leaves;
     }
 
     pub fn summary(&self) -> String {
         let images: Vec<String> = self.images.iter().map(|(k, v)| format!("{k} {v}")).collect();
         #[allow(unused_mut)]
         let mut summary = format!(
-            "{} files cooked, {} expanded, {} left out, {} -> {} bytes; images: {}",
+            "{} files cooked, {} expanded, {} left out, {} -> {} bytes; images: {}; collision models proved: {}, octree \
+             leaves agreeing: {}",
             self.cooked_files,
             self.expanded_files,
             self.left_out.len(),
             self.bytes_in,
             self.bytes_out,
-            images.join(", ")
+            images.join(", "),
+            self.collision_models,
+            self.octree_leaves
         );
         #[cfg(feature = "proof-tools")]
         summary.push_str(&format!(
             "; tables proved: {}, reads agreeing: {}",
             table::proof::TABLES.load(std::sync::atomic::Ordering::Relaxed),
             table::proof::READS.load(std::sync::atomic::Ordering::Relaxed)
-        ));
-        #[cfg(feature = "proof-tools")]
-        summary.push_str(&format!(
-            "; collision models proved: {}, octree leaves agreeing: {}",
-            kcl::proof::MODELS.load(std::sync::atomic::Ordering::Relaxed),
-            kcl::proof::LEAVES.load(std::sync::atomic::Ordering::Relaxed)
         ));
         #[cfg(feature = "proof-tools")]
         summary.push_str(&format!(
@@ -362,7 +364,7 @@ pub fn cook_file(name: &str, bytes: Vec<u8>, stats: &mut Stats) -> Result<Option
     } else if matches!(extension(name).as_str(), "bct" | "csw") {
         Some(native_data::speaker(&bytes, &extension(name)).with_context(|| format!("{name}: speaker file"))?)
     } else if extension(name) == "kcl" {
-        Some(kcl::cook(&bytes).with_context(|| format!("{name}: collision"))?)
+        Some(kcl::cook(&bytes, stats).with_context(|| format!("{name}: collision"))?)
     } else if fur::is_fur_text(name) {
         Some(fur::cook(&bytes).with_context(|| format!("{name}: fur"))?)
     } else if bytes.starts_with(b"RFNT") {
@@ -473,7 +475,6 @@ pub fn write_cooked_pak(
     impl Drop for Collecting {
         fn drop(&mut self) {
             *texture::NAMES.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            hit_record::twins_clear();
         }
     }
     let _collecting = Collecting;
@@ -612,11 +613,6 @@ pub fn write_cooked_pak(
     let mut rows = texture::NAMES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     let item = StoreItem { path: String::new(), order: 0, bytes: Some(texture::names_table(&mut rows)) };
     placed.extend(place(&mut pak, &mut at, texture::NAMES_PATH, vec![item], stats)?);
-    // Ray tracing's tables: each stage's numbers and the particle effects' light (rt_materials.h set_rt_tables).
-    for (path, text) in [(RT_STAGES_PATH, RT_STAGES), (RT_EFFECTS_PATH, RT_EFFECTS)] {
-        let item = StoreItem { path: String::new(), order: 0, bytes: Some(text.as_bytes().to_vec()) };
-        placed.extend(place(&mut pak, &mut at, path, vec![item], stats)?);
-    }
     // Nebula's placeholder model, the object archive a mod's missing class draws (docs/modding/reference/lumascript/references.md
     // section 4).
     let item = StoreItem { path: PLACEHOLDER_MODEL.to_string(), order: 0, bytes: Some(placeholder_model()?) };
@@ -629,13 +625,6 @@ pub fn write_cooked_pak(
     pak.sync_all().context("game.pak cannot be flushed to storage")?;
     Ok(at)
 }
-
-/// Ray tracing's tables, as the renderer finds them in the pak (runtime/include/galaxy/render/rt_materials.h
-/// kRtStagesPath, kRtEffectsPath).
-const RT_STAGES_PATH: &str = "NebulaData/RtStages.tsv";
-const RT_EFFECTS_PATH: &str = "NebulaData/RtEffects.tsv";
-const RT_STAGES: &str = include_str!("../../data/rt_stages.tsv");
-const RT_EFFECTS: &str = include_str!("../../data/rt_effects.tsv");
 
 /// Nebula's placeholder archive in the store (references.md section 4): the game draws its model for a mod's missing
 /// class (LumaRefs.cpp), and the start check (3.13, mod_start_check.cpp) turns mods off when a store lacks it.
@@ -660,9 +649,23 @@ pub fn placeholder_sound() -> Result<Vec<u8>> {
     Ok(nsfx)
 }
 
+/// The placeholder model's file name without its extension: the stem its forms are cooked under.
+pub const PLACEHOLDER_STEM: &str = "NebulaPlaceholder";
+
 /// The placeholder's cooked model, from data/placeholder/model.gltf and its face.png (make_placeholder.py writes both),
 /// carried in the importer so every import cooks the same bytes.
 pub fn placeholder_model() -> Result<Vec<u8>> {
+    let (model, _) = gltf::to_files(&placeholder_source()?, None, PLACEHOLDER_STEM).context("the placeholder's model")?;
+    Ok(model)
+}
+
+/// The placeholder's model as the cook reads it: its program texts go in the game's program set (programs::write_set).
+pub fn placeholder_ir() -> Result<model_ir::ModelIr> {
+    Ok(gltf::to_ir(&placeholder_source()?, None).context("the placeholder's model")?.0)
+}
+
+/// data/placeholder/model.gltf with face.png inside it.
+fn placeholder_source() -> Result<Vec<u8>> {
     let mut source: serde_json::Value =
         serde_json::from_slice(include_bytes!("../../../../data/placeholder/model.gltf")).context("the placeholder's model.gltf")?;
     let face = include_bytes!("../../../../data/placeholder/face.png");
@@ -672,8 +675,7 @@ pub fn placeholder_model() -> Result<Vec<u8>> {
         }
         image["uri"] = serde_json::Value::String(format!("data:image/png;base64,{}", gltf::base64_text(face)));
     }
-    let (model, _) = gltf::to_files(&serde_json::to_vec(&source)?, None, "NebulaPlaceholder").context("the placeholder's model")?;
-    Ok(model)
+    Ok(serde_json::to_vec(&source)?)
 }
 
 /// main.dol in a system area (its header's sections give its length).

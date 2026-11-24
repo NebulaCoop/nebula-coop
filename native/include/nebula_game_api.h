@@ -26,7 +26,7 @@ extern "C" {
 
 /* Upstream Nebula's number for this interface. Co-op changes leave it as it is (docs/COOP_PLAN.md "Versions"): the
    host checks the module against the header's fingerprint (nebula_game_api_fingerprint), which the build works out. */
-#define NEBULA_GAME_API_VERSION 158u
+#define NEBULA_GAME_API_VERSION 163u
 
 
 /* The game's fixed step: nebula_game_run's loop runs this many steps a second (frame_wait paces them), whatever the
@@ -229,6 +229,8 @@ typedef enum NebulaShaderId {
     NEBULA_SHADER_FRAME_DEPTH = 41, /* the frame's depth as the game reads it, averaged over the pass's pixel */
     NEBULA_SHADER_PARTICLE_INSTANCES = 42, /* the particle material's vertex stage for NEBULA_ITEM_INSTANCES draws */
     NEBULA_SHADER_GLYPH_INSTANCES = 43, /* the font material's vertex stage for CharWriter's instanced glyphs */
+    NEBULA_SHADER_FLARE_SIGHT = 44, /* LensFlareDirector: how much of its bright object shows, from the frame's depth */
+    NEBULA_SHADER_FLARE_BLEND = 45, /* LensFlareDirector: the frame with the flare and without it, mixed by that share */
     NEBULA_SHADER_COUNT
 } NebulaShaderId;
 
@@ -625,7 +627,7 @@ enum {
     NEBULA_OPTION_MENU_TEXT_SIZE,    /* the menus' text in percent; 0: as the screen's size calls for */
     NEBULA_OPTION_WINDOW_WIDTH_DP,   /* the window's width in density-independent units; 0: not known */
     NEBULA_OPTION_MODS_CHANGED,      /* the mods chosen differ from those this run started with: a reset starts the game again */
-    NEBULA_OPTION_PREPARE_KIND,      /* what the preparation screen is for: 0 ray tracing, 1 mods' files, 2 the pipeline list */
+    NEBULA_OPTION_PREPARE_KIND,      /* what the preparation screen is for: 1 mods' files, 2 the pipeline list */
     NEBULA_OPTION_PREPARATION,       /* a preparation the title waits for (NebulaPrepare): 0 none, 1 it opens, 2 it runs
                                         (the preparation screen shows) */
     NEBULA_OPTION_PREPARE_PROGRESS,  /* while NEBULA_OPTION_PREPARATION is 2: its progress, 0 to 10000, never going back */
@@ -633,7 +635,6 @@ enum {
     NEBULA_OPTION_TOUCH_POINTER,       /* 0 no touch screen, 1 one, 2 the finger has the pointer, 3 and the game is on a
                                           menu: no pointer shows under a finger there */
     NEBULA_OPTION_GRAPHICS_BACKEND,    /* the renderer's backend, the same all session: 1 D3D12, 2 Vulkan, 3 D3D11 (draw.native) */
-    NEBULA_OPTION_RAY_TRACING,         /* what ray tracing asks of the game now (NEBULA_RAY_TRACING_*); 0: nothing */
     NEBULA_OPTION_SCENE_TEXTURES,      /* 1 while texture packs' replacements of the textures a loaded scene made are still
                                           loading: the scene starts once this is 0 */
 };
@@ -643,17 +644,6 @@ enum {
     NEBULA_POST_OK = 0,        /* *program is the compiled program (never 0) */
     NEBULA_POST_COMPILE = 1,   /* the device's compiler refused the text: its first error in `error` */
     NEBULA_POST_NO_MOTION = 2, /* it reads motion and the frame has no motion vectors (temporal upscaling off) */
-};
-
-/* NEBULA_OPTION_RAY_TRACING's bits. */
-enum {
-    NEBULA_RAY_TRACING_ON = 1u << 0,          /* the renderer traces its shadows and lights */
-    NEBULA_RAY_TRACING_SHADOW_SETS = 1u << 1, /* a zone's shadow light set (the artists' darker lights for actors in a
-                                                 shade) gives way to the lit set it darkens: the traced shadow darkens
-                                                 them, once */
-    NEBULA_RAY_TRACING_MIRROR = 1u << 2,      /* reflections are traced at High: the game draws no mirror pass (a
-                                                 mirror's own view, captured for its surface); the surface's fetch of
-                                                 the capture takes the traced reflection in its place (12.5) */
 };
 
 /* The movie player's sound (movie_audio_control). */
@@ -845,8 +835,6 @@ enum {
     NEBULA_SETTINGS_STATUS_LEAVE,            /* leaving with changes not applied: apply them or discard them? */
     NEBULA_SETTINGS_STATUS_MODS_RESTART_ASK, /* mod changes applied: restart now? yes: APPLY, later: CLOSE */
     NEBULA_SETTINGS_STATUS_JOYCON,           /* Pair Joy-Con: `status_number` NEBULA_JOYCON_* bits; CLOSE leaves */
-    NEBULA_SETTINGS_STATUS_RT_RESTART_ASK,   /* ray tracing turned on before its shaders are prepared (they are at the
-                                                next start): restart now? yes: APPLY, later: CLOSE */
     NEBULA_SETTINGS_STATUS_DIAGNOSTICS_ASK,  /* restart and record a diagnostics run (the launcher's recording)? yes:
                                                 APPLY, no: CLOSE */
     NEBULA_SETTINGS_STATUS_MODS_CODE_ASK,    /* a mod turned on brings code (`status_text`: its name): allow it? yes:
@@ -963,6 +951,18 @@ typedef struct NebulaSettingsRow {
     uint16_t slider_at;
 } NebulaSettingsRow;
 
+/* The finger on a touch screen as Nebula's menus take it (menu_finger): the picture from -1 to 1 each way, left and top
+   -1, as the pointer's (MR::getPointerPastPos). A touch that came and went between two reads shows as a new `touch` with
+   `down` 0: a tap where it was lifted, or a flick. */
+typedef struct NebulaMenuFinger {
+    uint32_t touch;  /* counts the touches: a new value is a finger come down */
+    uint32_t down;   /* 1 while it is on the screen */
+    uint32_t moved;  /* 1 once it went past the display's touch slop since it came down: a drag, never a tap */
+    float x, y;      /* where it is, or where it was lifted */
+    float land_x, land_y; /* where it came down */
+    float vx, vy;    /* its speed as it was lifted, in the same units a second (0 when it held still first) */
+} NebulaMenuFinger;
+
 typedef struct NebulaSettingsView {
     uint32_t open;
     uint32_t page;
@@ -1015,7 +1015,6 @@ typedef struct NebulaSettingsView {
 /* What a benchmark step measures (NebulaBenchmarkState). */
 enum {
     NEBULA_BENCHMARK_PART_YOURS = 0, /* the player's settings */
-    NEBULA_BENCHMARK_PART_STANDARD,  /* the standard settings (1920x1080, High), the same on every device */
     NEBULA_BENCHMARK_PART_PROBE,     /* one optional pass, alone, to price it */
     NEBULA_BENCHMARK_PART_AGAIN,     /* the first stage again, the device warmed up */
 };
@@ -1025,7 +1024,7 @@ typedef struct NebulaBenchmarkState {
     uint32_t step;       /* the step running, from 1 */
     uint32_t steps;      /* the run's steps */
     uint32_t part;       /* NEBULA_BENCHMARK_PART_* */
-    uint32_t showing;    /* 1 while the step's stage is on screen (its opening, warming up or measured); 0 while it
+    uint32_t showing;    /* 1 while the step's stage is on screen (under the cover until play, warming up or measured); 0 while it
                             loads */
     uint32_t fps_tenths; /* pictures shown a second (every present) over the last second, in tenths; 0 not known */
     uint32_t progress;   /* the whole run, 0 to 10000, never going back */
@@ -1183,13 +1182,6 @@ typedef enum NebulaClearChannels {
     NEBULA_CLEAR_ALPHA = 2u,
     NEBULA_CLEAR_DEPTH = 4u
 } NebulaClearChannels;
-
-/* A point of the picture the game asks about (NEBULA_PASS_PROBE). */
-typedef struct NebulaScreenProbe {
-    float x, y;
-    float user_x, user_y, user_z;
-    float value; /* the depth, 0 near to 1 far */
-} NebulaScreenProbe;
 
 typedef struct NebulaHostServices {
     uint32_t version;
@@ -1390,9 +1382,6 @@ typedef struct NebulaHostServices {
     uint32_t (*pipeline_register)(void* user, const NebulaPipelineDesc* desc, const NebulaLayoutInput* inputs);
     /* The frame's list. The renderer owns it until it sets `released`; nothing waits. */
     void (*submit_frame)(void* user, NebulaFrameList* list);
-    /* `channel`'s latest finished probes with their values, at most `capacity`; how many (0 before any has finished).
-       Never waits for the GPU. */
-    uint32_t (*probe_results)(void* user, uint32_t channel, NebulaScreenProbe* probes, uint32_t capacity);
     /* The players input_read serves (0 to this - 1), fixed for the session. */
     uint32_t (*input_players)(void* user);
     /* The player chose to pause the game when its window loses focus (runtime settings, focus_loss) and the window has: 1 once
@@ -1455,6 +1444,12 @@ typedef struct NebulaHostServices {
     /* While a benchmark runs (Nebula --benchmark 1): `state` filled, 1; else 0 and nothing written. The game shows its
        run panel from it; the host takes the stop (Escape, a controller's B, Android's back). Game thread. */
     int32_t (*benchmark_state)(void* user, NebulaBenchmarkState* state);
+    /* The finger on a touch screen, for Nebula's menus (NebulaMenuFinger): 1 and `finger` filled while a finger is the
+       pointer, 0 while a mouse moved last or none has touched. Game thread. */
+    int32_t (*menu_finger)(void* user, NebulaMenuFinger* finger);
+    /* Returns once a save_request's `status` has left NEBULA_SAVE_PENDING, the thread asleep meanwhile (an acquire
+       load: the request's buffer and length are the host's result). Game thread. */
+    void (*save_wait)(void* user, const int32_t* status);
     /* Online co-op: a mod's chat command (the coop service's add_command, sm64coopdx's hook_chat_command), on the chat
        for the rest of the run: /`name` with `description` as its /help line, `options` its words split by spaces (null
        or "": a "[On|Off]" in the description gives them). 1: added; 0: the name is taken or not a name. Game thread. */
@@ -1487,8 +1482,6 @@ enum {
     NEBULA_CONTEXT_TILT_SECTION,          /* 0 none, 1 Mario on a Star Ball, 2 on a Ray: tilt steers */
     NEBULA_CONTEXT_FRAME_GENERATION,      /* each frame: 1 while the game shows play (no menu, window or full-screen
                                              page): DLSS Frame Generation may add frames (NebulaFrameGen) */
-    NEBULA_CONTEXT_CAMERA_WATER,          /* each frame: the camera's depth under water in units, at least 1 (0: out
-                                             of water; MR::isCameraInWater): ray tracing's water medium */
     NEBULA_CONTEXT_TOUCH_TARGET,          /* each frame, on a touch screen, for each thing in reach the pointer grabs (a pull
                                              star): its circle on the screen, bits 0-11 x and 12-23 y (0..4095 across), bits
                                              24-31 the radius (255: the screen's height) */

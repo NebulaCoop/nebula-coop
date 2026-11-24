@@ -1,9 +1,10 @@
 #include "Game/Scene/GameScene.hpp"
+#include "Game/NameObj/LoadSlice.hpp"
 #include "Game/System/NebulaMods.hpp"
 #include "Game/System/NebulaLoadTrace.hpp"
 #include <nebula_module.h>
 #include "Game/Render/FrameList.hpp"
-#include "Game/Util/GameLightSignal.hpp"
+#include "Game/System/LumaDrawLight.hpp"
 #include "Game/Util/MotionSignal.hpp"
 #include "Game/System/GameDataFunction.hpp"
 #include "Game/LiveActor/LiveActor.hpp"
@@ -37,7 +38,6 @@
 #include "Game/Map/OceanBowl.hpp"
 #include "Game/Map/OceanRing.hpp"
 #include "Game/Map/OceanSphere.hpp"
-#include "Game/Map/WaterAreaHolder.hpp"
 #include "Game/Map/WaterPoint.hpp"
 #include "Game/Scene/SceneObjHolder.hpp"
 #include "Game/Player/MarioAccess.hpp"
@@ -193,8 +193,8 @@ void GameScene::init() {
 // What needs the scenario: the star the player chose (MR::tryResumeSceneInitialize).
 bool GameScene::initAfterScenarioChosen() {
     if (!MR::isScenarioDecided()) return true;
-    const auto* host = nebula_host();
-    const uint64_t deadline = host->clock_ns(host->user) + 4'000'000u;
+    // A fixed count of items each frame (P-260): the same frames on every machine, whatever its speed.
+    LoadSlice slice(LoadSlice::cItemsPerFrame);
     do {
         switch (mInitializePhase) {
         case 0:
@@ -217,7 +217,7 @@ bool GameScene::initAfterScenarioChosen() {
             initSequences();
             break;
         case 3:
-            if (!SceneFunction::startActorPlacementStep(deadline)) return false;
+            if (!SceneFunction::startActorPlacementStep(slice)) return false;
             break;
         case 4:
             NebulaAchievementLuma::tryCreate();
@@ -232,7 +232,7 @@ bool GameScene::initAfterScenarioChosen() {
             while (mReservePiecesLeft != 0u) {
                 MR::getStarPieceDirector()->createStarPieces(1);
                 --mReservePiecesLeft;
-                if (host->clock_ns(host->user) >= deadline) return false;
+                if (slice.spend()) return false;
             }
             break;
         case 6:
@@ -253,7 +253,7 @@ bool GameScene::initAfterScenarioChosen() {
             return true;
         }
         ++mInitializePhase;
-    } while (host->clock_ns(host->user) < deadline);
+    } while (!slice.spend());
     return false;
 }
 
@@ -413,7 +413,37 @@ void GameScene::start() {
     }
 }
 
+// The settings' galaxy select (its ONLINE page's cheats) names its galaxies and stars in the game's own words, asked once. The
+// names are the game's message data, not the scene's: answered by the system each frame, the scene held or not
+// (GameSystem::updateSceneController), never from a draw (P-261).
+void GameScene::answerGalaxySelectNames() {
+    if (NebulaHost::galaxySelectNamesWanted() == 0) {
+        return;
+    }
+    MR::FormattedName id;
+    u32 stars = 0;
+    for (u32 i = 0; ::getGalaxySelectStage(i, &id, &stars) != 0; ++i) {
+        NebulaHost::galaxySelectName(i, 0, reinterpret_cast< const u16* >(MR::getGalaxyNameOnCurrentLanguage(id.c_str())));
+        for (u32 star = 1; star <= stars; ++star) {
+            NebulaHost::galaxySelectName(i, star,
+                                         reinterpret_cast< const u16* >(MR::getScenarioNameOnCurrentLanguage(id.c_str(), star)));
+        }
+    }
+}
+
 void GameScene::update() {
+    // A travel the player asked for in the settings' galaxy select, taken at the step's start as this step's input
+    // (P-261), through the game's own stage change; with the Grand Stars, the Observatory they power.
+    {
+        char stage[64];
+        int32_t star = 0;
+        const int travel = NebulaHost::galaxyTravel(stage, sizeof(stage), &star);
+        if (travel == NEBULA_GALAXY_TRAVEL_STAGE) {
+            NebulaModCalls::changeStage(stage, star);
+        } else if (travel == NEBULA_GALAXY_TRAVEL_GRAND_STARS) {
+            NebulaModCalls::setGrandStars(star, stage);
+        }
+    }
     NebulaMods::stageFrame();
     updateMenusLeftOpen();
     mPauseCtrl->updateNerve();
@@ -481,35 +511,6 @@ void GameScene::draw() const {
     // The scene shows play, whatever is over it: the HDR calibration's reference stage is ready once it does.
     NebulaHost::gameContext(NEBULA_CONTEXT_SCENE_PLAY,
                             !MR::isActiveMoviePlayer() && isNerve(GET_NERVE(GameScene, GameSceneAction)) ? 1 : 0);
-    // Where the camera is in water, how deep: ray tracing lights the water it looks through.
-    {
-        const f32 depth = MR::isCameraInWater() ? WaterAreaFunction::getCameraWaterDepth() : -1.0f;
-        NebulaHost::gameContext(NEBULA_CONTEXT_CAMERA_WATER, depth < 0.0f ? 0 : static_cast< s32 >(depth) + 1);
-    }
-    // The settings' galaxy select (its ONLINE page's cheats) names its galaxies and stars in the game's own words, asked once.
-    if (NebulaHost::galaxySelectNamesWanted() != 0) {
-        MR::FormattedName id;
-        u32 stars = 0;
-        for (u32 i = 0; ::getGalaxySelectStage(i, &id, &stars) != 0; ++i) {
-            NebulaHost::galaxySelectName(i, 0, reinterpret_cast< const u16* >(MR::getGalaxyNameOnCurrentLanguage(id.c_str())));
-            for (u32 star = 1; star <= stars; ++star) {
-                NebulaHost::galaxySelectName(i, star,
-                                         reinterpret_cast< const u16* >(MR::getScenarioNameOnCurrentLanguage(id.c_str(), star)));
-            }
-        }
-    }
-    // A travel the player asked for in the settings' galaxy select, through the game's own stage change; with the Grand
-    // Stars, the Observatory they power.
-    {
-        char stage[64];
-        int32_t star = 0;
-        const int travel = NebulaHost::galaxyTravel(stage, sizeof(stage), &star);
-        if (travel == NEBULA_GALAXY_TRAVEL_STAGE) {
-            NebulaModCalls::changeStage(stage, star);
-        } else if (travel == NEBULA_GALAXY_TRAVEL_GRAND_STARS) {
-            NebulaModCalls::setGrandStars(star, stage);
-        }
-    }
     LightFunction::initLightRegisterAll();
     CategoryList::execute(MR::DrawType_MiiFaceIcon);
     CategoryList::execute(MR::DrawType_MiiFaceNew);
@@ -733,7 +734,7 @@ void GameScene::draw3D() const {
     MotionSignal::sceneCamera(sceneCamera);
     NebulaHost::gameStage(MR::getCurrentStageName());
     Frame::sceneBegin(sceneCamera);
-    GameLightSignal::frame();
+    luma::draw::light::frame();  // the mods' lights (draw.light); one load while no mod has one
     CategoryList::execute(MR::DrawType_AstroDomeSkyClear);
     MR::loadViewMtx();
     MR::loadProjectionMtx();
@@ -752,7 +753,6 @@ void GameScene::draw3D() const {
     CategoryList::execute(MR::DrawType_PlayerSilhouette);
     SceneFunction::executeDrawSilhouetteAndFillShadow();
     SceneFunction::executeDrawAlphaShadow();
-    MR::setLensFlareDrawSyncToken();
     Frame::setPassAlpha(false);
     SceneFunction::executeDrawBufferListNormalOpa();
     SceneFunction::executeDrawListOpa();
@@ -767,8 +767,6 @@ void GameScene::draw3D() const {
     CategoryList::execute(MR::DrawType_CaptureScreenIndirect);
     SceneFunction::executeDrawAfterIndirect();
     CategoryList::execute(MR::DrawType_PlayerSearchLight);
-    MR::setStarPointerDrawSyncToken();
-    MR::setTalkDirectorDrawSyncToken();
     SceneFunction::executeDrawImageEffect();
     MR::loadViewMtx();
     MR::loadProjectionMtx();
@@ -778,6 +776,8 @@ void GameScene::draw3D() const {
     MR::loadLightPlayer();
     CategoryList::execute(MR::DrawType_PlayerIndirect);
     luma::draw::point(LUMA_DRAW_WORLD_AFTER);
+    // How much of the flare's bright object the whole scene leaves seen, while its depth stands.
+    MR::drawLensFlareSight();
     Frame::sceneEnd();
     luma::draw::post::stage(LUMA_DRAW_POST_WORLD);  // the mods' post programs over the scene (one load with none)
     MR::clearZBuffer();
@@ -949,11 +949,6 @@ bool GameScene::isDrawMirror() const {
     }
 
     if (isPlayMovie()) {
-        return false;
-    }
-
-    // Reflections traced at High: the mirror's surface takes the traced reflection in its capture's place (12.5).
-    if ((NebulaHost::option(NEBULA_OPTION_RAY_TRACING) & static_cast< u32 >(NEBULA_RAY_TRACING_MIRROR)) != 0) {
         return false;
     }
 

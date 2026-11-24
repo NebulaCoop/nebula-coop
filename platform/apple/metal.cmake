@@ -30,9 +30,7 @@ add_custom_command(OUTPUT "${nebula_apple_utility_msl_dir}/utility_msl_data.h"
 get_target_property(nebula_apple_vk_sources galaxy_render_vk SOURCES)
 set(nebula_apple_mtl_sources)
 foreach(source IN LISTS nebula_apple_vk_sources)
-    # The tracer's shader table is the other renderers' bytes (rt_shaders.cpp): Metal's has none (mtl/rt_backend_mtl.cpp).
-    if(source MATCHES "/render/vk/" OR source MATCHES "_vk\\.cpp$" OR source MATCHES "utility_spirv_data\\.h$"
-       OR source MATCHES "/render/rt/rt_shaders\\.cpp$" OR source MATCHES "rt_shaders_spirv\\.h$")
+    if(source MATCHES "/render/vk/" OR source MATCHES "_vk\\.cpp$" OR source MATCHES "utility_spirv_data\\.h$")
         continue()
     endif()
     list(APPEND nebula_apple_mtl_sources "${source}")
@@ -51,7 +49,7 @@ target_compile_features(galaxy_render_mtl PUBLIC cxx_std_20)
 # The game's version, from the main project's file (as platform/sdl reads it for its own targets).
 file(STRINGS "${nebula_root}/CMakeLists.txt" nebula_apple_project_line REGEX "^project\\(Nebula VERSION ")
 string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+" nebula_apple_version "${nebula_apple_project_line}")
-target_compile_definitions(galaxy_render_mtl PUBLIC NEBULA_GPU_METAL NEBULA_VERSION="${nebula_apple_version}")
+target_compile_definitions(galaxy_render_mtl PUBLIC NEBULA_GPU_METAL NEBULA_VERSION="${nebula_apple_version}${NEBULA_VERSION_SUFFIX}")
 if(TARGET nebula_archive)
     target_compile_definitions(galaxy_render_mtl PUBLIC NEBULA_MOD_IMPORT=1)
     target_link_libraries(galaxy_render_mtl PUBLIC nebula_archive)
@@ -107,6 +105,7 @@ target_link_libraries(nebula_metal PRIVATE galaxy_render_mtl SDL3::SDL3
 # audio_device_apple.mm, display_clock_apple.mm): AppKit, Game Controller, Core Haptics, Core Audio. No SDL.
 add_executable(nebula_native
     "${nebula_root}/native/host/host_main.cpp"
+    "${nebula_root}/runtime/src/whole_lines.cpp"
     "${nebula_root}/platform/sdl/native_game_host_sdl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/host_window_apple.mm"
     "${CMAKE_CURRENT_SOURCE_DIR}/luma_system_apple.mm"

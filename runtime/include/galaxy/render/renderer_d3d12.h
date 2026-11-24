@@ -21,6 +21,7 @@
 #include <d3d12sdklayers.h>
 #include <wrl/client.h>
 
+#include "galaxy/render/temporal_hold.h"
 #include "galaxy/render/fsr_frame_generation.h"
 #include "galaxy/render/utility_shaders.h"
 #include "galaxy/render/frame_pass.h"
@@ -28,19 +29,21 @@
 #include "galaxy/render/gpu_upload_ring.h"
 #include "galaxy/render/post_process.h"
 #include "galaxy/render/display_modes.h"
+#include "galaxy/render/dxgi_memory.h"
 #include "galaxy/render/os_hdr.h"
 #include "galaxy/render/ambient_occlusion.h"
 #include "galaxy/render/scene_camera.h"
 #include "galaxy/render/game_bloom.h"
-#include "galaxy/render/rt_types.h"
-#include "galaxy/render/rt/rt_backend.h"
+#include "galaxy/render/scene_view.h"
 #include "galaxy/render/gpu_placed_textures.h"
+#include "galaxy/render/gpu_pass_times.h"
 #include "galaxy/render/texture_sampler.h"
 #include "galaxy/render/gpu_types.h"
 #include "galaxy/render/renderer_common.h"
 #include "render/core/gpu_encoder.h"
 #include "render/core/draw_record.h"
 #include "galaxy/render/render_config.h"
+#include "galaxy/render/present_slots.h"
 #include "galaxy/render/window_owner.h"
 #include "galaxy/render_api.h"
 #include "galaxy/render/mod_post.h"
@@ -61,6 +64,7 @@
 #include <atomic>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace galaxy::render {
@@ -102,8 +106,6 @@ inline constexpr DXGI_FORMAT kTargetColorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 inline constexpr DXGI_FORMAT kSceneHdrColorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 // Motion vectors for temporal upscaling: render pixels, current -> previous.
 inline constexpr DXGI_FORMAT kMotionVectorFormat = DXGI_FORMAT_R16G16_FLOAT;
-// The tracer's prepass: each pixel's item of the frame's list, from 1 (0: none), and the item's triangle there.
-inline constexpr DXGI_FORMAT kItemFormat = DXGI_FORMAT_R32G32_UINT;
 // Reactive mask for temporal upscaling: blended draws' alpha, max-blended.
 inline constexpr DXGI_FORMAT kReactiveMaskFormat = DXGI_FORMAT_R8_UNORM;
 // The effects layer (kRenderStateLayerTarget): its colour (what the effects added, as they blended into the scene target) and
@@ -165,8 +167,20 @@ public:
         D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
         D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
     };
-    // Reserves `count` consecutive slots; the caller writes views at `cpu`.
+    // Reserves `count` consecutive slots; the caller writes views at `cpu` (write_view).
     Table allocate(unsigned count);
+    // Writes a view of `resource` (nullptr: a null view) at `at`, a slot of a table of this ring (allocate). A view is
+    // made once, into a CPU-only cache, and copied from there after: the same resource and description again cost a
+    // descriptor copy, not a view creation. The cache holds a reference to each resource it has a view of, so no new
+    // resource takes that address while the view is kept; begin_frame drops the views no frame wrote in the last
+    // frames_in_flight + 1 frames. A UAV has no counter resource.
+    void write_view(D3D12_CPU_DESCRIPTOR_HANDLE at, ID3D12Resource* resource,
+                    const D3D12_SHADER_RESOURCE_VIEW_DESC& desc);
+    void write_view(D3D12_CPU_DESCRIPTOR_HANDLE at, ID3D12Resource* resource,
+                    const D3D12_UNORDERED_ACCESS_VIEW_DESC& desc);
+    // Views made since initialize (the cache's misses) and views kept now: tests and diagnostics.
+    [[nodiscard]] std::uint64_t views_made() const noexcept { return views_made_; }
+    [[nodiscard]] std::size_t views_kept() const noexcept { return views_.size(); }
     // Copies this frame's tables from the shadow heap into the heap (before the frame's command list is submitted).
     void flush();
 
@@ -190,7 +204,7 @@ public:
         replaced_owner_ = owner;
     }
     // The heaps growth replaced, for the renderer to free once the GPU is past the commands that may read them.
-    [[nodiscard]] std::vector<Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>> take_replaced() noexcept { return std::move(replaced_); }
+    [[nodiscard]] std::vector<Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>> take_replaced() noexcept { return std::exchange(replaced_, {}); }
     // The most a frame's segment and the persistent region have held (diagnostics). A segment that a frame fills doubles, as the
     // persistent region does (grow_frames); its first size is kSrvPerFrame.
     [[nodiscard]] unsigned frame_high_water() const noexcept { return frame_high_water_; }
@@ -232,6 +246,34 @@ private:
     [[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE heap_cpu_at(unsigned index) const noexcept;  // a ring index, past the textures
     void fill_null(unsigned index, unsigned count);
     void copy_in(unsigned index, unsigned count);  // shadow -> heap, both by ring index
+    // The view cache (write_view). A key is the resource, the kind of view and the description's fields that its dimension
+    // reads, each at a fixed place in bytes that are otherwise zero (a description's padding never reaches the key).
+    struct ViewKey {
+        ID3D12Resource* resource = nullptr;
+        std::uint32_t kind = 0u;  // 0 SRV, 1 UAV
+        std::array<unsigned char, 48> desc{};
+        bool operator==(const ViewKey& other) const noexcept {
+            return resource == other.resource && kind == other.kind && desc == other.desc;
+        }
+    };
+    struct ViewKeyHash {
+        std::size_t operator()(const ViewKey& key) const noexcept;
+    };
+    struct KeptView {
+        Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+        unsigned slot = 0u;
+        std::uint64_t written_frame = 0u;
+    };
+    // The cache's slot for `key` (`made`: it was missing, and the caller makes the view there); a null handle when the
+    // cache cannot grow (the caller makes the view in place).
+    D3D12_CPU_DESCRIPTOR_HANDLE view_slot(const ViewKey& key, ID3D12Resource* resource, bool& made);
+    std::unordered_map<ViewKey, KeptView, ViewKeyHash> views_;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> view_heap_;  // CPU only
+    std::vector<unsigned> free_view_slots_;
+    unsigned view_capacity_ = 0u;
+    unsigned view_next_ = 0u;
+    std::uint64_t view_frame_ = 0u;
+    std::uint64_t views_made_ = 0u;
     ID3D12Device* device_ = nullptr;
     D3D12_DESCRIPTOR_HEAP_TYPE type_{};
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap_;
@@ -290,9 +332,9 @@ public:
     // A sampler's place in the sampler heap, made the first time it is asked for (until the heap starts again:
     // sampler_generation changes).
     [[nodiscard]] std::uint32_t sampler_slot(const SamplerKey& key);
-    // `count` pairs {texture slot, sampler slot} into this frame's texture lists: the buffer they went to and the first
-    // pair's place in it (DrawRoot::table).
-    void write_texture_list(const std::uint32_t* pairs, std::uint32_t count, gpu::Address& lists, std::uint32_t& first);
+    // A chunk of the texture lists (core::TextureLists, FRAME-MODEL 2.10): `pairs` pairs of mapped memory the programs
+    // read at `address`, kept until the renderer is taken down. False when it cannot be made.
+    bool make_texture_list_chunk(std::uint32_t pairs, std::uint32_t*& mapped, gpu::Address& address);
     // The texture cache records its uploads into this frame's command list.
     void attach_texture_uploads(TextureStore& cache);
     // The adapter's local video memory in use by this process and the OS's budget for it (DXGI QueryVideoMemoryInfo), read at
@@ -362,7 +404,7 @@ public:
     // scene target is a second target at the window's integer scale, so the 2D layer
     // renders at display resolution over the resampled scene. The two target
     // sets share layout and resource states and are swapped as a whole, so
-    // every scene target path (draws, clears, copies, probes) works unchanged on either.
+    // every scene target path (draws, clears, copies) works unchanged on either.
     // begin_output_scene returns false when the split is off or the scene target already
     // covers the window.
     [[nodiscard]] bool begin_output_scene(bool resolve_msaa_only = false);
@@ -389,49 +431,14 @@ public:
     void record_scene_aa();
     // The 3D scene in a wide target while `wanted` (the enhanced lighting), its camera at the end (scene_camera.h).
     bool begin_wide_scene(bool wanted, const SceneClearValues* initial_clear = nullptr);
-    void end_wide_scene(unsigned finish = 0u);  // finish: the traced relight's camera (scene_camera.hlsl g_finish)
+    void end_wide_scene();
     // Ambient occlusion (ambient_occlusion.h) of the scene drawn so far, from the view `set_scene_ao_view` gave:
     // after the opaque phases, before the translucent ones.
     [[nodiscard]] bool ambient_occlusion_ready() const noexcept { return ambient_occlusion_.ready(); }
-    void set_scene_ao_view(const RtView& view) noexcept { scene_ao_view_ = view; }
+    void set_scene_ao_view(const SceneView& view) noexcept { scene_ao_view_ = view; }
     // The scene's models (ambient_occlusion_objects.h).
     void set_scene_ao_objects(std::vector<ao::ObjectOccluder>& objects) noexcept { scene_ao_objects_.swap(objects); }
     void record_scene_ao();
-    // What the tracer records through (rt_backend.h Backend::begin: the frame's commands, no pass open, and where a
-    // pass's views go), timed as the ray tracing pass until rt_commands_end.
-    struct RtCommands {
-        void* commands = nullptr;
-        void* descriptors = nullptr;
-    };
-    [[nodiscard]] RtCommands rt_commands_begin();
-    void rt_commands_end();
-    // The scene's depth as a pass reads it, until rt_depth_end, with its size and the format an image must have to be
-    // copied over the scene's colour (rt_copy_to_scene). With `color_view`, the scene's colour as drawn so far for the
-    // pass to read as well. False when no pass can read them now (a multisampled scene).
-    [[nodiscard]] bool rt_depth_begin(rt::TextureView& depth, unsigned& width, unsigned& height, rt::ImageFormat& color,
-                                      rt::TextureView* color_view = nullptr);
-    void rt_depth_end();
-    // An image of the tracer's (Backend::image_to_copy) over the scene's colour: the tracer's views.
-    void rt_copy_to_scene(void* image);
-    // The tracer's prepass: the item target (each pixel's item of the list, from 1; 0 none) beside the scene's depth,
-    // made at the scene's size and cleared. Draws of aux kAuxPrepass write it. False when there can be none (a
-    // multisampled scene).
-    [[nodiscard]] bool rt_items_begin();
-    // The scene's depth and the item target as a pass reads them, until rt_light_end.
-    [[nodiscard]] bool rt_light_begin(rt::TextureView& depth, rt::TextureView& items, unsigned& width, unsigned& height);
-    void rt_light_end();
-    // The reactive mask as the tracer writes it, at the scene's end: false without one this frame or where
-    // the device cannot. Until rt_reactive_end.
-    [[nodiscard]] bool rt_reactive_begin(rt::TextureView& reactive);
-    void rt_reactive_end();
-    // The tracer's outside denoiser this frame (rt_denoiser.h: DLSS Ray Reconstruction), null for the built-in filters.
-    [[nodiscard]] rt::Denoiser* rt_denoiser() noexcept { return temporal_ ? temporal_->denoiser() : nullptr; }
-    // An image of the tracer's (Backend::image_to_sample) as a texture the draws' programs read: its place among the
-    // textures (the view constants' view_traced). `which`: 0 the traced light, 1 the added light.
-    [[nodiscard]] std::uint32_t rt_publish_light(void* image, TextureStore& textures, unsigned which = 0u);
-    // The tracer stops while the game runs: its pictures leave the draws (their views retire), after the GPU is idle.
-    void rt_unpublish_lights(TextureStore& textures);
-    void rt_wait_idle() { wait_for_gpu(); }
     // The game's bloom (game_bloom.h): `kind` a NEBULA_PASS_BLOOM_*, `a` and `b` its values.
     [[nodiscard]] bool game_bloom_ready() const noexcept { return game_bloom_.ready(); }
     void game_bloom(std::uint32_t kind, std::uint32_t a, std::uint32_t b);
@@ -462,11 +469,9 @@ public:
     [[nodiscard]] double gpu_ms_per_tick() const noexcept {
         return timestamp_frequency_ != 0u ? 1000.0 / static_cast<double>(timestamp_frequency_) : 0.0;
     }
-    // Smoothed GPU time of a frame that drew the scene (0 until measured): the tracer's build budget.
-    [[nodiscard]] double scene_gpu_ema_ms() const noexcept { return native_scene_gpu_ema_ms_; }
-    // After scene_temporal_begin, in a temporal scene or one the ray tracing
-    // engine lights (its histories follow moving surfaces by the motion; no
-    // jitter, no upscale): clears the motion target for the scene. False
+    // Smoothed GPU time of a frame that drew the scene (0 until measured).
+    [[nodiscard]] double scene_gpu_ema_ms() const noexcept { return frame_gpu_.scene_ema_ms(); }
+    // After scene_temporal_begin, in a temporal scene: clears the motion target for the scene. False
     // otherwise or when it could not be created (no motion writers).
     [[nodiscard]] bool begin_motion_scene();
     // RendererVk's: a clear here opens no render pass to keep.
@@ -513,20 +518,17 @@ public:
         return measured_present_hz_.load(std::memory_order_relaxed);
     }
     // Smoothed GPU time of one generated frame (0 until measured), for the budget.
-    [[nodiscard]] double generated_gpu_ema_ms() const noexcept { return generated_gpu_ema_ms_; }
+    [[nodiscard]] double generated_gpu_ema_ms() const noexcept { return frame_gpu_.generated_ema_ms(); }
     [[nodiscard]] double interpolation_gpu_cost_ms() const noexcept {
-        return temporal_interpolation() ? generated_gpu_ema_ms_ : native_scene_gpu_ema_ms_;
+        return temporal_interpolation() ? frame_gpu_.generated_ema_ms() : frame_gpu_.scene_ema_ms();
     }
     // The GPU cannot afford a generated frame per presented frame: the game frames take
     // the temporal upscaler (60 presents) until the display or upscaler
     // settings change.
     void suspend_temporal_interpolation(double ms_per_frame);
-    void reset_generated_gpu_ema() noexcept { generated_gpu_ema_ms_ = 0.0; }
+    void reset_generated_gpu_ema() noexcept { frame_gpu_.reset_generated_ema(); }
     void take_generated_gpu_ms(double& total_ms, std::uint64_t& samples) noexcept {
-        total_ms = generated_gpu_ms_;
-        samples = generated_gpu_samples_;
-        generated_gpu_ms_ = 0.0;
-        generated_gpu_samples_ = 0u;
+        frame_gpu_.take_generated(total_ms, samples);
     }
 // The scene camera's clip planes and vertical field of view (radians).
     // Generated frame draws drawn with blended vertices since the last call.
@@ -602,23 +604,14 @@ public:
     // diagnostic buffers never suppress the required blit/presentation.
     bool present(const DisplayTexture* source, bool capture_backbuffer = false, bool black = false);
 
-    // Render-owner only. Each point's depth (0 near, 1 far) into slot `slot`'s readback, in the open frame where the
-    // stream is now; screen_probes_finished names the values, one float a point, once that frame's fence has passed.
-    // `compared` probes are answered with their depth too: the read breaks no render pass here.
-    [[nodiscard]] bool record_screen_probes(std::size_t slot, std::span<const ScreenProbe> probes, bool compared);
-    [[nodiscard]] const float* screen_probes_finished(std::size_t slot);  // throws when the device is gone
-    bool debug_copy_scene_to_readback();
-    void debug_log_readback();
+    // Writes every test capture whose frame the GPU has finished.
     void debug_log_backbuffer_readback();
     bool debug_copy_selected_display_to_readback(const DisplayTexture& source);
-    void debug_log_selected_display_readback();
     // The backend binds the exact output paths to the frame before recording
     // its optional readbacks. Paths are retained with the pending readback so
     // a later nonblocking completion cannot write to a subsequent frame's
     // diagnostic file.
-    void set_debug_capture_paths(
-        std::string scene_ppm_path,
-        std::string backbuffer_ppm_path);
+    void set_debug_capture_paths(std::string backbuffer_ppm_path);
 
     [[nodiscard]] ID3D12Device* device() const { return device_.Get(); }
     [[nodiscard]] const FrameMap& frame_map() const noexcept { return frame_; }
@@ -648,6 +641,10 @@ public:
     [[nodiscard]] double display_refresh_hz() const noexcept { return display_refresh_hz_; }
     // The display's vblanks (host_window::vblank_grid): the latest and the interval, on galaxy::qpc_now()'s clock.
     [[nodiscard]] bool vblank_grid(std::int64_t& vblank, std::int64_t& period) const noexcept;
+    // What the swap chain keeps of the pictures presented (present_slots.h): every one with VSync; VSync off tears here.
+    [[nodiscard]] SwapQueue swap_queue() const noexcept {
+        return get_render_config().vsync_interval != 0u ? SwapQueue::EveryPicture : SwapQueue::Tearing;
+    }
     // The moment the next present shows (RenderCore's interpolation slots): this API has no presentation times, so
     // the presents pace themselves (PresentPacer, the swap chain's vblanks).
     void set_present_moment(std::int64_t) noexcept {}
@@ -691,18 +688,9 @@ private:
     // windowed or borderless, mode, window size) at a frame
     // boundary.
     void reconcile_display_state();
-    void reap_debug_capture_writers(bool wait_for_all);
-    void queue_debug_ppm_capture(
-        const char* tag,
-        const std::string& path,
-        const std::uint8_t* source,
-        unsigned width,
-        unsigned height,
-        unsigned row_pitch,
-        bool ten_bit = false);
     bool create_scene_targets(const FrameMap& map);
     // The MSAA sample count the settings ask for and the device has for the scene target's formats: 1 without MSAA, and
-    // with a temporal upscaler or ray tracing, which read the scene target's single-sample targets directly.
+    // with a temporal upscaler, which reads the scene target's single-sample targets directly.
     [[nodiscard]] unsigned wanted_msaa_samples() const;
     // The most samples per pixel the device has for both scene target formats (1: none), asked once.
     [[nodiscard]] unsigned msaa_max_samples() const;
@@ -735,9 +723,6 @@ private:
     void sync_post_process_settings();
     // A scale refused for the memory budget is tried again at this tick.
     std::uint64_t window_size_refused_ms_ = 0;
-    // Match Output's GPU budget: the frame command lists' measured GPU time over 2 s windows. When it stays above
-    // kGpuBudgetBusy of the wall time for two windows, the internal resolution Match Output may pick is capped one step
-    // lower for the session, so a GPU too slow for the window's resolution keeps every frame.
     // (Re)creates the scene target color/depth conversion SRVs in their fixed slots.
     void refresh_scene_conversion_source_views();
     // The scene target's conversion views (colour and depth) into `table`.
@@ -762,8 +747,16 @@ private:
     bool create_root_signature();
     bool create_sampler_heap();
     void reset_sampler_frame(); // only after this slot's fence completes
-    bool create_conversion_pipeline();  // the capture pipelines and the screen probes' compute pipeline
+    bool create_conversion_pipeline();  // the capture pipelines
     bool create_clear_pipeline();
+    // Every variant of the renderer's own passes' pipelines the device can draw (the clear's per scene variant, the 2D
+    // layer's per sample count, the depth resolve and copy) while the renderer starts (P-052): a frame never makes one.
+    void prepare_utility_pipelines();
+    void make_depth_resolve_pipeline();
+    void make_depth_copy_pipeline();
+    // The driver cache's loaded and made count at the end of the start, then as last logged: begin_frame names the
+    // pipelines made after it (a settings change; none in play).
+    std::uint64_t utility_pipelines_seen_ = 0u;
 
     // Records the conversion blit: fullscreen triangle into `dest` (RTV),
     // sampling the scene target color (or depth) SRV.  (src_x, src_y) is the source
@@ -794,16 +787,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
     // The device's enhanced-barrier interface when it has them (BarrierPath::device points at it).
     Microsoft::WRL::ComPtr<ID3D12Device10> barrier_device_;
-    // The selected adapter, for video-memory budget queries.
-    Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter3_;
-    // The OS signals this event when it changes the process's video memory budget (RegisterVideoMemoryBudgetChangeNotificationEvent;
-    // auto-reset; null where not registered); video_memory then reads again at once, else at most every 100 ms.
-    HANDLE budget_event_ = nullptr;
-    DWORD budget_cookie_ = 0u;
-    mutable std::int64_t memory_read_ms_ = 0;
-    mutable std::uint64_t memory_usage_ = 0u;
-    mutable std::uint64_t memory_budget_ = 0u;
-    void release_budget_notification() noexcept;
+    // The selected adapter's video memory (dxgi_memory.h: at most every 100 ms, at once when the OS moved the budget).
+    mutable DxgiMemory memory_;
     std::atomic<bool> occluded_{false};
     // The swap chain's frame latency waitable object (create_swap_chain): a present waits on it, bounded, so a frame is queued
     // when the display can take it. Owned (closed with the chain); null where the chain has none.
@@ -859,10 +844,8 @@ private:
     std::array<bool, kFramesInFlight> timestamp_pending_{};
     std::uint64_t timestamp_frequency_ = 0;
     // --diagnostics gpu-passes: GPU time by pass for present-stats' gpu-pass-ms. A mark starts a pass on the open command
-    // list; the time to the next mark (or the list's end) is that pass's.
-    enum class GpuPass : std::uint8_t {
-        Scene, Resolve, FramePass, DisplayCopy, Bloom, SceneAa, SceneAo, Upscale, RayTracing, Present, Camera, Count
-    };
+    // list; the time to the next mark (or the list's end) is that pass's (gpu_pass_times.h).
+    using GpuPass = ::galaxy::render::GpuPass;
     static constexpr unsigned kGpuPassSlots = 512;
     void gpu_pass(GpuPass pass);
     class GpuPassScope {
@@ -882,22 +865,12 @@ private:
     std::array<std::array<GpuPass, kGpuPassSlots>, kFramesInFlight> pass_marks_{};
     std::array<unsigned, kFramesInFlight> pass_mark_count_{};
     GpuPass current_pass_ = GpuPass::Scene;
-    GpuPass rt_outer_pass_ = GpuPass::Scene;
-    bool rt_color_read_ = false;  // rt_depth_begin put the scene's colour in a pass's hands
-    // The tracer's item target (rt_items_begin).
-    Microsoft::WRL::ComPtr<ID3D12Resource> item_target_;
-    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> item_rtv_heap_;
-    D3D12_CPU_DESCRIPTOR_HANDLE item_rtv_{};
-    static constexpr std::uint64_t kRtLightPicture = 1ull << 62u | 1u;  // the traced light's key among the pictures
-    static constexpr unsigned kRtLightPictures = 10u;  // its pictures, kRtLightPicture + 0 to 9 (rt_publish_light's which)
     bool pass_list_open_ = false;
-    std::array<double, static_cast<std::size_t>(GpuPass::Count)> telemetry_pass_ms_{};
     // The settings page's timing: asked for by gpu_timing_wanted_, on for the frames begun while it is (or the diagnostics
-    // record passes); each pass's running average for the page.
+    // record passes); the page's averages and the present statistics' window.
     std::atomic<bool> gpu_timing_wanted_{false};
     bool diagnostic_passes_ = false;
-    bool pass_timing_on_ = false;
-    std::array<std::atomic<float>, static_cast<std::size_t>(GpuPass::Count)> pass_ema_ms_{};
+    GpuPassTimes pass_times_;
     void ensure_pass_queries();
     // --diagnostics gpu-passes also counts each command list's pipeline statistics (shader invocations, primitives) for
     // present-stats' gpu-stats.
@@ -932,7 +905,7 @@ private:
     D3D12_CPU_DESCRIPTOR_HANDLE scene_dsv_{};
     // The inactive scene target target set (the output-resolution one between frames).
     // MSAA: an scene target's draws and clears go to these multisampled targets (the set's rtv and dsv name them); its color
-    // and depth, which copies and probes read, are their resolves (resolve_scene).
+    // and depth, which copies read, are their resolves (resolve_scene).
     struct SceneMsaa {
         Microsoft::WRL::ComPtr<ID3D12Resource> color;
         Microsoft::WRL::ComPtr<ID3D12Resource> depth;
@@ -947,7 +920,9 @@ private:
     bool create_scene_msaa(SceneMsaa& msaa, ID3D12Resource* color, ID3D12Resource* depth, unsigned samples,
                          D3D12_CPU_DESCRIPTOR_HANDLE& rtv, D3D12_CPU_DESCRIPTOR_HANDLE& dsv);
     void write_msaa_depth_view(SceneMsaa& msaa);
-    [[nodiscard]] ID3D12PipelineState* clear_pipeline(bool color);
+    [[nodiscard]] ID3D12PipelineState* clear_pipeline(bool color) { return clear_pipeline(color, scene_variant()); }
+    // The clear's pipeline for a scene variant (scene_variant()'s bits).
+    [[nodiscard]] ID3D12PipelineState* clear_pipeline(bool color, std::uint8_t variant);
     SceneMsaa scene_msaa_;
     mutable unsigned msaa_max_samples_ = 0u;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> depth_resolve_pso_;
@@ -967,6 +942,20 @@ private:
         std::size_t conv_ring = ~std::size_t{0};  // the conv_scene_tables_ entry its views are in after a swap_scene_color
     };
     SceneTargetSet alt_scene_;
+    // A target made again at another size while frames are in flight (P-028): its resources wait in
+    // retired_targets_[frame_slot_] and its persistent views in retired_persistent_ until the frames that could still
+    // read them are done, in place of a GPU drain. The open command list may name them too: they outlive it.
+    // `own_depth_view`: the set's multisampled depth view is its own (a wide set shares the scene's).
+    void retire_scene_set(SceneTargetSet& set, bool own_depth_view);
+    void retire_persistent(std::optional<DescriptorRing::Persistent>& table, unsigned count);
+    // `count` persistent descriptors: a retired table no frame can read any more, else new ones.
+    [[nodiscard]] DescriptorRing::Persistent fresh_persistent(unsigned count);
+    struct RetiredPersistent {
+        DescriptorRing::Persistent table;
+        unsigned count = 0u;
+        std::uint64_t free_from = 0u;  // the frame index from which no frame in flight reads it
+    };
+    std::vector<RetiredPersistent> retired_persistent_;
     // The open target pass's set (begin_target_pass) while the scene target holds it, and each key's set between passes
     // ( its colour shared with its picture), dropped after kIdleSteps game steps (idle_clock.h) unused. A picture is sampled
     // through its own view slot (TextureStore::allocate_view) reading the pass's channels.
@@ -1011,7 +1000,6 @@ private:
     // integrated GPU), for the sizes and mode recorded below.
     std::future<std::unique_ptr<TemporalUpscaler>> temporal_pending_;
     unsigned temporal_kind_ = 0;       // upscaler setting it was made for (2 FSR 3, 3 DLSS)
-    bool temporal_rr_ = false;         // DLSS made as Ray Reconstruction (the tracer running)
     bool temporal_wide_ = false;       // made for the float scene (HDR output): colour past white
     unsigned temporal_quality_ = 0;
     std::int64_t temporal_last_upscale_us_ = 0;
@@ -1046,7 +1034,7 @@ private:
     std::uint64_t temporal_frame_ = 0;
     bool temporal_history_valid_ = false;
     bool scene_temporal_ = false;
-    // The scene writes the motion target: a temporal scene, or the ray tracing engine's without a temporal upscaler.
+    // The scene writes the motion target: a temporal scene.
     bool scene_motion_ = false;
     float scene_jitter_[2]{};
     float scene_camera_[3]{1.0f, 100000.0f, 1.0f};
@@ -1117,7 +1105,7 @@ private:
     void record_layer_draw(ID3D12PipelineState* pipeline, ID3D12RootSignature* root, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
                            unsigned width, unsigned height, D3D12_GPU_DESCRIPTOR_HANDLE table, bool constants);
     void record_hdr_begin();
-    void record_hdr_end(unsigned finish = 0u);
+    void record_hdr_end();
     SceneCamera camera_pass_;
     std::chrono::steady_clock::time_point camera_metered_{};
     // persistent_views: the conversion-source views live in the descriptor
@@ -1153,12 +1141,9 @@ private:
         friend bool operator==(const TemporalInterpKey&, const TemporalInterpKey&) = default;
     };
     [[nodiscard]] TemporalInterpKey temporal_interp_key() const;
-    bool temporal_interp_suspended_ = false;
+    TemporalInterpHold temporal_interp_hold_;
     TemporalInterpKey temporal_interp_key_{};
-    double generated_gpu_ms_ = 0.0;
-    std::uint64_t generated_gpu_samples_ = 0;
-    double generated_gpu_ema_ms_ = 0.0;
-    double native_scene_gpu_ema_ms_ = 0.0;
+    FrameGpuTime frame_gpu_;  // the frame's GPU time: the governor's and the interpolation's measures
     bool scene_drawn_ = false;
     std::array<bool, kFramesInFlight> frame_scene_drawn_{};
     std::array<bool, kFramesInFlight> frame_generated_{};
@@ -1192,7 +1177,7 @@ private:
         std::uint64_t free_from = 0u;
     };
     std::vector<OldSceneTarget> old_scene_targets_;
-    RtView scene_ao_view_{};
+    SceneView scene_ao_view_{};
     std::vector<ao::ObjectOccluder> scene_ao_objects_;
     // scene target-copy destination textures (render targets) are placed in shared
     // heaps rather than committed one by one (gpu_placed_textures.h).
@@ -1222,20 +1207,8 @@ private:
     void texture_heap_replaced();
     const void* mirrored_backend_ = nullptr;
     TextureStore* mirrored_store_ = nullptr;
-    // The texture lists (t18): one upload buffer per frame in flight, written from the start each frame; a full one is
-    // replaced by one twice its size, the old kept until the GPU is past it.
-    struct TextureListBuffer {
-        Microsoft::WRL::ComPtr<ID3D12Resource> resource;
-        std::uint32_t* mapped = nullptr;
-        std::uint32_t capacity = 0u;  // pairs
-    };
-    std::array<TextureListBuffer, kFramesInFlight> texture_lists_{};
-    std::uint32_t texture_lists_used_ = 0u;
-    struct RetiredBuffer {
-        Microsoft::WRL::ComPtr<ID3D12Resource> resource;
-        std::uint64_t fence = 0u;
-    };
-    std::vector<RetiredBuffer> retired_texture_lists_;
+    // The texture lists' chunks (t18; core::TextureLists): upload buffers, mapped for their life.
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> texture_list_chunks_;
     gpu::Encoder encoder_;
     gpu::UploadMemory zero_stream_{};
     std::uint32_t zero_stream_bytes_ = 0u;
@@ -1251,37 +1224,17 @@ private:
     std::uint64_t next_fence_value_ = 0;
 
 
-    // Debug scene target readback (debug_copy_scene_to_readback / debug_log_readback).
-    Microsoft::WRL::ComPtr<ID3D12Resource> readback_buf_;
-    bool readback_pending_ = false;
-    bool readback_wide_ = false;  // the copy is of the wide (RGBA16F) scene target: 8 bytes a pixel
-    std::uint64_t readback_fence_value_ = 0;
-    std::string next_scene_capture_path_;
-    std::string readback_capture_path_;
-    Microsoft::WRL::ComPtr<ID3D12Resource> backbuffer_readback_buf_;
-    bool backbuffer_readback_pending_ = false;
-    std::uint64_t backbuffer_readback_fence_value_ = 0;
-    UINT backbuffer_readback_width_ = 0;
-    UINT backbuffer_readback_height_ = 0;
-    UINT backbuffer_readback_row_pitch_ = 0;
     std::string next_backbuffer_capture_path_;
-    std::string backbuffer_readback_capture_path_;
-    Microsoft::WRL::ComPtr<ID3D12Resource> selected_display_readback_buf_;
-    Microsoft::WRL::ComPtr<ID3D12Resource> selected_display_readback_source_;
-    bool selected_display_readback_pending_ = false;
-    bool selected_display_readback_ten_bit_ = false;
-    bool selected_display_readback_wide_ = false;  // an RGBA16F picture (the float scene's): read as 10-bit words
-    std::uint64_t selected_display_readback_fence_ = 0;
-    UINT selected_display_readback_width_ = 0;
-    UINT selected_display_readback_height_ = 0;
-    UINT selected_display_readback_pitch_ = 0;
-    std::string selected_display_readback_path_;
-    struct DebugPpmWriter {
-        std::string tag;
-        std::string path;
-        std::future<void> completion;
+    // The pictures copied out (the presented picture and the display picture), each its own readback buffer; a display
+    // picture's texture is held until its copy is done.
+    struct CaptureReadback {
+        Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+        Microsoft::WRL::ComPtr<ID3D12Resource> held;
     };
-    std::vector<DebugPpmWriter> debug_ppm_writers_;
+    using Captures = PictureCaptures<CaptureReadback>;
+    Captures captures_;
+    // A readback buffer for a capture of `bytes`: a spare one, or a new one.
+    [[nodiscard]] CaptureReadback capture_readback(UINT64 bytes, const wchar_t* name);
 
     // Presentation telemetry: successful DXGI submissions, distinct display picture
     // updates, frame-latency waits, Present blocking, and GPU timestamps.
@@ -1395,19 +1348,6 @@ private:
     std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kSceneVariantCount> clear_rgb_pipelines_;
     std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kSceneVariantCount> clear_alpha_pipelines_;
 
-    // Screen probes (ScreenProbeCs): the values a slot's dispatch writes, copied to its readback, fenced with its frame.
-    Microsoft::WRL::ComPtr<ID3D12RootSignature> probe_root_signature_;
-    Microsoft::WRL::ComPtr<ID3D12PipelineState> probe_pipeline_;
-    struct ScreenProbeSlot {
-        Microsoft::WRL::ComPtr<ID3D12Resource> values;    // default heap, unordered access between dispatches
-        Microsoft::WRL::ComPtr<ID3D12Resource> readback;
-        const float* mapped = nullptr;
-        std::uint64_t bytes = 0;
-        std::uint64_t fence = 0;
-    };
-    std::vector<ScreenProbeSlot> probe_slots_;
-    // ScreenProbeSlot::fence of probes recorded in the open frame.
-    static constexpr std::uint64_t kProbesInFrame = ~std::uint64_t{0};
     static const std::uint8_t* pin_readback_mapping(ID3D12Resource* readback);
 
 };

@@ -1,11 +1,10 @@
 # The test runs' targets: a test build passes this file to the root CMakeLists.txt as NEBULA_EXTRA_CMAKE, which
 # includes it after galaxy_test. Never in an install.
 
-# The test runs' extension (run.sh: --extension): scripted controls, pictures, sound, menus and device losses from the
-# run's GALAXY_* environment.
+# The test runs' extension (--extension): runs the harness's plan (tools/lumacore/luma_test.py) and keeps the sound.
 set(test_extension ${CMAKE_CURRENT_LIST_DIR}/extension)
 add_library(nebula_test_extension MODULE ${test_extension}/test_extension.cpp ${test_extension}/harness.cpp
-    ${test_extension}/test_services.cpp ${test_extension}/test_plugin.cpp ${test_extension}/data_guard.cpp
+    ${test_extension}/test_services.cpp ${test_extension}/data_guard.cpp ${test_extension}/process_memory.cpp
     ${rt}/hidden_start.cpp)
 target_link_libraries(nebula_test_extension PRIVATE galaxy_runtime_abi)
 if(WIN32)
@@ -15,7 +14,7 @@ else()
 endif()
 target_compile_features(nebula_test_extension PRIVATE cxx_std_20)
 if(MSVC)
-    target_compile_options(nebula_test_extension PRIVATE /W4 /WX /permissive- /EHsc)
+    target_compile_options(nebula_test_extension PRIVATE /W4 ${NEBULA_WARNINGS_AS_ERRORS} /permissive- /EHsc)
 endif()
 
 # The extension's data guard: a test run never touches a player's folders.

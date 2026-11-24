@@ -2,12 +2,16 @@
 
     luma_test.py run <test folder | suite.json> --bin <folder> [--renderer r] [--work <folder>] [--who F|G]
                  [--module hooks|plain] [--gpu vendor:device:subsystem] [--extension <file>] [--half <file>]
+                 [--pak <game.pak>] [--pak-for RMGP01=<game.pak> ...]
     luma_test.py refs <test folder> --run <run folder> --looked
 
 `run` reads each test strictly, gives it a private run folder, installs the game half first and then the test's mods,
 starts the game hidden and silent with the plan for the host half (tools/test_driver/extension/harness.cpp), waits,
-checks the run's files against the test's `expect` and the checks every test has, and writes result.json. One line per
-test and renderer; exit 0 only when every verdict is `pass`.
+checks the run's files against the test's `expect` and the checks every test has, and writes result.json (its "kind":
+pass, fail, tool or env, kind_of below). One line per test and renderer; exit 0 only when every verdict is `pass`, 3 when
+the machine is not fit to start (the run lock is held, the device does not answer) and no result is written. A test with a "disc" (RMGE01, RMGP01 or RMGJ01: one that
+needs that release's languages or files) runs on --pak when that pak is of its disc, else on the pak --pak-for (or
+LUMA_TEST_PAKS, DISC=path joined by the path separator) names for it, else its verdict is `not-run`, naming the disc.
 
 `refs` writes a run's pictures as the references a test names, after the person running it has looked at them.
 
@@ -41,6 +45,7 @@ import struct
 import subprocess
 import sys
 import time
+import traceback
 import zlib
 
 RUNNER_VERSION = "1.0"
@@ -94,7 +99,7 @@ LINE_WORDS = 16
 VEC_TYPES = {"const Vec3f &", "const TVec3f &", "Vec3f *", "const Vec3f *", "Vec3f", "TVec3f"}
 OBJECT_TYPES = {"LiveActor *", "const LiveActor *", "NameObj *", "const NameObj *", "MarioActor *"}
 READ_TYPES = {"f32", "s32", "u32", "u16", "s16", "u8", "bool", "TVec3f", "Vec3f", "const char *"}
-FACT_OPS = {"is", "is_not", "less", "at_most", "more", "at_least", "near", "exists", "absent", "has", "count"}
+FACT_OPS = {"is", "is_not", "less", "at_most", "more", "at_least", "near", "far", "exists", "absent", "has", "count"}
 # Revision 6: the host's Settings pages by name, lower case, as the Settings screen's own list keeps
 # them (runtime/src/ui/native_settings.cpp kNativeSettingsTabNames), and the number the host opens each by. "advanced"
 # is shown in test builds and dev mode only; elsewhere the host opens "display" for it.
@@ -110,6 +115,59 @@ OBJECT_REF = re.compile(r"(object:[^\s#]+|class:[^\s#]+)#\d+")
 
 class HarnessError(Exception):
     """The runner's own problem or a malformed test: verdict `harness-error`."""
+
+
+# The kind of result each verdict is (docs/plan/04-GATE-AND-MAIN.md section 9), the one place a test's kind is decided:
+#   fail  the game or the change is wrong: everything seen once the game has started (a crash, a game that completed no
+#         step for HANG_SECONDS while its process lived (hung), a run that reached its limit with the game in a pause
+#         that ended or never stepped (timeout), a run that reached its limit and did not reach its end although the
+#         game ran at 80% of full speed or more (not-reached), an exit code other than 0, a check of the test that did
+#         not hold), and a game half's own stop (harness.stop) other than pass;
+#   tool  the test tool broke: a test or file the runner itself must provide could not be read (harness-error), a run it
+#         could not set up or start (setup-failed), an exception of the runner's own, a picture or report the game writes at
+#         its exit that was not there OUTPUT_SECONDS after the game ended (output-missing), the tablet's exit record that
+#         never came (no-exit-record);
+#   env   the machine was not fit: the disc's game not given, the device gone, the drive full (not-run, device-lost), a run
+#         that reached its time limit while the game ran at under 80% of full speed (too-slow: the gate runs it again alone,
+#         tools/gate/kinds.py Settler; alone it is a flake if it passes, a fail if it is too slow again).
+# No verdict depends on how long something took (docs/plan/04-GATE-AND-MAIN.md, "Time limits in the test runner").
+# result.json carries it as "kind"; the gate reads it from there (tools/gate/kinds.py). The gate may change a fail to
+# flake or main afterwards; it never changes pass, tool or env.
+KINDS = {"pass": "pass", "fail": "fail", "crashed": "fail", "timeout": "fail", "hung": "fail", "not-reached": "fail",
+         "harness-error": "tool",
+         "setup-failed": "tool", "output-missing": "tool", "no-exit-record": "tool", "not-run": "env", "device-lost": "env",
+         "too-slow": "env"}
+
+# The three lengths of time a verdict is judged by, all counted from the game's own step lines (Progress below):
+# no step for HANG_SECONDS while the game's process lives is a hang (fail); a pause of more than STALL_SECONDS and less
+# than that is written into the result as a stall line and counted, not a failure; what the game writes at its exit (the
+# pictures a test asked for, the loss report) is waited for up to OUTPUT_SECONDS.
+HANG_SECONDS = 120.0
+STALL_SECONDS = 10.0
+OUTPUT_SECONDS = 60.0
+# The game takes 60 steps a second (galaxy/game_step.h kGameStepsPerSecond). A run that reaches its time limit with its end
+# not reached is judged by how much game time it got: at FULL_SPEED_SHARE of full speed or more the machine was not the
+# reason (not-reached, fail); under it the run is too-slow, which the gate runs again alone.
+GAME_STEPS_PER_SECOND = 60.0
+FULL_SPEED_SHARE = 0.8
+
+
+def kind_of(verdict):
+    return KINDS.get(verdict, "fail")
+
+
+class EnvRefused(Exception):
+    """The run could not start because the machine is not fit (the device does not answer, a lock is held): the runner
+    ends with exit code ENV_EXIT and writes no result; the gate reads that as kind env."""
+
+
+# Exit codes of `run`: 0 every test passed, 1 a test did not, ENV_EXIT the machine was not fit.
+ENV_EXIT = 3
+
+
+def drive_full(error):
+    """Whether an OSError says the drive has no room (ENOSPC, or Windows' ERROR_DISK_FULL and ERROR_HANDLE_DISK_FULL)."""
+    return isinstance(error, OSError) and (error.errno == 28 or getattr(error, "winerror", None) in (39, 112))
 
 
 # --- Reading a test strictly ------------------------------------------------------------------------------------------
@@ -134,6 +192,19 @@ def load_json(path):
         raise
     except (OSError, ValueError) as error:
         raise HarnessError("%s cannot be read as JSON: %s" % (path, error))
+
+
+def place_saves(test, run_folder):
+    """The test's own start saves (its "saves" folder) into the run's save folder, as laid out there: the host's save
+    root, whose game folder is the disc's four-letter code (RMGE/Nebula.sav; runtime/src/save_files.cpp)."""
+    if test.get("saves"):
+        shutil.copytree(test["folder"] / test["saves"], run_folder / "saves", dirs_exist_ok=True)
+
+
+def save_name_ok(name):
+    """A save_file name: a path inside the save root, by forward slashes, with no empty, "." or ".." part."""
+    parts = name.split("/")
+    return "\\" not in name and all(p not in ("", ".", "..") and ":" not in p for p in parts)
 
 
 def keys_known(obj, path, known):
@@ -211,6 +282,22 @@ CLASSES = None
 # None: the game's own choice. run_tests sets it from --gpu.
 GPU = None
 
+# The test extension's hooks the host reads when it starts (tools/test_driver/extension/test_extension.cpp reads them
+# from the environment): a test names them among its settings, and they go to the game's environment. Everything else a
+# test does is a step of its plan. harness_settings_test.py keeps this list equal to the extension's.
+TEST_HOOKS = ("GALAXY_TEST_VRAM_BUDGET_MB", "GALAXY_TEST_DISC_DELAY_US", "GALAXY_TEST_SAVE_DELAY_US",
+              "GALAXY_TEST_MODS_SCREEN", "GALAXY_TEST_MODS_CHANGED", "GALAXY_TEST_REMAKE_TARGETS",
+              "GALAXY_TEST_REBUILD_DELAY_MS", "GALAXY_TEST_CPU_LOAD")
+
+
+def setting_names():
+    """The names a run's settings file takes (tools/verify/settings_args.py's tables)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("settings_args", TREE / "tools" / "verify" / "settings_args.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return {name for table in module.FILES.values() for name, _ in table}
+
 
 def object_ref(value, path, classes):
     """`object:<name>#<n>` or `class:<Class>#<n>`; a class the types file lacks is a harness-error."""
@@ -241,7 +328,8 @@ def read_test(folder, types=None):
     t = load_json(folder / "test.json")
     keys_known(t, "", {"harness", "name", "about", "proves", "mods", "code", "language", "seed", "continue_from",
                        "renderers", "limit_seconds", "bare", "save", "stage", "player", "steps", "expect",
-                       "faults", "hide_game_files", "safe_start", "device", "ends", "starts", "fresh", "window"})
+                       "faults", "hide_game_files", "safe_start", "device", "ends", "starts", "fresh", "window",
+                       "time", "visible", "settings", "diagnostics", "disc", "memory", "saves", "clock", "rate"})
     for key in ("harness", "name", "about", "steps", "expect"):
         if key not in t:
             raise HarnessError("the test has no %s" % key)
@@ -266,6 +354,44 @@ def read_test(folder, types=None):
     device = text(t, "device", "") if "device" in t else "keyboard"
     if device not in ("keyboard", "pad"):
         raise HarnessError("device is keyboard or pad")
+    # The game's clock: fixed steps (the default; two runs match frame for frame) or real time, where the game steps on
+    # the host's clock and the display paces the pictures (pacing is measured in these).
+    clock = text(t, "time", "") if "time" in t else "steps"
+    if clock not in ("steps", "real"):
+        raise HarnessError("time is steps or real")
+    # Where frame 0 is for a test with no stage: the title screen's first frame (the default), or the game's first frame
+    # ("start"), for what comes before the title (a window the start shows).
+    clock_from = text(t, "clock", "") if "clock" in t else "title"
+    if clock_from not in ("title", "start"):
+        raise HarnessError("clock is title or start")
+    if clock_from == "start" and "stage" in t:
+        raise HarnessError("clock start is for a test with no stage")
+    # "memory": seconds (1 to 3600): the fact process.memory {"seconds", "bytes"} at frame 0 and each that many seconds
+    # of wall time after it, the process's own memory (tools/test_driver/extension/process_memory.h); a soak run's.
+    memory = whole(t, "memory", "", 1) if "memory" in t else None
+    if memory is not None and memory > 3600:
+        raise HarnessError("memory is 1 to 3600 seconds")
+    # "rate": the world clock's rate from the run's first step, in thousandths of real time, a whole number of steps a frame
+    # (1000, 2000 ... 16000); the plan then counts world steps (read_rate, read_steps).
+    rate = read_rate(t, bare)
+    # A visible window (pacing measurements only; every other run is hidden).
+    visible = boolean(t, "visible", "") if "visible" in t else False
+    # Settings for the run, as tools/verify/settings_args.py takes them (GALAXY_VSYNC_INTERVAL=1), and the test
+    # extension's hooks (TEST_HOOKS), which go to the game's environment. Any other name is an error: the game would
+    # never read it.
+    run_settings = t.get("settings", [])
+    if not isinstance(run_settings, list) or not all(
+            isinstance(a, str) and re.fullmatch(r"GALAXY_[A-Z0-9_]+=[^\s]*", a) for a in run_settings):
+        raise HarnessError("settings must be a list of GALAXY_NAME=value")
+    known = setting_names()
+    for a in run_settings:
+        name = a.partition("=")[0]
+        if name not in known and name not in TEST_HOOKS:
+            raise HarnessError("settings: %s is neither a setting the game reads nor a test hook" % name)
+    # The game's own records for the run (--diagnostics), as a list of names; a timeline goes to the run's folder.
+    diagnostics = t.get("diagnostics", [])
+    if not isinstance(diagnostics, list) or not all(isinstance(d, str) and re.fullmatch(r"[a-z-]+", d) for d in diagnostics):
+        raise HarnessError("diagnostics must be a list of names (present-stats, timeline, ...)")
     code = text(t, "code", "") if "code" in t else "allow"
     if code not in ("allow", "deny", "ask"):
         raise HarnessError("code must be allow, deny or ask")
@@ -285,9 +411,11 @@ def read_test(folder, types=None):
                    "install": "placed", "permissions": "allow", "options": {}, "folder": None, "enabled": True,
                    "remove": False}
             # "enabled": false: installed and switched off, as the Mods screen keeps a mod turned off (enabled=0 in
-            # its mods.ini section); a kept mod (continue_from) is switched off or on in place. "remove": true: a mod
+            # its mods.ini section); a kept mod (continue_from) is switched off or on in place when the entry says so,
+            # else its switch stays as the test before left it (a player's choice saved then). "remove": true: a mod
             # kept from the test before is taken away as a player deleting its folder. Neither starts, so neither is
             # among the mods every run checks as loaded.
+            mod["enabled_given"] = "enabled" in entry
             if "enabled" in entry:
                 mod["enabled"] = boolean(entry, "enabled", path)
             if "remove" in entry:
@@ -339,6 +467,11 @@ def read_test(folder, types=None):
         language = text(t, "language", "")
         if language not in LANGUAGES:
             raise HarnessError("language %s is not one of %s" % (language, ", ".join(LANGUAGES)))
+    disc = None
+    if "disc" in t:
+        disc = text(t, "disc", "")
+        if disc not in DISCS:
+            raise HarnessError("disc %s is not one of %s" % (disc, ", ".join(DISCS)))
     seed = whole(t, "seed", "", 0) if "seed" in t else 0
     # The window's size in pixels (the picture's shape: 48:9 is [1920, 360]).
     window = [1280, 720]
@@ -369,36 +502,51 @@ def read_test(folder, types=None):
         for i, f in enumerate(t["faults"]):
             keys_known(f, "faults[%d]" % i, {"mod"})
             faults.append(text(f, "mod", "faults[%d]" % i))
-    # A safe start: "asked" starts with --safe-start 1; "crash" leaves mods/.safe_start empty, as a crash
-    # with mods on does, before the start.
+    # A safe start: "asked" starts with --safe-start 1. "crash" and "crash-code" leave the crash record a crash with
+    # mods on leaves when it can name no mod (mods/.crash, runtime/include/galaxy/mod_crash.h): "crash" with no mod's
+    # code running (every mod is off for the start), "crash-code" with mods' code running (every mod's code is off).
     safe_start = t.get("safe_start")
-    if safe_start not in (None, "asked", "crash"):
-        raise HarnessError("safe_start must be \"asked\" or \"crash\"")
+    if safe_start not in (None, "asked", "crash", "crash-code"):
+        raise HarnessError("safe_start must be \"asked\", \"crash\" or \"crash-code\"")
     hidden = []
     if "hide_game_files" in t:
         if not isinstance(t["hide_game_files"], list):
             raise HarnessError("hide_game_files must be a list")
         hidden = [hidden_path(h, "hide_game_files[%d]" % i) for i, h in enumerate(t["hide_game_files"])]
     # How the run must end (revision 10): "end", at its end step by the harness (the default); or "crash", by the
-    # host's crash reporter before the end step (a test of a fault that must never be resumed, guard 2). A crash test
-    # names the crash line it expects: at least one log expectation reading the host's "crash: " line.
+    # host's crash reporter before the end step (a test of a fault that must never be resumed, guard 2); or
+    # "crash-at-stop", at its end step, then by the crash reporter while the game stops (a mod's stop function). A
+    # crash test names the crash line it expects: at least one log expectation reading the host's "crash: " line.
     ends = text(t, "ends", "") if "ends" in t else "end"
-    if ends not in ("end", "crash"):
-        raise HarnessError("ends must be end or crash")
+    if ends not in ("end", "crash", "crash-at-stop"):
+        raise HarnessError("ends must be end, crash or crash-at-stop")
     # How many processes the run's game was (1: it never started again; the host's start-again adds one each).
     starts = whole(t, "starts", "") if "starts" in t else None
     if starts is not None and starts < 1:
         raise HarnessError("starts must be 1 or more")
+    # "saves": a folder of the test's whose files the run's save folder holds at the start (a save made by hand: a
+    # damaged one, another build's). Not with continue_from, whose saves are the earlier test's.
+    saves = None
+    if "saves" in t:
+        saves = text(t, "saves", "")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", saves) or saves in (".", ".."):
+            raise HarnessError("saves names a folder in the test's own folder")
+        if "continue_from" in t:
+            raise HarnessError("saves and continue_from both name the start's saves")
+        if not (folder / saves).is_dir() or not any((folder / saves).iterdir()):
+            raise HarnessError("saves: the test has no folder %s with files in it" % saves)
     setup = read_setup(t, bare, seed, language, classes)
-    steps = read_steps(t, bare, classes)
-    expect, not_here = read_expect(t, bare, steps)
-    if ends == "crash" and not any(c["kind"] == "log" and c["pattern"].startswith("crash: ") for c in expect):
+    steps = read_steps(t, bare, classes, rate)
+    expect, not_here = read_expect(t, bare, steps, folder)
+    if ends != "end" and not any(c["kind"] == "log" and c["pattern"].startswith("crash: ") for c in expect):
         raise HarnessError("a test that ends in a crash expects its crash line: a log expectation starting \"crash: \"")
     return {"folder": folder, "raw": t, "name": t["name"], "proves": proves, "bare": bare, "mods": mods,
             "language": language, "seed": seed, "renderers": renderers, "limit": limit, "window": window,
-            "continue_from": continue_from, "faults": faults, "setup": setup, "steps": steps, "expect": expect,
+            "continue_from": continue_from, "saves": saves, "faults": faults, "setup": setup, "steps": steps,
+            "expect": expect,
             "has_stage": "stage" in t, "hidden": hidden, "safe_start": safe_start, "device": device, "ends": ends,
-            "starts": starts, "fresh": fresh, "not_here": not_here}
+            "time": clock, "clock": clock_from, "visible": visible, "settings": run_settings, "diagnostics": diagnostics,
+            "starts": starts, "fresh": fresh, "not_here": not_here, "disc": disc, "memory": memory, "rate": rate}
 
 
 def read_setup(t, bare, seed, language, classes):
@@ -414,7 +562,7 @@ def read_setup(t, bare, seed, language, classes):
     lines.append("setup file 1")
     if "save" in t:
         s = t["save"]
-        keys_known(s, "save", {"character", "spin", "stars", "grand_stars", "flags", "values"})
+        keys_known(s, "save", {"character", "spin", "stars", "grand_stars", "flags", "values", "tico_seeds"})
         if "character" in s:
             c = text(s, "character", "save")
             if c not in ("mario", "luigi"):
@@ -440,6 +588,13 @@ def read_setup(t, bare, seed, language, classes):
             for name in s["values"]:
                 plain(name, "save.values key")
                 lines.append("setup save.value %s %d" % (name, whole(s["values"], name, "save.values", 0)))
+        if "tico_seeds" in s:
+            if not isinstance(s["tico_seeds"], dict):
+                raise HarnessError("save.tico_seeds must be an object")
+            for luma in s["tico_seeds"]:
+                if not luma.isdigit() or int(luma) > 255:
+                    raise HarnessError("save.tico_seeds keys are seed numbers, 0 to 255")
+                lines.append("setup save.tico_seed %d %d" % (int(luma), whole(s["tico_seeds"], luma, "save.tico_seeds", 0)))
     lines.append("setup seed %d" % seed)
     if language is not None:
         lines.append("setup language %s" % language)
@@ -503,23 +658,78 @@ def read_check(c, path, keys):
         if "within" not in c:
             raise HarnessError("%s: near needs within" % path)
         within = number(c, "within", path)
-        if not (isinstance(value, (int, float)) and not isinstance(value, bool)) and not (
-                isinstance(value, list) and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value)):
-            raise HarnessError("%s.near takes a number or a list of numbers" % path)
     elif "within" in c and "within" in keys:
         raise HarnessError("%s: within belongs with near" % path)
+    # `far`: the value is more than `beyond` from VALUE (a number, or [x, y, z] by distance): a check of the whole
+    # run only, as the game's own waits know near and not far.
+    if op == "far":
+        if "far" not in keys:
+            raise HarnessError("%s: far is a check of the whole run (expect), not a wait" % path)
+        if "beyond" not in c:
+            raise HarnessError("%s: far needs beyond" % path)
+        within = number(c, "beyond", path)
+    elif "beyond" in c and "far" in keys:
+        raise HarnessError("%s: beyond belongs with far" % path)
+    if op in ("near", "far") and not (isinstance(value, (int, float)) and not isinstance(value, bool)) and not (
+            isinstance(value, list) and value and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value)):
+        raise HarnessError("%s.%s takes a number or a list of numbers" % (path, op))
     return op, value, within
 
 
-def read_steps(t, bare, classes):
+RATE_LEAST, RATE_MOST, RATE_REAL = 1, 16000, 1000  # the time service's (native/include/luma_time.h)
+
+
+def read_rate(t, bare):
+    """The test's "rate" (None without one): the world clock's rate in thousandths, 1 to 16000 as the time service takes it,
+    and a whole number of steps a frame (a multiple of 1000), because the plan's times are then world steps and a step that
+    is not a frame's first cannot be told apart from it by the controls, which are read once a frame."""
+    if "rate" not in t:
+        return None
+    if bare:
+        raise HarnessError("a bare test has no rate")
+    rate = whole(t, "rate", "", 1)
+    if not RATE_LEAST <= rate <= RATE_MOST:
+        raise HarnessError("rate must be 1 to 16000, thousandths of real time (the time service's range), not %d" % rate)
+    if rate % RATE_REAL:
+        raise HarnessError("rate must be a whole number of steps a frame: 1000, 2000 ... 16000, not %d" % rate)
+    return rate
+
+
+def frame_of(step, rate, path):
+    """The test-clock frame that begins with world step `step` at `rate` (None: the plan is in frames). The rate is set in
+    frame 0, which runs one step (step 0) and takes effect from frame 1: frame f >= 1 runs steps (f - 1) * k + 1 to f * k
+    (k steps a frame). A step that is not the first of a frame cannot be asked for: the controls are read once a frame."""
+    if rate is None or step == 0:
+        return step
+    k = rate // RATE_REAL
+    if (step - 1) % k:
+        raise HarnessError("%s: world step %d does not begin a frame at a rate of %d (a frame begins with step 0, 1, %d, %d ...)" % (
+            path, step, rate, 1 + k, 1 + 2 * k))
+    return (step - 1) // k + 1
+
+
+def span_frames(first, steps, rate, path):
+    """The frames of a run of `steps` world steps from `first` (None for a step that waits: its start is not known). At a rate
+    the run must end where a frame ends, and a run after a wait must be a whole number of frames."""
+    if rate is None:
+        return steps
+    if first is None:
+        if steps % (rate // RATE_REAL):
+            raise HarnessError("%s: %d world steps are not a whole number of frames at a rate of %d" % (path, steps, rate))
+        return steps // (rate // RATE_REAL)
+    return frame_of(first + steps, rate, path) - frame_of(first, rate, path)
+
+
+def read_steps(t, bare, classes, rate=None):
     steps = t["steps"]
     if not isinstance(steps, list) or not steps:
         raise HarnessError("steps must be a list with an end step")
     out = []
     ends = 0
     pictures = set()
-    actions = {"hold", "stick", "shake", "pointer", "key", "text", "settings", "picture", "call", "read", "stage", "wait",
-               "end", "take_out", "reload", "forget", "copy_file", "load_file", "erase_file", "new_file"}
+    actions = {"hold", "stick", "shake", "pointer", "key", "text", "settings", "picture", "call", "read", "stage", "wait", "hash",
+               "end", "take_out", "reload", "forget", "copy_file", "load_file", "erase_file", "new_file", "window",
+               "lose_device"}
     for i, s in enumerate(steps):
         path = "steps[%d]" % i
         if not isinstance(s, dict):
@@ -534,8 +744,10 @@ def read_steps(t, bare, classes):
         if ("at" in s) == ("after" in s):
             raise HarnessError("%s needs at or after, not both" % path)
         step = {"action": action, "at": None, "after": None, "timeout": 600}
+        first = None
         if "at" in s:
-            step["at"] = whole(s, "at", path, 0)
+            first = whole(s, "at", path, 0)
+            step["at"] = frame_of(first, rate, path + ".at")
             if "timeout" in s:
                 raise HarnessError("%s: timeout belongs with after" % path)
         else:
@@ -572,22 +784,22 @@ def read_steps(t, bare, classes):
         for key in needs:
             if key not in s:
                 raise HarnessError("%s: %s needs %s" % (path, action, key))
-        if bare and action not in ("wait", "picture", "key", "text", "settings", "end"):
-            raise HarnessError("%s: a bare test has only wait, picture, key, text, settings and end steps" % path)
+        if bare and action not in ("wait", "picture", "key", "text", "settings", "window", "lose_device", "end"):
+            raise HarnessError("%s: a bare test has only wait, picture, key, text, settings, window, lose_device and end steps" % path)
         v = s[action]
         if action == "hold":
             if not isinstance(v, list) or not v or not all(isinstance(b, str) and b in BUTTONS for b in v):
                 raise HarnessError("%s.hold must list buttons of %s" % (path, " ".join(sorted(BUTTONS))))
-            step["line"] = "hold %s %d" % ("+".join(v), whole(s, "frames", path, 1))
+            step["line"] = "hold %s %d" % ("+".join(v), span_frames(first, whole(s, "frames", path, 1), rate, path + ".frames"))
         elif action == "stick" or action == "pointer":
             if not (isinstance(v, list) and len(v) == 2 and all(isinstance(n, (int, float)) and not isinstance(n, bool) for n in v)):
                 raise HarnessError("%s.%s must be two numbers" % (path, action))
             low = -1 if action == "stick" else 0
             if not all(low <= n <= 1 for n in v):
                 raise HarnessError("%s.%s: each is %d to 1" % (path, action, low))
-            step["line"] = "%s %r %r %d" % (action, float(v[0]), float(v[1]), whole(s, "frames", path, 1))
+            step["line"] = "%s %r %r %d" % (action, float(v[0]), float(v[1]), span_frames(first, whole(s, "frames", path, 1), rate, path + ".frames"))
         elif action == "shake":
-            step["line"] = "shake %d" % whole(s, "shake", path, 1)
+            step["line"] = "shake %d" % span_frames(first, whole(s, "shake", path, 1), rate, path + ".shake")
         elif action == "key":
             if v not in KEYS:
                 raise HarnessError("%s.key must be one of %s" % (path, " ".join(sorted(KEYS))))
@@ -610,6 +822,16 @@ def read_steps(t, bare, classes):
             pictures.add(name)
             step["line"] = "picture %s" % name
             step["picture"] = name
+        elif action == "window":
+            # The window's inside resized as the player drags it, [width, height] in pixels.
+            if not (isinstance(v, list) and len(v) == 2 and all(isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= 65535 for n in v)):
+                raise HarnessError("%s.window is [width, height] in pixels, each 1 to 65535" % path)
+            step["line"] = "window %d %d" % (v[0], v[1])
+        elif action == "lose_device":
+            # The graphics device lost at the renderer's next frame, as a driver reset loses it.
+            if v is not True:
+                raise HarnessError("%s.lose_device takes true" % path)
+            step["line"] = "lose_device"
         elif action in ("wait", "end"):
             if v is not True:
                 raise HarnessError("%s.%s takes true" % (path, action))
@@ -682,6 +904,12 @@ def read_steps(t, bare, classes):
             if ty not in READ_TYPES:
                 raise HarnessError("%s.type %s: the harness reads %s" % (path, ty, ", ".join(sorted(READ_TYPES))))
             step["line"] = "game read %s %s %s %s" % (plain(s["fact"], path + ".fact"), of, field, ty)
+        elif action == "hash":
+            # The step hash (tools/verify/step_hash.py): "on" from this step, a fact hash.step after every step; "detail"
+            # one fact hash.actor per actor at this step.
+            if v not in ("on", "detail"):
+                raise HarnessError("%s.hash is on or detail" % path)
+            step["line"] = "game hash %s" % v
         elif action == "stage":
             st = v
             keys_known(st, path + ".stage", {"name", "scenario"})
@@ -691,6 +919,9 @@ def read_steps(t, bare, classes):
         out.append(step)
     if ends != 1:
         raise HarnessError("the test has %d end steps; it needs exactly one" % ends)
+    if rate is not None:
+        # The first step of the run (frame 0) sets the world's rate; it takes effect from the next frame.
+        out.insert(0, {"action": "rate", "at": 0, "after": None, "timeout": 600, "line": "game rate %d" % rate})
     return out
 
 
@@ -754,7 +985,7 @@ def scope_of(c, path):
         raise HarnessError("%s.scope is \"installation\" or absent" % path)
 
 
-def read_expect(t, bare, steps):
+def read_expect(t, bare, steps, folder):
     expect = t["expect"]
     if not isinstance(expect, list):
         raise HarnessError("expect must be a list")
@@ -777,11 +1008,11 @@ def read_expect(t, bare, steps):
                 not_here.append({"check": path, "systems": systems})
                 continue
         if "fact" in c:
-            keys_known(c, path, {"fact", "when", "frames", "within", "matching", "field", "scope"} | FACT_OPS)
+            keys_known(c, path, {"fact", "when", "frames", "within", "beyond", "matching", "field", "scope"} | FACT_OPS)
             scope_of(c, path)
             if bare:
                 raise HarnessError("%s: a bare test checks only the log, pictures and sound" % path)
-            op, value, within = read_check(c, path, {"within", "count"})
+            op, value, within = read_check(c, path, {"within", "count", "far"})
             # `matching`: only the writes whose value has it (as `has` reads) are checked, so `count`, `absent`
             # and the rest speak of one mod's or one word's writes of a key many write ("modlog", "fx.*").
             matching = None
@@ -853,6 +1084,18 @@ def read_expect(t, bare, steps):
                 raise HarnessError("%s.%s needs rmse" % (path, limit_key))
             out.append({"kind": mode, "picture": name, "ref": text(c, mode, path), "rmse": number(c[limit_key], "rmse", path + "." + limit_key),
                         "box": box, "source": c})
+        elif "save_file" in c:
+            # A file of the run's save folder at the end: "same" as the test's own copy (saves), or "absent".
+            keys_known(c, path, {"save_file", "is"})
+            name = text(c, "save_file", path)
+            if not save_name_ok(name):
+                raise HarnessError("%s.save_file is a path in the save root, by forward slashes (RMGE/Nebula.sav)" % path)
+            state = text(c, "is", path) if "is" in c else ""
+            if state not in ("same", "absent"):
+                raise HarnessError("%s.is must be same or absent" % path)
+            if state == "same" and ("saves" not in t or not (folder / str(t["saves"]) / name).is_file()):
+                raise HarnessError("%s: same needs the file in the test's saves folder" % path)
+            out.append({"kind": "save_file", "name": name, "is": state, "source": c})
         elif "sound" in c:
             keys_known(c, path, {"sound", "rms"})
             s, r = c["sound"], c.get("rms")
@@ -862,7 +1105,7 @@ def read_expect(t, bare, steps):
                 raise HarnessError("%s.rms must be [low, high] in dBFS" % path)
             out.append({"kind": "sound", "frames": s, "rms": r, "source": c})
         else:
-            raise HarnessError("%s is not a check this harness knows (fact, log, no_log, picture, sound)" % path)
+            raise HarnessError("%s is not a check this harness knows (fact, log, no_log, picture, save_file, sound)" % path)
     return out, not_here
 
 
@@ -1148,7 +1391,9 @@ def install(settings, mod_folder, code_allowed, order, kept=False, permissions="
     permissions: "allow", "deny" or {name: "allow"|"deny"}: each declared permission's answer, as the consent screen
     records a player's (consent.md 1.2; a name the object leaves out is allowed).
     broken_ok: a mod the test expects not to load (loads false) may have a luma.json that is not JSON on purpose: it is
-    placed as it is, under its folder's name, as the game names a mod whose manifest cannot be read (mod-log 1)."""
+    placed as it is, under its folder's name, as the game names a mod whose manifest cannot be read (mod-log 1).
+    enabled: None for a kept mod whose switch stays as the test before left it."""
+    switch = True if enabled is None else enabled
     try:
         manifest = load_json(mod_folder / "luma.json")
     except HarnessError:
@@ -1189,7 +1434,8 @@ def install(settings, mod_folder, code_allowed, order, kept=False, permissions="
         if kept:
             if options:
                 keep_options(settings / "mods.ini", place, option_lines(mod_folder, manifest, options))
-            keep_enabled(settings / "mods.ini", place, enabled)
+            if enabled is not None:
+                keep_enabled(settings / "mods.ini", place, enabled)
             return mod_id
         raise HarnessError("two mods have the id %s (a second copy takes \"folder\")" % mod_id)
     shutil.copytree(mod_folder, target)
@@ -1199,9 +1445,9 @@ def install(settings, mod_folder, code_allowed, order, kept=False, permissions="
         # it hold again, as for a player putting the folder back; only its options and switch are this test's.
         if options:
             keep_options(ini, place, option_lines(mod_folder, manifest, options))
-        keep_enabled(ini, place, enabled)
+        keep_enabled(ini, place, switch)
         return mod_id
-    lines = "[%s]\nenabled=%d\norder=%d\n" % (place, 1 if enabled else 0, order)
+    lines = "[%s]\nenabled=%d\norder=%d\n" % (place, 1 if switch else 0, order)
     if code_allowed and libraries:
         lines += "code_ok=%s\n" % code_token(target / libraries[0])
     # The player's answers as the consent screen records them (consent.md 1.2): every declared permission answered.
@@ -1249,12 +1495,22 @@ def sha256(path):
     return h.hexdigest()
 
 
+def run_diagnostics(test, args):
+    """The game's --diagnostics for a run: the runner's own (--diagnostics, for every run) then the test's, once each."""
+    given = [d for d in (args.diagnostics or "").split(",") if d]
+    return given + [d for d in test.get("diagnostics", []) if d not in given]
+
+
 def plan_text(test, out):
     lines = ["harness 1", "out %s" % out, "bare %d" % (1 if test["bare"] else 0)]
-    if not test["has_stage"]:
+    if not test["has_stage"] and test.get("clock", "title") == "title":
         lines.append("clock title")
     if test.get("device", "keyboard") == "pad":
         lines.append("device pad")
+    if test.get("time", "steps") == "real":
+        lines.append("time real")
+    if test.get("memory"):
+        lines.append("memory %d" % test["memory"])
     lines += test["setup"]
     for s in test["steps"]:
         if s["at"] is not None:
@@ -1338,7 +1594,7 @@ def place_mods(test, settings, previous, frozen, ports=None):
                          permissions="ask" if m["code"] == "ask" else m["permissions"],
                          broken_ok=not m["loads"] and m["enabled"], folder=m["folder"],
                          options=with_ports(m["options"], ports),
-                         enabled=m["enabled"])
+                         enabled=m["enabled"] if m["enabled_given"] or previous is None else None)
         # A mod with no code (luma.json has no "code": content only) is never started, so the host writes no start
         # or refusal line for it and there is no mod.<id>.loaded fact: its test's own facts show its content.
         try:
@@ -1350,19 +1606,28 @@ def place_mods(test, settings, previous, frozen, ports=None):
             frozen["mods/%s/%s" % (mod_id, lib.relative_to(settings / "mods" / mod_id).as_posix())] = sha256(lib)
     if test["safe_start"] == "asked":
         imports += ["--safe-start", "1"]
-    elif test["safe_start"] == "crash":
+    elif test["safe_start"] in ("crash", "crash-code"):
         (settings / "mods").mkdir(parents=True, exist_ok=True)
-        (settings / "mods" / ".safe_start").write_bytes(b"")
+        code = b"1" if test["safe_start"] == "crash-code" else b"0"
+        (settings / "mods" / ".crash").write_bytes(b"nebula crash 1\nphase play\ncode " + code + b"\n")
     return mod_ids, imports
 
 
 def write_run_settings(test, settings):
-    """The run's settings file: the window's size and the test's language (tools/verify/settings_args.py)."""
+    """The run's settings file: the window's size, the test's language, VSync off for a fixed-step run, and the test's own settings
+    (tools/verify/settings_args.py)."""
     assignments = ["GALAXY_WINDOW_WIDTH=%d" % test["window"][0], "GALAXY_WINDOW_HEIGHT=%d" % test["window"][1]]
     if test["language"] is not None:
         assignments.append("GALAXY_LANGUAGE=%s" % LANGUAGES[test["language"]])
     if GPU is not None:
         assignments.append("GALAXY_GPU=%s" % GPU)
+    named = {a.partition("=")[0] for a in test.get("settings", [])}
+    if test.get("time", "steps") == "steps" and "GALAXY_VSYNC_INTERVAL" not in named:
+        # A fixed-step run's frames do not follow the display, so its presents need not wait for the refresh (N-1052:
+        # Direct3D's VSync waits where Vulkan's MAILBOX does not, which made the Direct3D suites the gate's slowest).
+        # A test that names the setting (the pace suite's real-time runs) keeps its own.
+        assignments.append("GALAXY_VSYNC_INTERVAL=0")
+    assignments += [a for a in test.get("settings", []) if a.partition("=")[0] not in TEST_HOOKS]
     subprocess.run([sys.executable, "-I", str(TREE / "tools" / "verify" / "settings_args.py"), str(settings)] + assignments,
                    check=True, capture_output=True)
 
@@ -1376,6 +1641,60 @@ def pak_of(args, bin_folder):
     return pathlib.Path(bin_folder.joinpath("pak.path").read_text(encoding="utf-8").strip())
 
 
+# The releases a game.pak may be imported from, by their discs' ids.
+DISCS = ("RMGE01", "RMGP01", "RMGJ01")
+
+
+def pak_header(pak):
+    """A game.pak's 64-byte header (crates/nebula-import/src/cook/store.rs, write_index): the magic, the store version,
+    the index's places, then the disc's six-character id at byte 48."""
+    try:
+        with open(pak, "rb") as f:
+            return f.read(64)
+    except OSError as error:
+        raise HarnessError("the game %s does not open: %s" % (pak, error))
+
+
+def pak_disc(pak):
+    """The disc a game.pak was imported from (RMGE01, RMGP01, RMGJ01), or None when the header has none."""
+    return pak_disc_of(pak_header(pak))
+
+
+def pak_disc_of(head):
+    """The disc a game.pak's 64-byte header names, or None."""
+    disc = head[48:54].decode("ascii", "replace") if len(head) == 64 else ""
+    return disc if disc in DISCS else None
+
+
+def paks_for(args):
+    """The paks named per disc: --pak-for DISC=path (repeated), else LUMA_TEST_PAKS (DISC=path, joined by os.pathsep)."""
+    given = list(getattr(args, "pak_for", None) or [])
+    if not given and os.environ.get("LUMA_TEST_PAKS"):
+        given = [g for g in os.environ["LUMA_TEST_PAKS"].split(os.pathsep) if g]
+    paks = {}
+    for g in given:
+        disc, eq, path = g.partition("=")
+        if not eq or disc not in DISCS or not path:
+            raise HarnessError("--pak-for %s: give DISC=<game.pak>, DISC one of %s" % (g, ", ".join(DISCS)))
+        paks[disc] = pathlib.Path(path)
+    return paks
+
+
+def pak_for(test, args, bin_folder):
+    """The game.pak this test runs on: the run's own (pak_of) unless the test needs another disc, then the one named
+    for that disc; with none, NotRun."""
+    pak = pak_of(args, bin_folder)
+    disc = test.get("disc")
+    if disc is None or pak_disc(pak) == disc:
+        return pak
+    other = paks_for(args).get(disc)
+    if other is None:
+        raise NotRun("needs disc %s: this run's game is %s; give --pak-for %s=<its game.pak>" % (disc, pak_disc(pak) or "of no known disc", disc))
+    if pak_disc(other) != disc:
+        raise HarnessError("--pak-for %s names %s, a game of %s" % (disc, other, pak_disc(other) or "no known disc"))
+    return other
+
+
 def described(bin_folder, name):
     """A file of the game's self-description: at the bin folder's top (a build folder) or in its luma/ folder (an
     installed version)."""
@@ -1383,6 +1702,44 @@ def described(bin_folder, name):
         if place.is_file():
             return place
     return None
+
+
+# The address sanitizer's runtime, which a sanitizer build's game modules import (build_windows.ps1 -Sanitize puts it in the bin folder).
+SANITIZER_RUNTIME = "clang_rt.*.dll"
+
+
+def copy_sanitizer_runtime(bin_folder, target, frozen):
+    """The sanitizer runtime DLLs of the bin folder, into a run's own bin folder beside the programs (the loader finds a module's
+    imports there, N-1062); each is frozen with the rest. A build without sanitizers has none: nothing is copied."""
+    for runtime in sorted(pathlib.Path(bin_folder).glob(SANITIZER_RUNTIME)):
+        shutil.copy2(runtime, pathlib.Path(target) / runtime.name)
+        frozen[runtime.name] = sha256(pathlib.Path(target) / runtime.name)
+
+
+STORE_VERSION_FUNCTION = "nebula_import_store_version"
+ASK_SECONDS = 60
+
+
+def asked_store_version(library, function=STORE_VERSION_FUNCTION):
+    """The number the exported function `function` of `library` gives (the importer's store version: crates/nebula-import c_api.rs),
+    asked in a program of its own so that no library stays loaded here; None when it cannot be asked (no such file, not a library, no
+    such function, no answer)."""
+    code = "import ctypes,sys; f=getattr(ctypes.CDLL(sys.argv[1]), sys.argv[2]); f.restype=ctypes.c_uint32; print(f())"
+    try:
+        done = subprocess.run([sys.executable, "-I", "-c", code, str(library), function], capture_output=True, text=True,
+                              timeout=ASK_SECONDS)
+        return int(done.stdout.strip()) if done.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def build_store_version(bin_folder):
+    """(the store version the game data of this build must have, whose it is): the one its own importer writes, so that an older
+    build is played with its own data; this tree's store_version.inc where the importer cannot be asked."""
+    asked = asked_store_version(pathlib.Path(bin_folder) / HOST["importer"])
+    if asked is not None:
+        return asked, "this build's, from its own importer,"
+    return int((TREE / "runtime" / "include" / "galaxy" / "store_version.inc").read_text(encoding="utf-8").strip()), "this tree's"
 
 
 def run_one(test, renderer, args, run_folder, previous):
@@ -1402,17 +1759,15 @@ def run_one(test, renderer, args, run_folder, previous):
     for need in (exe, bin_folder / HOST["game"], bin_folder / HOST["importer"]):
         if not need.is_file():
             raise HarnessError("the bin folder has no %s" % need.name)
-    # The pak must be of this tree's store version (the host refuses another at its start: "need importing again").
-    pak = pak_of(args, bin_folder)
-    wanted = int((TREE / "runtime" / "include" / "galaxy" / "store_version.inc").read_text(encoding="utf-8").strip())
-    try:
-        with open(pak, "rb") as f:
-            head = f.read(12)
-    except OSError as error:
-        raise HarnessError("the game %s does not open: %s" % (pak, error))
+    # The pak must be of the store version of the build it is played with (the host refuses another at its start: "need importing
+    # again"). The build's own: a side of a speed pair is an older build with its own data, played by this tree's runner.
+    pak_path = pak_for(test, args, bin_folder)
+    pak = pak_path
+    wanted, whose = build_store_version(bin_folder)
+    head = pak_header(pak)
     if head[:8] != b"NBSTORE" + bytes(1) or int.from_bytes(head[8:12], "little") != wanted:
-        raise HarnessError("the game %s is of store version %s; this runner's is %d: import the game again with this "
-                           "version's nebula-import or name another pak" % (pak, int.from_bytes(head[8:12], "little") if head[:8] == b"NBSTORE" + bytes(1) else "none (not a store)", wanted))
+        raise HarnessError("the game %s is of store version %s; %s is %d: import the game again with this "
+                           "version's nebula-import or name another pak" % (pak, int.from_bytes(head[8:12], "little") if head[:8] == b"NBSTORE" + bytes(1) else "none (not a store)", whose, wanted))
     if run_folder.exists():
         shutil.rmtree(run_folder)
     for sub in ("bin", "pictures", "saves", "settings", "appdata"):
@@ -1427,12 +1782,14 @@ def run_one(test, renderer, args, run_folder, previous):
             shutil.rmtree(run_folder / sub)
             shutil.copytree(previous / sub, run_folder / sub)
         carry_data(previous, run_folder)
+    place_saves(test, run_folder)
     frozen = {}
     # The plain module when the bin folder has it: without it the game loads the rows module and says so.
     plain = (HOST["plain"],) if (bin_folder / HOST["plain"]).is_file() else ()
     for name in (exe.name, HOST["game"]) + plain:
         shutil.copy2(bin_folder / name, run_folder / "bin" / name)  # copy2: the program keeps its mode on Linux
         frozen[name] = sha256(run_folder / "bin" / name)
+    copy_sanitizer_runtime(bin_folder, run_folder / "bin", frozen)
     shutil.copy2(extension, run_folder / "bin" / HOST["extension"])
     frozen[HOST["extension"]] = sha256(run_folder / "bin" / HOST["extension"])
     # The game's placement facts, which the build writes beside the module (native/CMakeLists.txt, placement.py): an
@@ -1477,7 +1834,7 @@ def run_one(test, renderer, args, run_folder, previous):
     write_run_settings(test, settings)
     plan = run_folder / "plan.txt"
     plan.write_text(plan_text(test, run_folder.as_posix()), encoding="utf-8", newline="\n")
-    pak = str(pak_of(args, bin_folder))
+    pak = str(pak_path)
     env = dict(os.environ)
     # The test extension's data guard (tools/test_driver/extension/data_guard.cpp) declines to start unless the run
     # names its own work folder and every private folder lies inside it, away from the player's data.
@@ -1495,6 +1852,10 @@ def run_one(test, renderer, args, run_folder, previous):
         "GALAXY_AUDIO_WAV_DUMP_SECONDS": str(int(math.ceil(test["limit"]))),
         "LUMA_HARNESS_PLAN": str(plan),
     })
+    for a in test.get("settings", []):
+        name, _, value = a.partition("=")
+        if name in TEST_HOOKS:
+            env[name] = value
     if platform.system() == "Linux":
         # The game's data folder ($XDG_DATA_HOME/Nebula, platform_paths.h) in the run's, as LOCALAPPDATA on Windows.
         env["XDG_DATA_HOME"] = str(run_folder / "appdata")
@@ -1504,16 +1865,34 @@ def run_one(test, renderer, args, run_folder, previous):
     if platform.system() == "Linux":
         # The importer's library is opened by name (dlopen "libnebula_import.so"), SDL's beside the game.
         env["LD_LIBRARY_PATH"] = os.pathsep.join([str(run_folder / "bin")] + [p for p in [os.environ.get("LD_LIBRARY_PATH")] if p])
-    for name in ("GALAXY_PRESENT_SNAPSHOT_DIR", "GALAXY_INPUT_AUTOPRESS_SCRIPT", "GALAXY_TEST_DETERMINISTIC"):
-        env.pop(name, None)
     command = [str(run_folder / "bin" / exe.name), "--pak", pak, "--saves", str(run_folder / "saves"),
-               "--seconds", str(int(math.ceil(test["limit"]))), "--settings", str(settings),
+               "--seconds", str(int(math.ceil(test["limit"])) + int(HANG_SECONDS) + 30), "--settings", str(settings),
                "--crash-dumps", str(run_folder), "--extension", str(run_folder / "bin" / HOST["extension"])] + imports
-    if args.diagnostics:
+    # No game of a test run takes the player's keyboard focus, hidden or visible (docs/using-nebula/command-line-arguments.md).
+    command += ["--no-focus", "1"]
+    diagnostics = run_diagnostics(test, args)
+    if diagnostics:
         # A stress or record the whole run is made under (--diagnostics ring-stress): the game's own switch.
-        command += ["--diagnostics", args.diagnostics]
+        command += ["--diagnostics", ",".join(diagnostics)]
+        if "timeline" in diagnostics:
+            command += ["--timeline", str(run_folder / "timeline.bin")]
+    if getattr(args, "gpu_validation", 0):
+        # The graphics API's debug layer (the gate's validate lane): the game says whether it is really on at its start.
+        command += ["--gpu-validation", str(int(args.gpu_validation))]
+    if getattr(args, "software_device", 0):
+        # The software graphics device (docs/using-nebula/command-line-arguments.md): no graphics card is used.
+        command += ["--software-device", "1"]
     hidden = {}
-    if platform.system() == "Windows":
+    if test.get("visible") and platform.system() == "Windows":
+        # A visible run (the play route measure) shows without taking the focus: the player's keys stay where they were
+        # (P-328). Its window is watched (watch_window): a run the player's desktop reached is said so.
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startup.wShowWindow = 4  # SW_SHOWNOACTIVATE
+        hidden["startupinfo"] = startup
+    elif test.get("visible"):
+        pass
+    elif platform.system() == "Windows":
         startup = subprocess.STARTUPINFO()
         startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startup.wShowWindow = subprocess.SW_HIDE
@@ -1523,14 +1902,290 @@ def run_one(test, renderer, args, run_folder, previous):
         command += ["--hidden", "1"]
     began = time.time()
     with (run_folder / "run.log").open("wb") as log:
-        with subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT, **hidden) as process:
-            code, starts, unwatched = watch_run(process, run_folder, exe.name, test["limit"] + 60)
+        try:
+            process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT, **hidden)
+        except OSError as error:
+            if drive_full(error):
+                raise
+            raise HarnessError("the game could not be started: %s" % error) from error
+        with process:
+            watched, watcher = None, None
+            if test.get("visible") and platform.system() == "Windows":
+                import threading
+                watched = threading.Event()
+                watcher = threading.Thread(target=watch_window, args=(run_folder, process.pid, watched), daemon=True)
+                watcher.start()
+            try:
+                code, starts, unwatched, steps = watch_run(process, run_folder, exe.name, test["limit"])
+            finally:
+                if watcher is not None:
+                    watched.set()
+                    watcher.join(5)
     seconds = time.time() - began
     return {"code": code, "seconds": seconds, "frozen": frozen, "mods": mod_ids, "exe": exe.name, "starts": starts,
-            "unwatched": unwatched}
+            "unwatched": unwatched, **steps}
 
 
-def watch_run(first, run_folder, exe_name, limit):
+# What the runner sees of a running game's progress: the host's own report (native/host/host_main.cpp, its main loop), one
+# line a second in the run's log whenever the game's step count has moved, "[  12.345] host: frame 721, file reads ...":
+# the host's clock, then the game's steps so far. The line is written on every platform (on Android it reaches logcat, tag
+# Nebula). A line is "a step was completed"; the host writes none before the first step, nor while no step is taken.
+PROGRESS_LINE = re.compile(r"^\[\s*(\d+\.\d{3})\] host: frame (\d+),")
+# The host's line near the start of every process (the host's clock is 0 there): a start of the game, the first or the one
+# that took the place of another (also ExecStarts').
+START_LINE = "boot: main at"
+
+
+class Progress:
+    """The steps a game has taken, read from its progress lines (PROGRESS_LINE) as its log grows (a file, or text handed to
+    feed_lines), and how long ago the last one was seen, on `clock`. The time before the first step of a process (its
+    start-up) is nobody's pause: quiet() is None until a step is seen, and again for each process that takes the place of
+    the one before (new_process). A line seen twice (a log read again from further back) counts once: only a step the host's
+    clock puts after the last one is a step."""
+
+    def __init__(self, log=None, clock=time.monotonic):
+        self.log = None if log is None else pathlib.Path(log)
+        self.clock = clock
+        self.offset = 0
+        self.rest = b""
+        self.new_process()
+
+    def new_process(self):
+        self.frame = None
+        self.stamp = None
+        self.last = None
+
+    def poll(self):
+        """Reads what the file has gained since the last poll (whole lines only)."""
+        if self.log is None:
+            return
+        try:
+            with open(self.log, "rb") as f:
+                f.seek(self.offset)
+                more = f.read()
+        except OSError:
+            return
+        self.offset += len(more)
+        lines = (self.rest + more).split(b"\n")
+        self.rest = lines.pop()
+        self.feed_lines((line.decode("utf-8", "replace") for line in lines), starts=True)
+
+    def feed_lines(self, lines, starts=False):
+        """Takes lines of the log in order. `starts`: each line is new to this reader (a file read on from where it was), so
+        the host's start line (START_LINE) says the game started again. Text read again from further back (a device's log
+        tail) is given without it: its start line is old news, and its process is told by new_process."""
+        for line in lines:
+            if starts and START_LINE in line:
+                self.new_process()
+                continue
+            m = PROGRESS_LINE.match(line)
+            if m is None:
+                continue
+            stamp = float(m.group(1))
+            if self.stamp is not None and stamp <= self.stamp:
+                continue
+            self.stamp, self.frame, self.last = stamp, int(m.group(2)), self.clock()
+
+    def quiet(self):
+        """Seconds since the last step was seen; None when this process has taken none."""
+        return None if self.last is None else self.clock() - self.last
+
+    def snapshot(self):
+        """What the verdict needs: whether a step was seen, how long ago the last was, at which step the game stood, and its
+        speed: the steps it had completed divided by the host's seconds at the last step line (steps a second, over this
+        process's whole run; the host's frame count is the game's own step count, not the pictures drawn: the line's
+        "renderer frames" is that)."""
+        rate = self.frame / self.stamp if self.frame and self.stamp else None
+        return {"stepped": self.last is not None, "quiet": self.quiet(), "frame": self.frame, "rate": rate}
+
+
+def stalls_in(log_lines, after=STALL_SECONDS):
+    """[(seconds, frame)] for each pause between two progress lines of one process of more than `after` seconds on the
+    host's own clock (the lines are a second apart while the game steps), the frame being the last step before it. A line
+    whose time is before the one before, and the host's start line (START_LINE), are another process (the game starting
+    again): no pause is read across it."""
+    found, stamp, frame = [], None, None
+    for line in log_lines:
+        if START_LINE in line:
+            stamp = None
+            continue
+        m = PROGRESS_LINE.match(line)
+        if m is None:
+            continue
+        now = float(m.group(1))
+        if stamp is not None and now >= stamp and now - stamp > after:
+            found.append((int(now - stamp), frame))
+        stamp, frame = now, int(m.group(2))
+    return found
+
+
+def stall_line(seconds, frame):
+    """The line a pause is written as, in the result, on the console and in the run's summary."""
+    return "stall %d s at frame %d" % (seconds, frame)
+
+
+def hang_dump(run_folder, process=None):
+    """The dump step for a game that is judged hung and about to be ended. The host writes the dump itself, from outside
+    its own threads, when no frame came for 10 s in a test run on Windows (nebula-hang-*.dmp, host_main.cpp); this names what
+    it wrote, and the verdict says so. Elsewhere the game writes none, and the verdict says that."""
+    return sorted(p.name for p in pathlib.Path(run_folder).glob("nebula-hang-*.dmp"))
+
+
+COVERED_BELOW = 0.5  # a window with less than this share of its area visible is "covered"
+
+
+def visible_share(rect, above):
+    """The share (0 to 1) of the rectangle `rect` (left, top, right, bottom) that none of the rectangles `above` covers:
+    each is subtracted as a rectangle (a window above it, in front, has its whole rectangle)."""
+    pieces = [rect]
+    for hole in above:
+        h_l, h_t, h_r, h_b = hole
+        rest = []
+        for l, t, r, b in pieces:
+            if h_l >= r or h_r <= l or h_t >= b or h_b <= t:  # does not touch this piece
+                rest.append((l, t, r, b))
+                continue
+            if h_t > t:
+                rest.append((l, t, r, h_t))                                  # above the hole
+            if h_b < b:
+                rest.append((l, h_b, r, b))                                  # below it
+            mid_t, mid_b = max(t, h_t), min(b, h_b)
+            if h_l > l:
+                rest.append((l, mid_t, h_l, mid_b))                          # left of it
+            if h_r < r:
+                rest.append((h_r, mid_t, r, mid_b))                          # right of it
+        pieces = rest
+    whole = (rect[2] - rect[0]) * (rect[3] - rect[1])
+    if whole <= 0:
+        return 1.0
+    return sum((r - l) * (b - t) for l, t, r, b in pieces) / whole
+
+
+def window_kinds(desktop, ours, pointer_moved=True):
+    """The ways the player's desktop reached the run's window in this look: a list of "active" (the foreground window is the
+    run's, so keys reach it), "pointer" (the pointer is over it and `pointer_moved`: a pointer that rests where the window
+    came up reaches nothing, a game window that takes no focus reads no pointer that does not move), "minimized" and "covered" (less than half of the game's window
+    is visible: the visible windows above it, not minimized and not cloaked, subtracted as rectangles). `desktop` is the
+    look: foreground_pid(), pointer_pid() (the process of the top-level window under the pointer) and windows(): the top-level
+    windows from the top down, each {pid, visible, minimized, cloaked, rect, through} (through: a layered window the pointer
+    passes through, an overlay that hides nothing). `ours`: the run's process ids."""
+    kinds = []
+    if desktop.foreground_pid() in ours:
+        kinds.append("active")
+    if pointer_moved and desktop.pointer_pid() in ours:
+        kinds.append("pointer")
+    above = []
+    for w in desktop.windows():
+        if w["pid"] in ours:
+            if w["visible"] and w["minimized"]:
+                kinds.append("minimized")
+                break
+            if w["visible"] and not w["cloaked"]:
+                share = visible_share(w["rect"], above)
+                if share < COVERED_BELOW:
+                    kinds.append("covered")
+                    break
+            continue
+        if (w["visible"] and not w["minimized"] and not w["cloaked"] and not w["through"]
+                and w["rect"][2] > w["rect"][0] and w["rect"][3] > w["rect"][1]):
+            above.append(w["rect"])
+    return kinds
+
+
+def win32_desktop(first_pid, run_folder):
+    """The look at the real desktop (Windows), and the set of the run's processes: the one started and each one the host
+    started in its place (run_folder/restarted)."""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    dwm = ctypes.WinDLL("dwmapi")
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.WindowFromPoint.restype = wintypes.HWND
+    user32.WindowFromPoint.argtypes = [wintypes.POINT]
+    user32.GetAncestor.restype = wintypes.HWND
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    dwm.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT, DWMWA_CLOAKED, GA_ROOT = -20, 0x80000, 0x20, 14, 2
+
+    def pid_of(hwnd):
+        pid = wintypes.DWORD(0)
+        if hwnd:
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return pid.value
+
+    class Desktop:
+        def foreground_pid(self):
+            return pid_of(user32.GetForegroundWindow())
+
+        def pointer_at(self):
+            point = wintypes.POINT()
+            return (point.x, point.y) if user32.GetCursorPos(ctypes.byref(point)) else None
+
+        def pointer_pid(self):
+            point = wintypes.POINT()
+            if not user32.GetCursorPos(ctypes.byref(point)):
+                return 0
+            under = user32.WindowFromPoint(point)
+            return pid_of(user32.GetAncestor(under, GA_ROOT)) if under else 0
+
+        def windows(self):
+            found = []
+
+            def visit(hwnd, _):
+                rect, cloaked = wintypes.RECT(), ctypes.c_int(0)
+                user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                dwm.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, ctypes.byref(cloaked), 4)
+                style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                found.append({"pid": pid_of(hwnd), "visible": bool(user32.IsWindowVisible(hwnd)),
+                              "minimized": bool(user32.IsIconic(hwnd)), "cloaked": cloaked.value != 0,
+                              "rect": (rect.left, rect.top, rect.right, rect.bottom),
+                              "through": bool(style & WS_EX_LAYERED and style & WS_EX_TRANSPARENT)})
+                return True
+            user32.EnumWindows(enum_proc(visit), 0)  # the top-level windows, the top one first
+            return found
+
+    def pids():
+        out = {first_pid}
+        try:
+            words = (run_folder / "restarted").read_text(encoding="utf-8").split()
+            if words and words[0].isdigit():
+                out.add(int(words[0]))
+        except OSError:
+            pass
+        return out
+    return Desktop(), pids
+
+
+def watch_window(run_folder, first_pid, done, desktop=None, pids=None, now=time.time, every=0.25):
+    """A visible run's window, every quarter second until `done` is set (Windows): a line in run_folder/window-watch.txt
+    the first time, and a count, of each way the player's desktop reached it (window_kinds): "minimized", "active" (the
+    foreground window, so keys reach it), "pointer" (the pointer over it and moving: one that rests under the window reaches
+    nothing) and "covered" (less than half of the game's window is visible). The run's processes: the one started and each
+    one the host started in its place."""
+    if desktop is None:
+        desktop, pids = win32_desktop(first_pid, run_folder)
+    seen = {}
+    began = now()
+    last = None  # where the pointer was at the look before
+    while not done.wait(every):
+        here = desktop.pointer_at() if hasattr(desktop, "pointer_at") else None
+        moved = hasattr(desktop, "pointer_at") is False or (last is not None and here != last)
+        last = here
+        for kind in window_kinds(desktop, pids(), moved):
+            first, count = seen.get(kind, (now() - began, 0))
+            seen[kind] = (first, count + 1)
+    if seen:
+        lines = ["%s first at %.1f s, %d of the quarter seconds" % (k, first, n) for k, (first, n) in sorted(seen.items())]
+        (run_folder / "window-watch.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def watch_run(first, run_folder, exe_name, limit, clock=time.monotonic, hang_after=HANG_SECONDS, dump=hang_dump):
     """The run's game to its end: the process the runner started and each one that took its place (the host's
     start-again: mods cooked, a mod's code chose other layers). The host writes "<process id> <creation time>" of the new
     process to <crash dumps>/restarted, the run folder here, just after starting it and before its own end. The new
@@ -1540,8 +2195,19 @@ def watch_run(first, run_folder, exe_name, limit):
     The file is read while the process that writes it still runs, and the new process is opened at once: an open
     handle keeps it findable with its exit code however long the old one takes to end, so a new process that ends
     first is still watched. Each process gets `limit` seconds and is ended at it (Popen's kill or Followed's); one
-    ended at its limit, or one that cannot be watched, ends every process that took its place too. Returns (the last process's exit code, or None when
-    one was ended at its limit; processes started; why one could not be watched, or None)."""
+    ended at its limit, or one that cannot be watched, ends every process that took its place too.
+
+    The limit is when the runner looks at how the run stands; what the ending means is judged by the game's own steps
+    (Progress). A process whose last step was seen `hang_after` seconds ago is ended as hung, after `dump(run_folder,
+    process)` (the dump step: it returns the names of the dumps the game wrote). When the limit passes with the game in a
+    pause (no step for STALL_SECONDS) nothing is decided: the run goes on until steps come again (then the limit is judged) or
+    the pause reaches `hang_after` (hung). When the limit passes with the game stepping, or with no step ever taken, the game
+    is ended and the run says so (limit_hit). `clock` is the runner's clock for all of it. The game's own --seconds is set
+    beyond the limit, a pause and a margin, so that the runner and not the game decides what the limit means.
+
+    Returns (the last process's exit code, or None when one was ended at its limit or as hung; processes started; why one
+    could not be watched, or None; {"stepped", "quiet", "frame", "rate" as Progress.snapshot gives them, "limit_hit", and
+    "hung": None, or {"seconds", "frame", "dumps"} for a process ended as hung})."""
     marker = run_folder / "restarted"
     seen = set()
     waiting = []
@@ -1585,9 +2251,13 @@ def watch_run(first, run_folder, exe_name, limit):
             state["unwatched"] = "the game started again more than 4 times"
         return True
 
+    progress = Progress(run_folder / "run.log", clock)
+    hung = None
+    limit_hit = False
     process = first
     while True:
-        deadline = time.time() + limit
+        progress.new_process()
+        deadline = clock() + limit
         code = None
         try:
             while True:
@@ -1596,30 +2266,47 @@ def watch_run(first, run_folder, exe_name, limit):
                     break
                 except subprocess.TimeoutExpired:
                     look(False)
+                    progress.poll()
                     if look_exec():
-                        deadline = time.time() + limit
+                        # The log is read to the end of the old start before the new one's steps are looked for.
+                        progress.poll()
+                        progress.new_process()
+                        deadline = clock() + limit
                     if state["unwatched"] is not None and execs is not None:
                         process.kill()
                         process.wait()
                         break
-                    if time.time() >= deadline:
+                    quiet = progress.quiet()
+                    if quiet is not None and quiet >= hang_after:
+                        # Alive, and no step for hang_after seconds: hung. The dump step first, then the end.
+                        hung = {"seconds": int(quiet), "frame": progress.frame, "dumps": dump(run_folder, process)}
+                        process.kill()
+                        process.wait()
+                        break
+                    if clock() >= deadline:
+                        if quiet is not None and quiet > STALL_SECONDS:
+                            # The limit passed in a pause: nothing is decided yet. If steps come again the limit is judged
+                            # then; if the pause reaches hang_after the check above ends the game as hung.
+                            continue
+                        limit_hit = True
                         process.kill()
                         process.wait()
                         break
         finally:
             if isinstance(process, Followed):
                 process.close()
+        progress.poll()
         if code is None:
-            # Ended at its limit: what took its place goes too, so no process of the run outlives it.
+            # Ended at its limit, or as hung: what took its place goes too, so no process of the run outlives it.
             end_all(waiting)
-            return None, state["starts"], state["unwatched"]
+            return None, state["starts"], state["unwatched"], dict(progress.snapshot(), hung=hung, limit_hit=limit_hit)
         look(True)
         look_exec()
         if state["unwatched"] is not None:
             end_all(waiting)
-            return code, state["starts"], state["unwatched"]
+            return code, state["starts"], state["unwatched"], dict(progress.snapshot(), hung=None, limit_hit=False)
         if not waiting:
-            return code, state["starts"], None
+            return code, state["starts"], None, dict(progress.snapshot(), hung=None, limit_hit=False)
         process = waiting.pop(0)
 
 
@@ -1904,13 +2591,16 @@ def check_value(actual, op, value, within):
         return has_value(actual, value)
     if op == "is_not":
         return not same_value(actual, value)
-    if op == "near":
+    if op in ("near", "far"):
+        distance = None
         if isinstance(actual, (int, float)) and not isinstance(actual, bool) and isinstance(value, (int, float)):
-            return abs(actual - value) <= within
-        if isinstance(actual, list) and isinstance(value, list) and len(actual) == len(value) and all(
+            distance = abs(actual - value)
+        elif isinstance(actual, list) and isinstance(value, list) and len(actual) == len(value) and all(
                 isinstance(v, (int, float)) and not isinstance(v, bool) for v in actual):
-            return math.sqrt(sum((p - q) ** 2 for p, q in zip(actual, value))) <= within
-        return False
+            distance = math.sqrt(sum((p - q) ** 2 for p, q in zip(actual, value)))
+        if distance is None:
+            return False  # not a value of that shape: neither near nor far
+        return distance <= within if op == "near" else distance > within
     if isinstance(actual, bool) or not isinstance(actual, (int, float)):
         return False
     return {"less": actual < value, "at_most": actual <= value, "more": actual > value, "at_least": actual >= value}[op]
@@ -1919,6 +2609,14 @@ def check_value(actual, op, value, within):
 # The host's own crash line (native/host/host_main.cpp log_line("crash:", ...)): its time, then the tag. A mod or a
 # fact that writes the word elsewhere is not a crash.
 CRASH_LINE = re.compile(r"^\[\s*\d+\.\d{3}\] crash: ")
+# Direct3D 11's constants watch (--diagnostics constants-watch, runtime/include/galaxy/render/d3d11/constants_watch_d3d11.h,
+# ledger P-332): the line it prints when a compute read of the constant ring did not read what was written.
+CONSTANTS_WATCH = "[constants] watch"
+
+
+WRITTEN_CHECK = "every picture asked was written"
+LOSS_CHECK = "nothing the game asked for was lost"
+NO_LOSS_REPORT = "no [loss] report at the exit"
 
 
 def evaluate(test, renderer, run_folder, ran):
@@ -1935,10 +2633,12 @@ def evaluate(test, renderer, run_folder, ran):
         checks.append({"check": name, "result": "pass" if ok else "fail", "actual": actual})
         return ok
 
-    # A crash's dump, and a stall's (nebula-hang-*.dmp: the host's every-thread dump when a test run's game made no
-    # frame for 10 s; it goes on, so the run is judged by it here).
+    # A crash's dump. A stall's (nebula-hang-*.dmp: the host's every-thread dump when a test run's game made no frame for
+    # 10 s; the game goes on) is no crash: a pause is judged by the game's step lines, below.
     dumps = sorted(p.name for p in run_folder.glob("*.dmp") if not p.name.startswith("nebula-hang-"))
-    hangs = sorted(p.name for p in run_folder.glob("nebula-hang-*.dmp"))
+    # A pause of HANG_SECONDS or more in the game's step lines is a hang, whether or not the runner was watching (the runner
+    # ends a game as hung at that point, so a log with such a pause is one it did not watch).
+    long_gaps = [seconds for seconds, _ in stalls_in(log_lines) if seconds >= HANG_SECONDS]
     stop = by_key.get("harness.stop", [])
     end = by_key.get("harness.end", [])
     crash_lines = [line for line in log_lines if CRASH_LINE.match(line)]
@@ -1949,9 +2649,12 @@ def evaluate(test, renderer, run_folder, ran):
     code = ran.get("code")
     died = (not end and not stop and isinstance(code, int) and code != 0
             and ran.get("seconds", float(test["limit"])) < test["limit"])
-    crashed = bool(dumps or crash_lines or died)
-    # A test that must end in a crash (ends "crash") that crashed is judged by its checks, as any run that ended.
-    meant = test["ends"] == "crash" and crashed
+    # After the end step (ends "crash-at-stop"): the game gone with a code that is not 0 while it stopped.
+    died_at_stop = (test["ends"] == "crash-at-stop" and bool(end) and not stop and isinstance(code, int) and code != 0)
+    crashed = bool(dumps or crash_lines or died or died_at_stop)
+    # A test that must end in a crash (ends "crash", or "crash-at-stop" once its end step was reached) that crashed is
+    # judged by its checks, as any run that ended; a crash-at-stop test that crashed before its end step is a crash.
+    meant = crashed and (test["ends"] == "crash" or (test["ends"] == "crash-at-stop" and bool(end)))
     verdict, reason = None, None
     declined = [line for line in log_lines if "fatal: --extension" in line or "extension: test extension:" in line]
     # The host could not open the bin folder's game.pak (host_main.cpp open_pak: another store version, or unreadable).
@@ -1969,15 +2672,39 @@ def evaluate(test, renderer, run_folder, ran):
         if not dumps and not crash_lines:
             reason = "the game ended after %.1f s with exit %d (0x%08X) before its end step, with no crash line and no dump; %s" % (
                 ran.get("seconds", 0.0), code, code & 0xFFFFFFFF, reason)
+    elif ran.get("no_exit_record"):
+        # The tablet's record of how the game's process ended never came (luma_test_android.py): nothing is known of the end.
+        verdict = "no-exit-record"
+        reason = "the tablet gave no exit record for the game's process, so how the game ended is not known"
     elif stop:
         verdict = stop[-1]["value"].get("verdict", "fail")
         reason = stop[-1]["value"].get("reason", "")
+    elif ran.get("hung"):
+        hung = ran["hung"]
+        verdict = "hung"
+        reason = "the game completed no step for %d s while its process was alive (it stood at frame %s); %s" % (
+            hung["seconds"], hung["frame"],
+            ("stall dump: %s" % ", ".join(hung["dumps"])) if hung.get("dumps") else "no stall dump was written")
     elif not end and not meant:
-        verdict = "timeout"
-        reason = "the run did not reach its end step within limit_seconds (%s s)" % test["limit"]
-        stalled = [line for line in log_lines if "the game made no frame for" in line]
-        if stalled:
-            reason += "; %s" % stalled[0].split("host: ", 1)[-1]
+        if ran.get("limit_hit") and ran.get("stepped") and ran.get("rate") is not None:
+            # The limit passed with the game stepping: how much game time did it get? At 80% of full speed or more the
+            # machine was not the reason; under that it is too slow, which the gate runs again alone.
+            share = ran["rate"] / GAME_STEPS_PER_SECOND
+            if share >= FULL_SPEED_SHARE:
+                verdict = "not-reached"
+                reason = "its end was not reached in %s s although the game ran at full speed" % test["limit"]
+            else:
+                verdict = "too-slow"
+                reason = ("too slow on this machine now: still moving when its time limit of %s s passed "
+                          "(the game ran at %d%% of full speed)" % (test["limit"], round(share * 100)))
+        else:
+            verdict = "timeout"
+            reason = "the run did not reach its end step within limit_seconds (%s s)" % test["limit"]
+            if ran.get("limit_hit"):
+                reason += ", and the game never took a step"
+            stalled = [line for line in log_lines if "the game made no frame for" in line]
+            if stalled:
+                reason += "; %s" % stalled[0].split("host: ", 1)[-1]
     # Always checked (test-harness.md 3.7).
     if ran.get("unwatched"):
         add("every process the game started in its place was watched to its end", False, ran["unwatched"])
@@ -1985,11 +2712,18 @@ def evaluate(test, renderer, run_folder, ran):
         add("the game started %d time%s" % (test["starts"], "" if test["starts"] == 1 else "s"),
             ran.get("starts") == test["starts"], ran.get("starts"))
     end_step = next(s for s in test["steps"] if s["action"] == "end")
-    if test["ends"] == "crash":
-        # The crash is the run's end: before the end step, by the host's crash reporter (its line, a dump, the game
-        # gone with a code that is not 0, not killed at the limit).
-        add("the game ended in a crash before its end step", crashed and not end,
-            (crash_lines[:1] or dumps) if not end else end[-1]["value"].get("frame"))
+    if test["ends"] in ("crash", "crash-at-stop"):
+        if test["ends"] == "crash":
+            # The crash is the run's end: before the end step, by the host's crash reporter (its line, a dump, the
+            # game gone with a code that is not 0, not killed at the limit).
+            add("the game ended in a crash before its end step", crashed and not end,
+                (crash_lines[:1] or dumps) if not end else end[-1]["value"].get("frame"))
+        else:
+            # The end step reached, then the crash while the game stopped.
+            frame = end[-1]["value"].get("frame") if end else None
+            add("the run reached its end step", bool(end) and (end_step["at"] is None or frame == end_step["at"]), frame)
+            add("the game crashed while it stopped, after its end step", crashed and bool(end),
+                crash_lines[:1] or dumps or ran.get("code"))
         if platform.system() == "Windows":
             add("a crash dump was written", bool(dumps), dumps)
         else:
@@ -2002,12 +2736,30 @@ def evaluate(test, renderer, run_folder, ran):
             frame = end[-1]["value"].get("frame")
             add("the run ended at its end step", end_step["at"] is None or frame == end_step["at"], frame)
         add("no crash dump", not dumps, dumps)
-        add("the game never stopped making frames", not hangs, hangs)
+        add("the game took a step at least every %d s" % HANG_SECONDS, not ran.get("hung") and not long_gaps,
+            long_gaps or ([ran["hung"]["seconds"]] if ran.get("hung") else []))
         add("the game quit by itself with exit 0", ran.get("code") == 0, ran.get("code"))
     # The game says this once when it cannot give a refusal in words (mod_plugins.cpp validate_message): the importer's
     # library did not load or has no luma_validate_message. Every refusal of the run is then codes only.
     coded = [line for line in log_lines if "refusals are given as codes" in line]
     add("refusals are given in words", not coded, coded)
+    # The constants watch's line (the gate's Direct3D 11 runs turn the watch on) fails the run, whatever else it says.
+    watched = [line for line in log_lines if CONSTANTS_WATCH in line]
+    if watched:
+        add("the constants watch saw every read right", False, watched[:3])
+    if test["ends"] == "end" and end:
+        # Nothing the game asked for was lost (galaxy/loss_report.h): the [loss] counts the host logs at its exit (a draw
+        # with no material or pipeline, a texture drawn blank, a sound read past its memory) are all 0.
+        report = [line for line in log_lines if line.startswith("[loss] ") and not line.startswith("[loss] first")]
+        counts = re.findall(r"([\w-]+)=(\d+)", report[-1]) if report else []
+        add(LOSS_CHECK, bool(report) and bool(counts) and all(v == "0" for _, v in counts),
+            report[-1] if report else NO_LOSS_REPORT)
+    if test["ends"] == "end" and end:
+        # Every picture a step asked was written (the host writes them from the GPU at its exit, waiting 5 s): a test
+        # whose picture never came is not a pass, whether or not a check of its own reads that picture.
+        unwritten = sorted(s["picture"] for s in test["steps"]
+                           if "picture" in s and not (run_folder / "pictures" / (s["picture"] + ".png")).exists())
+        add(WRITTEN_CHECK, not unwritten, unwritten)
     for bad in by_key.get("harness.bad_fact", []):
         add("every fact is well formed (JSON, a key a mod may log)", False, bad["value"])
     if not test["bare"]:
@@ -2025,11 +2777,12 @@ def evaluate(test, renderer, run_folder, ran):
             add("the mod %s loaded" % mod_id, value is True, value)
     # A guard event is the mod log's entry from the guard (LumaModLog source "guard", LumaGuard.cpp caught()): a mod
     # whose code faulted and was caught. A test passes with one only when it names that mod in faults, and a mod it
-    # names there must have faulted.
+    # names there must have faulted. The guard's rows written to a mod that stays on (its call cut short, Guard.CutUntold;
+    # a library named the common place of two callers' faults, Guard.CommonPlace) are not its faults.
     guarded = {}
     for f in by_key.get("modlog", []):
         v = f.get("value")
-        if isinstance(v, dict) and v.get("source") == "guard":
+        if isinstance(v, dict) and v.get("source") == "guard" and v.get("row") not in ("Guard.CutUntold", "Guard.CommonPlace"):
             guarded.setdefault(str(v.get("mod")), v.get("text"))
     for mod, said in sorted(guarded.items()):
         add("guard event in %s is listed in faults" % mod, mod in test["faults"], said)
@@ -2040,6 +2793,8 @@ def evaluate(test, renderer, run_folder, ran):
         if c["kind"] == "fact":
             got = [f for f in by_key.get(c["key"], []) if c["frames"] is None or c["frames"][0] <= f["frame"] <= c["frames"][1]]
             name = "fact %s %s %s" % (c["key"], c["op"], json.dumps(c["value"]))
+            if c["frames"] is not None:
+                name += " in frames %d-%d" % tuple(c["frames"])
             if c["matching"] is not None:
                 got = [f for f in got if has_value(f["value"], c["matching"])]
                 name += " matching %s" % json.dumps(c["matching"], ensure_ascii=False)
@@ -2073,6 +2828,15 @@ def evaluate(test, renderer, run_folder, ran):
                 add("log matches %s" % c["pattern"], bool(hits), hits[:1])
             else:
                 add("no log line matches %s" % c["pattern"], not hits, hits[:3])
+        elif c["kind"] == "save_file":
+            have = run_folder / "saves" / c["name"]
+            if c["is"] == "absent":
+                add("the save folder has no %s" % c["name"], not have.exists(), None)
+            else:
+                wanted = test["folder"] / test["saves"] / c["name"]
+                add("the save folder's %s is as the test placed it" % c["name"],
+                    have.is_file() and have.read_bytes() == wanted.read_bytes(),
+                    "%d bytes" % have.stat().st_size if have.is_file() else "missing")
         elif c["kind"] in ("like", "unlike", "mean_rgb"):
             png = run_folder / "pictures" / (c["picture"] + ".png")
             if not png.exists():
@@ -2109,8 +2873,18 @@ def evaluate(test, renderer, run_folder, ran):
         elif c["kind"] == "sound":
             add("sound %s rms %s" % (c["frames"], c["rms"]), *sound_check(run_folder, facts, c))
     failed = [c for c in checks if c["result"] == "fail"]
+    absent = ran.get("missing_outputs") or []
+    if verdict is None and failed and absent and all(
+            (c["check"] == WRITTEN_CHECK and set(c["actual"]) <= set(absent))
+            or (c["check"] == LOSS_CHECK and c["actual"] == NO_LOSS_REPORT) for c in failed):
+        # What the game writes at its exit was still not there OUTPUT_SECONDS after the game ended (settle_outputs), and
+        # nothing else is wrong: the game is not shown wrong; whatever wrote the file, or kept it from the folder, did not.
+        verdict = "output-missing"
+        reason = "the game ended, and %d s later this was still not there: %s" % (OUTPUT_SECONDS, ", ".join(absent))
     if verdict is None:
         verdict, reason = ("fail", "%s (actual: %s)" % (failed[0]["check"], json.dumps(failed[0]["actual"]))) if failed else ("pass", "")
+    elif verdict == "pass" and watched:
+        verdict, reason = "fail", "the constants watch saw a wrong read: %s" % watched[0]
     return verdict, reason, checks, facts
 
 
@@ -2150,6 +2924,54 @@ def sound_check(run_folder, facts, c):
     return c["rms"][0] <= db <= c["rms"][1], round(db, 2)
 
 
+def picture_complete(path):
+    """Whether a picture file the game wrote is all there: a P6 picture holds the bytes its header counts, a PNG ends with its
+    IEND chunk. A file still being written, or cut short, is not."""
+    path = pathlib.Path(path)
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return False
+    if path.suffix == ".png":
+        return data[:8] == b"\x89PNG\r\n\x1a\n" and data[-12:] == b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    try:
+        w, h, rgb = read_ppm(path)
+    except (ValueError, IndexError):
+        return False
+    return len(rgb) == w * h * 3
+
+
+def settle_outputs(test, run_folder, ran, limit=OUTPUT_SECONDS, clock=time.monotonic, sleep=time.sleep):
+    """What the game writes at its own exit, waited for until it is there and complete, at most `limit` seconds from when the
+    game ended: each picture a step asked (pictures/<name>.ppm, or .png once the runner has made it) and the loss report in
+    run.log. Returns the names of what was still not there, empty when all came. Only a game that reached its end step and
+    ended by itself is held to it (a crashed, hung or ended-at-its-limit game wrote what it wrote). The wait ends at once
+    when everything is there, and runs the whole `limit` when something is not: the game's own wait at its exit for the
+    card is a fixed time, after which it ends without the file, and a slow disk can still be writing what it did write."""
+    if test["ends"] != "end" or ran.get("code") is None or ran.get("hung"):
+        return []
+    if not any(f.get("key") == "harness.end" for f in read_facts(run_folder)):
+        return []
+    log = run_folder / "run.log"
+    pictures = [s["picture"] for s in test["steps"] if "picture" in s]
+    deadline = clock() + limit
+    while True:
+        missing = []
+        for name in pictures:
+            folder = run_folder / "pictures"
+            if not any((folder / (name + ext)).exists() and picture_complete(folder / (name + ext)) for ext in (".png", ".ppm")):
+                missing.append(name)
+        try:
+            text = log.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        if not any(line.startswith("[loss] ") and not line.startswith("[loss] first") for line in text.splitlines()):
+            missing.append("the [loss] report in run.log")
+        if not missing or clock() >= deadline:
+            return missing
+        sleep(0.2)
+
+
 def finish_pictures(run_folder):
     kept = []
     for ppm in sorted((run_folder / "pictures").glob("*.ppm")):
@@ -2168,6 +2990,16 @@ def gpu_line(log_lines):
     return "unknown"
 
 
+def test_path_of(folder):
+    """The test's own folder under the repository's tests/ ("engine/boot"), or None for a test that is not kept there (a
+    tour is written into the run's folder). tools/gate/pictures.py files a test's approved pictures under it, whatever name
+    the run gave its suite."""
+    try:
+        return pathlib.Path(folder).resolve().relative_to(TREE / "tests").as_posix()
+    except ValueError:
+        return None
+
+
 def run_tests(args):
     target = pathlib.Path(args.target).resolve()
     if target.is_file() and target.name == "suite.json":
@@ -2175,7 +3007,14 @@ def run_tests(args):
         keys_known(suite, "suite", {"harness", "tests"})
         if suite.get("harness") != HARNESS or not isinstance(suite.get("tests"), list):
             raise SystemExit("suite.json: harness 1 and a list of tests")
-        folders = [target.parent / t for t in suite["tests"]]
+        names = suite["tests"]
+        if args.test:
+            # Some of the suite's tests, in the suite's order: runners side by side each take their own.
+            unknown = [t for t in args.test if t not in names]
+            if unknown:
+                raise SystemExit("--test %s: not in %s" % (unknown[0], target))
+            names = [t for t in names if t in args.test]
+        folders = [target.parent / t for t in names]
         suite_name = target.parent.name
     else:
         folders = [target]
@@ -2187,10 +3026,33 @@ def run_tests(args):
         raise SystemExit("give --lock or LUMA_TEST_LOCK")
     if not args.limit_scale >= 1:
         raise SystemExit("--limit-scale is at least 1")
+    if getattr(args, "software_device", 0) and args.device:
+        raise SystemExit("--software-device: a device runs on its own graphics chip; the option is for this computer's programs")
     lock = pathlib.Path(args.lock)
     if lock.exists():
-        raise SystemExit("run.lock held: " + lock.read_text(encoding="utf-8", errors="replace").strip())
-    global CLASSES, GPU
+        raise EnvRefused("run.lock held: " + lock.read_text(encoding="utf-8", errors="replace").strip())
+    global CLASSES, GPU, HOST, EXES, HOST_SYSTEM, run_one
+    device = None
+    if args.device:
+        # An Android device over adb (luma_test_android.py): this runner's tests, its platform's names, the start
+        # moved to the device. The test app must be there with its game (luma_test_android.py prepare).
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("luma_test_android", TREE / "tools" / "lumacore" / "luma_test_android.py")
+        android = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(android)
+        device = android.Device(args.device)
+        if not device.answers():
+            raise EnvRefused("%s does not answer adb" % args.device)
+        if not device.installed():
+            raise SystemExit("the test app %s is not on %s: luma_test_android.py prepare" % (android.PACKAGE, args.device))
+        HOST = android.host_for(device.abi())
+        EXES = HOST["exes"]
+        HOST_SYSTEM = HOST["platform"].split("-")[0]
+        this = sys.modules[__name__]
+        run_one = lambda test, renderer, a, run_folder, previous: android.run_one(this, device, test, a, run_folder, previous)  # noqa: E731
+        taken = android.device_lock(args.device_lock, args.who)
+        if taken is not None:
+            raise EnvRefused("the device's lock %s is held: %s" % (args.device_lock, taken))
     if args.gpu is not None and not re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}:[0-9a-f]{8}", args.gpu):
         raise SystemExit("--gpu: vendor:device:subsystem in lowercase hex, as the game's config.ini gpu (10de:2b85:89ef1043)")
     GPU = args.gpu
@@ -2199,6 +3061,8 @@ def run_tests(args):
     lock.write_text("%s %s luma-test %s\n" % (args.who, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), suite_name), encoding="utf-8")
     all_pass = True
     passed = {}
+    SUMMARY.clear()
+    lost = None  # why the device went, once it has: the tests after it are not run
     try:
         for folder in folders:
             try:
@@ -2207,13 +3071,19 @@ def run_tests(args):
                 # scaled alike; steps and their timeouts count frames and stay as written.
                 test["limit"] = test["limit"] * args.limit_scale
                 renderers = [args.renderer] if args.renderer else test["renderers"]
-            except HarnessError as error:
+            except Exception as error:  # noqa: BLE001 - a test the runner cannot read is the tool's, whatever raised
                 all_pass = False
-                report(work / "runs" / suite_name / folder.name / "-", folder.name, [], "-", "harness-error", str(error), [], args, {})
+                said = str(error) if isinstance(error, HarnessError) else "the runner raised %s: %s" % (type(error).__name__, error)
+                report(work / "runs" / suite_name / folder.name / "-", folder.name, [], "-", "harness-error", said, [], args, {})
                 continue
             for renderer in renderers:
                 run_folder = work / "runs" / suite_name / test["name"] / renderer
                 previous = None
+                if lost is not None:
+                    all_pass = False
+                    report(run_folder, test["name"], test["proves"], renderer, "device-lost",
+                           "not run: the device left before it (%s)" % lost, [], args, {})
+                    continue
                 try:
                     if test["continue_from"] is not None:
                         prev = passed.get((test["continue_from"], renderer))
@@ -2221,12 +3091,26 @@ def run_tests(args):
                             raise SetupFailed("continue_from %s: that test did not pass earlier in this suite" % test["continue_from"])
                         previous = prev
                     ran = run_one(test, renderer, args, run_folder, previous)
+                    ran["missing_outputs"] = settle_outputs(test, run_folder, ran)
                     pictures = finish_pictures(run_folder)
                     verdict, reason, checks, facts = evaluate(test, renderer, run_folder, ran)
                 except HarnessError as error:
                     verdict, reason, checks, facts, pictures, ran = "harness-error", str(error), [], [], [], {}
                 except SetupFailed as error:
                     verdict, reason, checks, facts, pictures, ran = "setup-failed", str(error), [], [], [], {}
+                except NotRun as error:
+                    verdict, reason, checks, facts, pictures, ran = "not-run", str(error), [], [], [], {}
+                except DeviceLost as error:
+                    verdict, reason, checks, facts, pictures, ran = "device-lost", str(error), [], [], [], {}
+                    lost = str(error)
+                except Exception as error:  # noqa: BLE001 - the runner's own fault for this test, said in its result
+                    if drive_full(error):
+                        verdict, reason = "not-run", "the drive is full: %s" % error
+                    else:
+                        verdict, reason = "harness-error", "the runner raised %s: %s" % (type(error).__name__, error)
+                        run_folder.mkdir(parents=True, exist_ok=True)
+                        (run_folder / "runner-error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+                    checks, facts, pictures, ran = [], [], [], {}
                 if verdict == "pass":
                     passed[(test["name"], renderer)] = run_folder
                 else:
@@ -2240,36 +3124,86 @@ def run_tests(args):
                                 print("harness: %s left in %s: held by %s" % (p.name, p.parent, held), flush=True)
                 setup = {f["key"]: f["value"] for f in facts if f.get("key", "").startswith("setup.")}
                 report(run_folder, test["name"], test["proves"], renderer, verdict, reason, checks, args,
-                       {"setup": setup, "frames": max([f.get("frame", -1) for f in facts] or [-1]),
+                       {"setup": setup, "stalls": run_stalls(run_folder), "frames": max([f.get("frame", -1) for f in facts] or [-1]),
                         "seconds": round(ran.get("seconds", 0.0), 2), "pictures": pictures,
                         "binaries": ran.get("frozen", {}), "exit": ran.get("code"), "starts": ran.get("starts"),
-                        "not_on_this_system": test["not_here"], "limit_seconds": test["limit"],
+                        "test_path": test_path_of(folder), "not_on_this_system": test["not_here"], "limit_seconds": test["limit"],
                         "limit_scale": args.limit_scale, "test_json": test["raw"]})
+        print(summary_line(SUMMARY), flush=True)
     finally:
         lock.unlink()
+        if device is not None:
+            android.release_lock(args.device_lock)
     return 0 if all_pass else 1
+
+
+def run_stalls(run_folder):
+    """The pauses of a run as the lines they are written as ("stall 30 s at frame 412"): each gap of more than STALL_SECONDS
+    between two of the game's step lines in run.log. A pause is no failure; the run's summary counts them."""
+    log = pathlib.Path(run_folder) / "run.log"
+    try:
+        lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    return [stall_line(seconds, frame) for seconds, frame in stalls_in(lines)]
+
+
+# What this run has reported so far, for the line it ends with: a count of results by kind, and "stalls" (report adds to it).
+SUMMARY = {}
+
+
+def summary_line(tally):
+    """The line the runner ends with: how many results of each kind, and how many pauses the games made."""
+    total = sum(tally.get(k, 0) for k in ("pass", "fail", "tool", "env"))
+    kinds = ", ".join("%s %d" % (k, tally.get(k, 0)) for k in ("pass", "fail", "tool", "env"))
+    return "summary: %d result%s (%s); stalls: %d" % (total, "" if total == 1 else "s", kinds, tally.get("stalls", 0))
 
 
 class SetupFailed(Exception):
     pass
 
 
+class DeviceLost(Exception):
+    """The device the run was on stopped answering (luma_test_android.py): verdict `device-lost` for the test, and the
+    suite's other tests are not run. Not a verdict on the game."""
+
+
+class NotRun(Exception):
+    """The test cannot run here (its disc's game is not given): verdict `not-run`, which is not a pass."""
+
+
+def os_line():
+    """The system the run was on, for result.json. Not platform.platform(): on Windows it asks WMI for the processor,
+    which times out on a loaded machine, and Python then raises (KeyError) before result.json is written (P-326)."""
+    if sys.platform == "win32":
+        v = sys.getwindowsversion()
+        return "Windows-%d.%d.%d" % (v.major, v.minor, v.build)
+    u = platform.uname()
+    return "-".join(x for x in (u.system, u.release, u.version) if x)
+
+
 def report(run_folder, name, proves, renderer, verdict, reason, checks, args, extra):
     run_folder.mkdir(parents=True, exist_ok=True)
     log_lines = (run_folder / "run.log").read_text(encoding="utf-8", errors="replace").splitlines() if (run_folder / "run.log").exists() else []
     result = {"harness": HARNESS, "runner": RUNNER_VERSION, "test": name, "proves": proves, "renderer": renderer,
-              "platform": HOST["platform"], "os": platform.platform(), "gpu": gpu_line(log_lines),
-              "commit": args.commit, "module": args.module, "verdict": verdict, "reason": reason, "checks": checks}
+              "platform": HOST["platform"], "os": os_line(), "gpu": gpu_line(log_lines),
+              "driver": next((l.split("=", 1)[1].strip() for l in log_lines if l.startswith("[gpu] driver=")), ""),
+              "commit": args.commit, "module": args.module, "verdict": verdict, "kind": kind_of(verdict), "reason": reason,
+              "checks": checks}
     test_json = extra.pop("test_json", None)
     result.update(extra)
     # Every result has the same fields; a test refused before it ran has them empty.
-    for key, empty in (("setup", {}), ("frames", None), ("seconds", None), ("pictures", [])):
+    for key, empty in (("setup", {}), ("frames", None), ("seconds", None), ("pictures", []), ("stalls", [])):
         result.setdefault(key, empty)
     (run_folder / "result.json").write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     if test_json is not None:
         (run_folder / "test.json").write_text(json.dumps({"runner": RUNNER_VERSION, "test": test_json}, indent=2, ensure_ascii=False) + "\n",
                                               encoding="utf-8")
     print("%-28s %-7s %-14s %s" % (name, renderer, verdict, reason))
+    for line in result.get("stalls", []):
+        print("%-28s %-7s %s" % ("", "", line))
+    SUMMARY[result["kind"]] = SUMMARY.get(result["kind"], 0) + 1
+    SUMMARY["stalls"] = SUMMARY.get("stalls", 0) + len(result.get("stalls", []))
 
 
 def write_refs(args):
@@ -2297,6 +3231,16 @@ def write_refs(args):
 
 
 def main():
+    # A self-test that starts this tool as a child process runs it under the live-state guard (tools/gate/selftest_guard.py).
+    import pathlib as _pathlib
+    import sys as _sys
+    _gate = str(_pathlib.Path(__file__).resolve().parents[1] / "gate")
+    _sys.path.insert(0, _gate)
+    try:
+        import selftest_guard
+    finally:
+        _sys.path.remove(_gate)
+    selftest_guard.install_if_asked()
     # Names and reasons may be any language (a Japanese object name): the console or the file the output goes
     # to takes them as UTF-8, whatever the system's code page.
     for stream in (sys.stdout, sys.stderr):
@@ -2307,7 +3251,13 @@ def main():
     run.add_argument("target")
     run.add_argument("--bin", required=True)
     run.add_argument("--pak", help="the game.pak each run starts (default: the one the bin folder's pak.path names)")
+    run.add_argument("--pak-for", action="append", metavar="DISC=PAK",
+                     help="the game.pak of another disc, for the tests whose \"disc\" it is (or LUMA_TEST_PAKS)")
     run.add_argument("--renderer")
+    run.add_argument("--device", help="an Android device's adb serial: the tests run there, in the test app "
+                     "(luma_test_android.py); --bin is build_apk.ps1's test-bin-<ABI>")
+    run.add_argument("--device-lock", default=os.environ.get("LUMA_TEST_DEVICE_LOCK"),
+                     help="with --device: a lock folder taken for the whole run (made at once or not at all)")
     run.add_argument("--work")
     run.add_argument("--who", default="?")
     run.add_argument("--module", default="hooks", choices=("hooks", "plain"))
@@ -2318,9 +3268,17 @@ def main():
                      "of these bins wrote); a test with \"fresh\": true starts without it")
     run.add_argument("--diagnostics", default=os.environ.get("LUMA_TEST_DIAGNOSTICS"),
                      help="the game's --diagnostics for every run (or LUMA_TEST_DIAGNOSTICS), e.g. ring-stress")
+    run.add_argument("--gpu-validation", type=int, choices=(0, 1), default=int(os.environ.get("LUMA_TEST_GPU_VALIDATION") or 0),
+                     help="1: every game starts with --gpu-validation 1, the graphics API's debug layer (or LUMA_TEST_GPU_VALIDATION); "
+                          "the run is much slower, so give --limit-scale too")
+    run.add_argument("--software-device", type=int, choices=(0, 1), default=int(os.environ.get("LUMA_TEST_SOFTWARE_DEVICE") or 0),
+                     help="1: every game starts with --software-device 1, on Microsoft's software graphics device and no graphics "
+                          "card (or LUMA_TEST_SOFTWARE_DEVICE); the run is much slower, so give --limit-scale too; not with --device")
     run.add_argument("--gpu", default=os.environ.get("LUMA_TEST_GPU") or None,
                      help="the GPU every run starts on (or LUMA_TEST_GPU): vendor:device:subsystem in lowercase hex, as "
                           "Nebula Settings writes config.ini gpu; result.json's gpu names the adapter the game used")
+    run.add_argument("--test", action="append", default=[],
+                     help="with a suite.json: only this test of it (repeat for several; they run in the suite's order)")
     run.add_argument("--lock", default=os.environ.get("LUMA_TEST_LOCK"),
                      help="the run lock file (or LUMA_TEST_LOCK); the runner refuses to start while it exists")
     run.add_argument("--limit-scale", type=float, default=float(os.environ.get("LUMA_TEST_LIMIT_SCALE") or 1),
@@ -2332,7 +3290,25 @@ def main():
     refs.add_argument("--looked", action="store_true")
     args = parser.parse_args()
     if args.command == "run":
-        return run_tests(args)
+        if not args.device and not os.environ.get("NEBULA_SELF_TEST"):
+            # Started by hand while a speed measure runs: wait for it (at most 15 minutes; the gate, a landing and the measure
+            # itself set NEBULA_NO_MEASURE_WAIT). A run on the tablet needs no quiet PC.
+            _gate = str(pathlib.Path(__file__).resolve().parents[1] / "gate")
+            sys.path.insert(0, _gate)
+            try:
+                import measure_wait
+            finally:
+                sys.path.remove(_gate)
+            if measure_wait.wait(minutes=None if os.environ.get("NEBULA_MEASURE_WAIT_MINUTES") else measure_wait.AGENT_MINUTES) == "went on":
+                # Never a game beside a running measure: it spoils the figures the landing judges (AGENT.md section 9).
+                print("luma_test.py: env: the speed measure still runs after %g minutes: nothing is started; run the command again when "
+                      "it has ended" % measure_wait.AGENT_MINUTES, file=sys.stderr)
+                return ENV_EXIT
+        try:
+            return run_tests(args)
+        except EnvRefused as error:
+            print("luma_test.py: env: %s" % error, file=sys.stderr)
+            return ENV_EXIT
     return write_refs(args)
 
 

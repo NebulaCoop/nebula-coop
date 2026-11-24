@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // The Vulkan renderer (renderer_vk.h): device, swapchain, frames, present and the overlay. The scene target, draws,
-// copies and screen probes are renderer_vk_frame.cpp.
+// and copies are renderer_vk_frame.cpp.
 
 #include "renderer_vk_internal.h"
+#include "galaxy/pacing_recorder.h"
 #include "galaxy/benchmark.h"
 #include "galaxy/frame_timeline.h"
 #include "galaxy/launch_args.h"
+#include "galaxy/whole_lines.h"
+#include "galaxy/render/present_clock.h"
 #include "galaxy/render/vk/streamline_vk.h"
+#include "galaxy/render/vk/swapchain_extent.h"
 #if defined(_WIN32)
 #include "galaxy/render/streamline_bridge.h"
 #endif
@@ -22,8 +26,7 @@
 #include "galaxy/render/host_window_win32.h"
 #endif
 #include "galaxy/render/program_table.h"
-#include "galaxy/render/rt/rt_backend.h"
-#include "galaxy/render/rt_caps.h"
+#include "galaxy/render/device_memory.h"
 #include "galaxy/render/texture_store.h"
 #include "galaxy/game_paths.h"
 #include "galaxy/render/idle_clock.h"
@@ -248,9 +251,13 @@ bool RendererVk::initialize(int window_width, int window_height, const FrameMap&
             post_.initialize(post_process_settings_from(cfg), draw_layout_.scene_pass, color_pass_, rgba8_pass_);
             if (!ao_.initialize()) {
                 std::cerr << "[ambient-occlusion] off on this device" << std::endl;
+            } else {
+                ao_.prepare_pipelines(scene_passes(false), scene_passes(true));
             }
             if (!scene_camera_.initialize()) {
                 std::cerr << "[scene-camera] off on this device" << std::endl;
+            } else {
+                scene_camera_.prepare_pipelines(scene_passes(false), scene_passes(true));
             }
             post_.set_present_pass(present_pass_);
         } else {
@@ -275,7 +282,9 @@ void RendererVk::report_adapter() {
     const VkPhysicalDeviceProperties& properties = context.properties();
     const bool rtx = properties.vendorID == 0x10DEu && std::strstr(properties.deviceName, "RTX") != nullptr;
     host_window::rtx_adapter.store(rtx, std::memory_order_relaxed);
-    record_render_adapter(properties.deviceName, properties.vendorID, properties.deviceID, context.subsys_id(), false);
+    record_render_adapter(properties.deviceName, properties.vendorID, properties.deviceID, context.subsys_id());
+    // The GPU shares the system's memory: an integrated one.
+    set_device_unified_memory(properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU);
     {
         // The version number decoded by the driver's own scheme. driverInfo is free text: Qualcomm's is several lines of
         // build ids and dates, longer than a report's driver field.
@@ -294,17 +303,6 @@ void RendererVk::report_adapter() {
                                                                   : "the GPU has no multisampled scene target formats");
     caps.taa = make_render_feature_status(false, false, false, false,
                                           "motion vectors, jitter, and history resources are not built");
-    const RtCaps rt = context.rt_caps();
-    const bool rt_wanted = get_render_config().ray_tracing_enabled;
-    set_rt_caps(rt);
-    log_rt_caps("vulkan", rt, rt_wanted);
-    host_window::ray_tracing_offered.store(kRayTracingRowOffered && rt_capable(rt), std::memory_order_relaxed);
-    if (rt_wanted && rt_capable(rt)) {
-        (void)rt::shaders_load(context.device());
-    }
-    caps.dxr = make_render_feature_status(true, rt.ray_queries && rt.acceleration_structures, rt_capable(rt),
-                                          kRayTracingRowOffered && rt_capable(rt),
-                                          rt_refusal(rt) != nullptr ? rt_refusal(rt) : "ray tracing is not offered yet");
 #if defined(_WIN32)
     const bool dlss_ready = streamline::dlss_supported();
 #else
@@ -330,8 +328,7 @@ bool RendererVk::create_surface_and_device() {
         return host_window::create_vulkan_surface(instance, window);
     };
     if (!vk::Context::get().initialize(get_render_config().gpu.data(), validation,
-                                       host_window::vulkan_instance_extensions(), make_surface, &surface_,
-                                       true)) {  // the tracer's features wherever it can trace: the setting changes in play
+                                       host_window::vulkan_instance_extensions(), make_surface, &surface_)) {
         return false;
     }
     const vk::Context& context = vk::Context::get();
@@ -401,7 +398,6 @@ bool RendererVk::create_layouts() {
                                  " maps in a table, and it has no descriptor indexing");
     }
     program_use_bound_tables(!bindless_);
-    program_use_triangle_ids(context.rt_caps().triangle_ids);
     static_assert(kSamplerHeapSlots == vk::kBindlessSamplerSlots);
     {
         // Set 0: b0, b1, b2, the composed rows, the instance table and, with descriptor indexing, the frame's texture lists.
@@ -431,8 +427,7 @@ bool RendererVk::create_layouts() {
             const VkDescriptorSetLayoutBinding binding{
                 0, images ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER,
                 bindless_ ? (images ? texture_array_limit_ : vk::kBindlessSamplerSlots) : vk::kBoundTableSlots,
-                // The image array is the tracer's passes' too (rt_backend_vk.cpp: set 1 of a pass).
-                static_cast<VkShaderStageFlags>(VK_SHADER_STAGE_FRAGMENT_BIT | (images && bindless_ ? VK_SHADER_STAGE_COMPUTE_BIT : 0)), nullptr};
+                VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
             VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
             info.bindingCount = 1;
             info.pBindings = &binding;
@@ -515,24 +510,6 @@ bool RendererVk::create_layouts() {
         info.bindingCount = 2;
         info.pBindings = bindings;
         vk::check(vkCreateDescriptorSetLayout(device, &info, nullptr, &utility_set_layout_), "utility set layout");
-    }
-    {
-        const VkDescriptorSetLayoutBinding bindings[] = {
-            {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-            {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-        };
-        VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        info.bindingCount = 3;
-        info.pBindings = bindings;
-        vk::check(vkCreateDescriptorSetLayout(device, &info, nullptr, &probe_set_layout_), "probe set layout");
-        const VkPushConstantRange count{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(std::uint32_t)};
-        VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layout.setLayoutCount = 1;
-        layout.pSetLayouts = &probe_set_layout_;
-        layout.pushConstantRangeCount = 1;
-        layout.pPushConstantRanges = &count;
-        vk::check(vkCreatePipelineLayout(device, &layout, nullptr, &probe_layout_), "probe pipeline layout");
     }
     {
         // The 2D layer's merge (layer_merge_shader_source): the layer as drawn and as it started, read with Load.
@@ -682,14 +659,14 @@ bool RendererVk::create_layouts() {
                                                          : &draw_layout_.scene_pass_clear),
                   "scene target clearing render pass");
     }
-    // The scene depth cleared alone (settle_depth_clear with no pass open): the depth target only, so the colour is neither
-    // loaded nor stored. [0] keeps the stencil, [1] clears it, as depth_clear_passes.
-    for (unsigned samples_log2 = 0u; (1u << samples_log2) <= msaa_max_samples_; ++samples_log2) {
+    // The single-sample depth target alone (resolve_scene_depth): the colour is neither loaded nor stored.
+    {
         VkAttachmentDescription attachment{};
         attachment.format = depth_format_;
-        attachment.samples = static_cast<VkSampleCountFlagBits>(1u << samples_log2);
+        attachment.samples = VK_SAMPLE_COUNT_1_BIT;
         attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
         attachment.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         attachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -714,11 +691,7 @@ bool RendererVk::create_layouts() {
         info.pSubpasses = &subpass;
         info.dependencyCount = 2;
         info.pDependencies = dependencies;
-        for (const unsigned stencil : {0u, 1u}) {
-            attachment.stencilLoadOp = stencil != 0u ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
-            vk::check(vkCreateRenderPass(device, &info, nullptr, &depth_alone_passes_[stencil][samples_log2]),
-                      "depth clearing render pass (depth alone)");
-        }
+        vk::check(vkCreateRenderPass(device, &info, nullptr, &depth_alone_pass_), "depth render pass (depth alone)");
     }
     // The effects layer needs its format drawn and blended, and four colour attachments with independent blending.
     {
@@ -801,56 +774,7 @@ bool RendererVk::create_layouts() {
         vk::check(vkCreateRenderPass(device, &info, nullptr, &draw_layout_.aux_passes_clear[wide ? 1u : 0u][aux]),
                   "temporal scene clearing render pass");
     }
-    // The tracer's prepass: the item target and the scene's depth. The clearing form takes the item target whatever
-    // it held (cleared to no item); both leave it a render target.
-    for (const bool clears : {false, true}) {
-        VkAttachmentDescription attachments[2]{};
-        attachments[0].format = VK_FORMAT_R32G32_UINT;
-        attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
-        attachments[0].loadOp = clears ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
-        attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        attachments[0].initialLayout = clears ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        attachments[1].format = depth_format_;
-        attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
-        attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
-        attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        const VkAttachmentReference color{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-        const VkAttachmentReference depth{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
-        VkSubpassDescription subpass{};
-        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-        subpass.colorAttachmentCount = 1u;
-        subpass.pColorAttachments = &color;
-        subpass.pDepthStencilAttachment = &depth;
-        VkSubpassDependency dependencies[2]{};
-        dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
-        dependencies[0].dstSubpass = 0;
-        dependencies[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-        dependencies[0].dstStageMask = dependencies[0].srcStageMask;
-        dependencies[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        dependencies[1] = dependencies[0];
-        dependencies[1].srcSubpass = 0;
-        dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-        VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-        info.attachmentCount = 2u;
-        info.pAttachments = attachments;
-        info.subpassCount = 1;
-        info.pSubpasses = &subpass;
-        info.dependencyCount = 2;
-        info.pDependencies = dependencies;
-        vk::check(vkCreateRenderPass(device, &info, nullptr, clears ? &draw_layout_.item_pass_clear : &draw_layout_.item_pass),
-                  "ray tracing prepass render pass");
-    }
-    // One target written whole (copies; RGBA8: screen probes): its old contents are dropped; it ends shader-readable.
+    // One target written whole (copies; RGBA8: a window-format picture): its old contents are dropped; it ends shader-readable.
     {
         VkAttachmentDescription attachment{};
         attachment.format = vk::kSceneColorFormat;
@@ -943,7 +867,10 @@ bool RendererVk::create_swapchain() {
     vk::check(caps_result, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
     VkExtent2D extent = caps.currentExtent;
     if (extent.width == UINT32_MAX) {
-        extent = {host_window::backbuffer_width, host_window::backbuffer_height};
+        // The surface sets no size (Wayland): the window's last size, else the one it had when it was made.
+        const vk::Extent2 chosen = vk::swapchain_extent({extent.width, extent.height}, {window_width_, window_height_},
+                                                {host_window::backbuffer_width, host_window::backbuffer_height});
+        extent = {chosen.width, chosen.height};
     }
     if (caps.maxImageExtent.width == 0u || caps.maxImageExtent.height == 0u ||
         (caps.currentExtent.width == 0u && caps.currentExtent.height == 0u)) {
@@ -1086,6 +1013,32 @@ bool RendererVk::create_swapchain() {
             info.pNext = &switch_info;
         }
     }
+    // Present timing (the pacing recorder's display reports) where the device and this surface take it; not under AMD's
+    // wrapped swap chain, which presents on its own.
+    VkPresentStageFlagsEXT timing_stage = 0;
+    if (!fsr && context.present_timing()) {
+        VkPhysicalDeviceSurfaceInfo2KHR surface_info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR};
+        surface_info.surface = surface_;
+        VkPresentTimingSurfaceCapabilitiesEXT timing_caps{VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT};
+        VkSurfaceCapabilitiesPresentId2KHR id2_caps{VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR};
+        VkSurfaceCapabilitiesPresentWait2KHR wait2_caps{VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_WAIT_2_KHR};
+        id2_caps.pNext = &wait2_caps;
+        wait2_caps.pNext = &timing_caps;
+        VkSurfaceCapabilities2KHR caps2{VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR};
+        caps2.pNext = &id2_caps;
+        if (vkGetPhysicalDeviceSurfaceCapabilities2KHR(context.physical_device(), &surface_info, &caps2) == VK_SUCCESS &&
+            id2_caps.presentId2Supported == VK_TRUE && wait2_caps.presentWait2Supported == VK_TRUE &&
+            timing_caps.presentTimingSupported == VK_TRUE) {
+            // The moment the picture is first seen, else the moment its first pixel leaves for the display.
+            timing_stage = (timing_caps.presentStageQueries & VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT) != 0u
+                               ? VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT
+                               : timing_caps.presentStageQueries & VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT;
+        }
+        if (timing_stage != 0u) {
+            info.flags |= VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR | VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR |
+                          VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+        }
+    }
     VkSwapchainKHR handle = VK_NULL_HANDLE;
     if (swapchain_fsr_) {
         vkDeviceWaitIdle(device);
@@ -1131,6 +1084,56 @@ bool RendererVk::create_swapchain() {
     swapchain_.mode = mode;
     swapchain_.vsync = vsync;
     swapchain_.relaxed = relaxed;
+    swapchain_.ids2 = !amd && timing_stage != 0u;
+    swapchain_.timed = false;
+    swapchain_.local_clock = false;
+    std::string time_domains;  // the swap chain's, logged where none is usable
+    swapchain_.timing_stage = timing_stage;
+    swapchain_.refresh_qpc = 0;
+    swapchain_.timing_properties_counter = ~std::uint64_t{0};
+    swapchain_.timing_outstanding = 0u;
+    if (swapchain_.ids2) {
+        // The results' queue, and the time domain that is the runtime's own clock.
+        (void)vkSetSwapchainPresentTimingQueueSizeEXT(device, handle, 32u);
+        VkSwapchainTimeDomainPropertiesEXT domains{VK_STRUCTURE_TYPE_SWAPCHAIN_TIME_DOMAIN_PROPERTIES_EXT};
+        std::uint64_t domains_counter = 0;
+        if (vkGetSwapchainTimeDomainPropertiesEXT(device, handle, &domains, &domains_counter) == VK_SUCCESS &&
+            domains.timeDomainCount != 0u) {
+            std::vector<VkTimeDomainKHR> kinds(domains.timeDomainCount);
+            std::vector<std::uint64_t> ids(domains.timeDomainCount);
+            domains.pTimeDomains = kinds.data();
+            domains.pTimeDomainIds = ids.data();
+            if (vkGetSwapchainTimeDomainPropertiesEXT(device, handle, &domains, &domains_counter) >= VK_SUCCESS) {
+                // The runtime's clock first (no mapping), then the present stage's own clock, then the swap chain's.
+                // Apple's runtime clock (CLOCK_UPTIME_RAW) is no Vulkan domain: there the swap chain is not timed.
+                const auto rank = [](VkTimeDomainKHR kind) {
+#if defined(_WIN32)
+                    if (kind == VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR) return 0;
+#elif !defined(__APPLE__)
+                    if (kind == VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR) return 0;
+#endif
+                    if (kind == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT) return 1;
+                    if (kind == VK_TIME_DOMAIN_SWAPCHAIN_LOCAL_EXT) return 2;
+                    return 3;
+                };
+                std::uint32_t best = domains.timeDomainCount;
+                for (std::uint32_t i = 0; i < domains.timeDomainCount; ++i) {
+                    time_domains += (time_domains.empty() ? "" : ",") + std::to_string(static_cast<int>(kinds[i]));
+                    if (rank(kinds[i]) < 3 && (best == domains.timeDomainCount || rank(kinds[i]) < rank(kinds[best]))) {
+                        best = i;
+                    }
+                }
+#if !defined(__APPLE__)
+                if (best != domains.timeDomainCount) {
+                    swapchain_.time_domain = kinds[best];
+                    swapchain_.time_domain_id = ids[best];
+                    swapchain_.local_clock = rank(kinds[best]) != 0;
+                    swapchain_.timed = !swapchain_.local_clock || calibrate_present_clock();
+                }
+#endif
+            }
+        }
+    }
     swapchain_.hdr_asked = hdr_asked;
     swapchain_.hdr = hdr_made;
     last_present_id_ = 0u;  // present ids belong to a swap chain: nothing to wait for on the new one
@@ -1138,8 +1141,17 @@ bool RendererVk::create_swapchain() {
     swapchain_calls_.get_images(device, handle, &count, nullptr);
     swapchain_.images.resize(count);
     swapchain_calls_.get_images(device, handle, &count, swapchain_.images.data());
-    std::fprintf(stderr, "[vulkan] swapchain %ux%u transform=%u images=%u\n", extent.width, extent.height,
-                 static_cast<unsigned>(transform), count);
+    std::fprintf(stderr, "[vulkan] swapchain %ux%u transform=%u images=%u; display reports: %s\n", extent.width,
+                 extent.height, static_cast<unsigned>(transform), count,
+                 swapchain_.timed
+                     ? (swapchain_.timing_stage == VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT
+                            ? (swapchain_.local_clock ? "present timing, first pixel seen, its clock calibrated"
+                                                      : "present timing, first pixel seen")
+                            : (swapchain_.local_clock ? "present timing, first pixel out, its clock calibrated"
+                                                      : "present timing, first pixel out"))
+                 : context.display_timing() ? "display timing"
+                 : swapchain_.ids2          ? ("none (present timing's clocks " + time_domains + " not usable)").c_str()
+                                            : "none");
     if (count != logged_swap_images_ || mode != logged_swap_mode_) {
         // Once, and again only when the count or the mode changes (VSync toggled).
         logged_swap_images_ = count;
@@ -1156,7 +1168,7 @@ bool RendererVk::create_swapchain() {
                        : offer == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? " PRESENT_MODE_FIFO_RELAXED"
                                                                    : " other";
         }
-        const bool waits = context.present_wait() && mode == VK_PRESENT_MODE_FIFO_KHR && !amd;
+        const bool waits = (context.present_wait() || swapchain_.ids2) && mode == VK_PRESENT_MODE_FIFO_KHR && !amd;
         std::fprintf(stderr, "[vk] swap chain: %u images, %s (offered:%s); late frames %s; frame latency by %s\n", count, name,
                      offered.c_str(), relaxed ? "present as FIFO_RELAXED" : "wait for the next refresh",
                      waits ? "present wait (the last frame must show before the next is queued, on the interpolation's slot clock the one before it; 100 ms at most)" : "the frame fences");
@@ -1538,25 +1550,12 @@ bool RendererVk::create_utility_pipelines() {
     depth_copy_pipeline_ = create_utility_pipeline(depth_copy_pass_, utility_layout_, vk::UtilitySpirv::BlitVs,
                                                    vk::UtilitySpirv::DepthCopyPs, VK_COLOR_COMPONENT_R_BIT, false, false,
                                                    false);
-    {
-        const VkDevice device = vk::Context::get().device();
-        const VkShaderModule module = utility_module(vk::UtilitySpirv::ScreenProbeCs);
-        VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        info.stage.module = module;
-        info.stage.pName = "main";
-        info.layout = probe_layout_;
-        const VkResult result = vkCreateComputePipelines(device, vk::shared_pipeline_cache(), 1, &info, nullptr, &probe_pipeline_);
-        vkDestroyShaderModule(device, module, nullptr);
-        vk::check(result, "screen probe pipeline");
-    }
     for (unsigned kind = 0u; kind < static_cast<unsigned>(SceneUtility::Count); ++kind) {
         (void)scene_utility_pipeline(static_cast<SceneUtility>(kind));
     }
     if (msaa_max_samples_ > 1u) {
         // The single-sample depth target's pass alone (resolve_scene_depth): the resolve writes depth only.
-        depth_resolve_pipeline_ = create_utility_pipeline(depth_alone_passes_[0][0], utility_layout_,
+        depth_resolve_pipeline_ = create_utility_pipeline(depth_alone_pass_, utility_layout_,
                                                           vk::UtilitySpirv::BlitVs, vk::UtilitySpirv::DepthResolvePs, 0u, false,
                                                           false, true, VK_SAMPLE_COUNT_1_BIT, false);
     }
@@ -1606,76 +1605,6 @@ VkPipeline RendererVk::scene_utility_pipeline(SceneUtility kind) {
     return pipeline;
 }
 
-VkPipeline RendererVk::probe_test_pipeline() {
-    const unsigned aux = scene_pass_aux_;
-    if (target_pass_active_ || aux > 3u || (aux == 3u && draw_layout_.aux_pass_for(scene_variant(), 3u) == VK_NULL_HANDLE)) {
-        return VK_NULL_HANDLE;
-    }
-    VkPipeline& pipeline = probe_test_pipelines_[aux][scene_variant()];
-    if (pipeline != VK_NULL_HANDLE) {
-        return pipeline;
-    }
-    const VkDevice device = vk::Context::get().device();
-    // The scene pass this aux target opens: the motion and reactive passes are single-sample with a second target.
-    const VkRenderPass pass = aux != 0u ? draw_layout_.aux_pass_for(scene_variant(), aux) : draw_layout_.pass_for(scene_variant(), false);
-    const auto samples = aux != 0u ? VK_SAMPLE_COUNT_1_BIT : static_cast<VkSampleCountFlagBits>(1u << scene_samples_log2());
-    const VkShaderModule vs = utility_module(vk::UtilitySpirv::BlitVs);
-    const VkShaderModule ps = utility_module(vk::UtilitySpirv::ClearDepthPs);
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main", nullptr};
-    stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, ps, "main", nullptr};
-    VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    VkPipelineInputAssemblyStateCreateInfo input_assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-    viewport.viewportCount = 1;
-    viewport.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_NONE;
-    raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
-    raster.lineWidth = 1.0f;
-    // The first sample, as the probe dispatch reads a multisampled depth (its resolve keeps sample 0).
-    const VkSampleMask first_sample = 1u;
-    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    multisample.rasterizationSamples = samples;
-    multisample.pSampleMask = &first_sample;
-    // Reversed depth: the point is seen where it is as near as the scene there or nearer.
-    VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    depth.depthTestEnable = VK_TRUE;
-    depth.depthWriteEnable = VK_FALSE;
-    depth.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
-    VkPipelineColorBlendAttachmentState targets[4]{};  // write masks 0
-    VkPipelineColorBlendStateCreateInfo blend_info{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    blend_info.attachmentCount = aux == 3u ? 4u : aux != 0u ? 2u : 1u;
-    blend_info.pAttachments = targets;
-    const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = 2;
-    dynamic.pDynamicStates = dynamic_states;
-    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    info.stageCount = 2;
-    info.pStages = stages;
-    info.pVertexInputState = &vertex_input;
-    info.pInputAssemblyState = &input_assembly;
-    info.pViewportState = &viewport;
-    info.pRasterizationState = &raster;
-    info.pMultisampleState = &multisample;
-    info.pDepthStencilState = &depth;
-    info.pColorBlendState = &blend_info;
-    info.pDynamicState = &dynamic;
-    info.layout = utility_layout_;
-    info.renderPass = pass;
-    const VkResult result = vkCreateGraphicsPipelines(device, vk::shared_pipeline_cache(), 1, &info, nullptr, &pipeline);
-    vkDestroyShaderModule(device, vs, nullptr);
-    vkDestroyShaderModule(device, ps, nullptr);
-    if (result != VK_SUCCESS) {
-        pipeline = VK_NULL_HANDLE;
-        std::fprintf(stderr, "[RendererVk] probe test pipeline: %d; probes read after the pass\n", static_cast<int>(result));
-    }
-    return pipeline;
-}
-
 RendererVk::Kept RendererVk::take_apart_lost_device() {
     keep_window_ = true;
     try {
@@ -1715,19 +1644,13 @@ void RendererVk::shutdown() {
             if (picture.sampled != VK_NULL_HANDLE) vkDestroyImageView(device, picture.sampled, nullptr);
         }
         pictures_.clear();
-        for (VkPipeline* pipeline : {&conversion_pipeline_, &probe_pipeline_, &display_filter_pipeline_,
+        for (VkPipeline* pipeline : {&conversion_pipeline_, &display_filter_pipeline_,
                                      &conversion_pipeline_wide_, &display_filter_pipeline_wide_,
              &depth_resolve_pipeline_, &blit_pipeline_, &depth_copy_pipeline_}) {
             if (*pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, *pipeline, nullptr);
             *pipeline = VK_NULL_HANDLE;
         }
         for (auto& variants : scene_utility_pipelines_) {
-            for (VkPipeline& pipeline : variants) {
-                if (pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, pipeline, nullptr);
-                pipeline = VK_NULL_HANDLE;
-            }
-        }
-        for (auto& variants : probe_test_pipelines_) {
             for (VkPipeline& pipeline : variants) {
                 if (pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, pipeline, nullptr);
                 pipeline = VK_NULL_HANDLE;
@@ -1746,8 +1669,7 @@ void RendererVk::shutdown() {
         mirrored_backend_ = nullptr;
         mirrored_store_ = nullptr;
         uploads_store_ = nullptr;
-        texture_lists_ = {};
-        texture_lists_used_ = 0u;
+        texture_list_chunks_.clear();
         set_mod_post_compiler(nullptr, true);
         release_mod_post();
         post_.shutdown();
@@ -1780,15 +1702,7 @@ void RendererVk::shutdown() {
         utility_pool_ = VK_NULL_HANDLE;
         output_scene_active_ = false;
         output_source_sampled_ = false;
-        for (ProbeSlot& slot : probe_slots_) {
-            if (slot.queries != VK_NULL_HANDLE) vkDestroyQueryPool(device, slot.queries, nullptr);
-        }
-        probe_slots_.clear();
-        held_probe_slots_.clear();
-        scene_capture_ = Readback{};
-        backbuffer_capture_ = Readback{};
-        display_capture_ = Readback{};
-        display_capture_pending_path_.clear();
+        captures_.clear();
         vertex_ring_.reset();
         index_ring_.reset();
         constant_ring_.reset();
@@ -1804,17 +1718,16 @@ void RendererVk::shutdown() {
         if (stats_queries_ != VK_NULL_HANDLE) vkDestroyQueryPool(device, stats_queries_, nullptr);
         stats_queries_ = VK_NULL_HANDLE;
         timestamp_pending_.fill(false);
-        native_scene_gpu_ema_ms_ = 0.0;
+        frame_gpu_.reset_scene_ema();
         frame_scene_drawn_.fill(false);
         pass_mark_count_.fill(0u);
         stats_pending_.fill(false);
-        pass_ms_.fill(0.0);
+        (void)pass_times_.take_window_list();
         stats_sum_.fill(0.0);
-        profile_samples_ = 0;
         profile_frame_ = pass_recording_ = false;
         destroy_swapchain();
         for (VkRenderPass pass :
-             {present_pass_, color_pass_, color_pass_wide_, rgba8_pass_, depth_copy_pass_, draw_layout_.scene_pass,
+             {present_pass_, color_pass_, color_pass_wide_, rgba8_pass_, depth_copy_pass_, depth_alone_pass_, draw_layout_.scene_pass,
               draw_layout_.scene_pass_clear,
               draw_layout_.target_pass, draw_layout_.target_pass_clear}) {
             if (pass != VK_NULL_HANDLE) vkDestroyRenderPass(device, pass, nullptr);
@@ -1822,7 +1735,7 @@ void RendererVk::shutdown() {
         wide_base_sampled_ = false;
         for (auto* group : {&draw_layout_.discard_color_passes, &draw_layout_.depth_clear_passes[0],
                             &draw_layout_.depth_clear_passes[1], &draw_layout_.discard_depth_clear_passes[0],
-                            &draw_layout_.discard_depth_clear_passes[1], &depth_alone_passes_}) {
+                            &draw_layout_.discard_depth_clear_passes[1]}) {
             for (auto& passes : *group) {
                 for (VkRenderPass& pass : passes) {
                     if (pass != VK_NULL_HANDLE) vkDestroyRenderPass(device, pass, nullptr);
@@ -1837,10 +1750,6 @@ void RendererVk::shutdown() {
                 pass = VK_NULL_HANDLE;
             }
         }
-        for (VkRenderPass* pass : {&draw_layout_.item_pass, &draw_layout_.item_pass_clear}) {
-            if (*pass != VK_NULL_HANDLE) vkDestroyRenderPass(device, *pass, nullptr);
-            *pass = VK_NULL_HANDLE;
-        }
         temporal_pending_ = {};
         temporal_.reset();
         destroy_motion_framebuffers();
@@ -1851,19 +1760,19 @@ void RendererVk::shutdown() {
                 pass = VK_NULL_HANDLE;
             }
         }
-        present_pass_ = color_pass_ = color_pass_wide_ = rgba8_pass_ = depth_copy_pass_ = draw_layout_.target_pass =
+        present_pass_ = color_pass_ = color_pass_wide_ = rgba8_pass_ = depth_copy_pass_ = depth_alone_pass_ = draw_layout_.target_pass =
             draw_layout_.target_pass_clear =
             draw_layout_.scene_pass = draw_layout_.scene_pass_clear = VK_NULL_HANDLE;
-        for (VkPipelineLayout layout : {draw_layout_.layout, utility_layout_, probe_layout_, layer2d_layout_}) {
+        for (VkPipelineLayout layout : {draw_layout_.layout, utility_layout_, layer2d_layout_}) {
             if (layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, layout, nullptr);
         }
-        draw_layout_.layout = utility_layout_ = probe_layout_ = layer2d_layout_ = VK_NULL_HANDLE;
+        draw_layout_.layout = utility_layout_ = layer2d_layout_ = VK_NULL_HANDLE;
         for (VkDescriptorSetLayout layout : {draw_layout_.sets[0], draw_layout_.sets[1], draw_layout_.sets[2],
-                                             utility_set_layout_, probe_set_layout_, layer2d_set_layout_}) {
+                                             utility_set_layout_, layer2d_set_layout_}) {
             if (layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, layout, nullptr);
         }
         draw_layout_.sets.fill(VK_NULL_HANDLE);
-        utility_set_layout_ = probe_set_layout_ = layer2d_set_layout_ = VK_NULL_HANDLE;
+        utility_set_layout_ = layer2d_set_layout_ = VK_NULL_HANDLE;
         if (linear_clamp_ != VK_NULL_HANDLE) vkDestroySampler(device, linear_clamp_, nullptr);
         linear_clamp_ = VK_NULL_HANDLE;
         context.collect();
@@ -1885,23 +1794,24 @@ void RendererVk::grow_rings() {
     // A ring whose frames took over half their budget (or spilled) grows; one whose last 30 seconds (and 600 frames) stayed
     // under a quarter of it gives half of its memory back on a frame without the scene (UploadRing::kQuietNs). Only that
     // ring is made again. --diagnostics ring-stress: all made again (at the size each wants) every kRingStressFrames frames.
-    const bool ring_stress =
-        ::galaxy::diagnosing(::galaxy::kDiagnoseRingStress) && frame_index_ % ::galaxy::kRingStressFrames == 0u;
     const UploadRingSlot rings[] = {{&vertex_ring_, "vertex", kRingSegments, true},
                                     {&index_ring_, "index", kFramesInFlight, true},
                                     {&constant_ring_, "constant", kFramesInFlight, true},
                                     {&matrix_ring_, "matrix", kRingSegments, false}};
-    if (!ring_stress && (ring_growth_failed_ || std::none_of(std::begin(rings), std::end(rings),
-                                                             [](const UploadRingSlot& s) { return s.ring->wants_new_size(); }))) {
+    const RingRemake due = upload_rings_due(rings, frame_index_, ring_growth_failed_);
+    if (due == RingRemake::None) {
         return;
     }
     const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::RingResize);
     // No wait for the GPU: a ring is made again as a new buffer. The old buffer and its chunks are released here, which
     // hands them to the context to destroy once the work submitted so far has completed.
     std::vector<gpu::BufferRef> old;
-    if (remake_upload_rings(vk::Context::get().device(), rings, ring_stress, ring_growth_failed_, old)) {
-        history_segment_ = 0u;
-        history_segment_fence_.fill(0u);
+    if (remake_upload_rings(vk::Context::get().device(), rings, due == RingRemake::All, ring_growth_failed_, old)) {
+        // The vertex and matrix rings share one segment counter and one fence for each segment (history_segment_,
+        // history_segment_fence_). A ring made again is a new buffer, every segment of which is free; a ring that was not made
+        // again (the vertex ring, when only the matrix ring grew) keeps the segments the frames in flight write and read, so
+        // the counter and the fences stay as they are: with the counter at 0 and the fences gone, the next frame wrote the
+        // segment a frame in flight was still drawing from (P-339).
         history_used_ = true;
     }
 }
@@ -1948,7 +1858,7 @@ void RendererVk::wait_for_fence_value(std::uint64_t fence_value) {
 }
 
 void RendererVk::begin_frame() {
-    host_window::poll_render_config_file();
+    host_window::watch_render_config_file();
     if (!streamline_frame_open_) {
         vk::streamline_vk::open_frame(swapchain_fsr_);
         streamline_frame_open_ = true;
@@ -1960,9 +1870,12 @@ void RendererVk::begin_frame() {
     apply_dynamic_resolution();
     // draw.post: a program reading motion registers only while a temporal upscaler makes it.
     set_mod_post_motion(temporal_ != nullptr && temporal_mode());
-    if (temporal_interp_suspended_ && temporal_interp_key() != temporal_interp_key_) {
-        // The settings changed: decided again.
-        temporal_interp_suspended_ = false;
+    // A hold of the temporal upscaler on generated frames: decided again when its settings changed, tried again
+    // when its wait passed (the governor then measures generated frames again, not by the cost that held it).
+    if (temporal_interp_hold_.lift_at_frame_start([this] { return temporal_interp_key() != temporal_interp_key_; },
+                                                  galaxy::qpc_to_ns(galaxy::qpc_now()))) {
+        frame_gpu_.reset_generated_ema();
+        std::cerr << "[interp] temporal upscaling of generated frames tried again\n";
     }
     sync_post_process();
     bloom_.poll_ready();
@@ -1975,7 +1888,15 @@ void RendererVk::begin_frame() {
     vk::Context& context = vk::Context::get();
     const VkDevice device = context.device();
     if (frame.fence != 0u) {
+        // --diagnostics timeline: a wait for the slot's last frame, as Direct3D 12 records it (a = its fence value).
+        const bool timeline_slot_wait = galaxy::timeline::enabled() && completed_fence_value() < frame.fence;
+        if (timeline_slot_wait) {
+            galaxy::timeline::record(galaxy::timeline::Event::SlotWaitBegin, frame.fence);
+        }
         wait_for_fence_value(frame.fence);
+        if (timeline_slot_wait) {
+            galaxy::timeline::record(galaxy::timeline::Event::SlotWaitEnd, frame.fence);
+        }
     }
     if (timestamp_pending_[frame_slot_] && timestamps_ != VK_NULL_HANDLE) {
         std::uint64_t ticks[2]{};
@@ -1983,15 +1904,7 @@ void RendererVk::begin_frame() {
                                   sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
             ticks[1] >= ticks[0]) {
             const double gpu_ms = static_cast<double>(ticks[1] - ticks[0]) * timestamp_period_ns_ / 1'000'000.0;
-            if (frame_scene_drawn_[frame_slot_]) {
-                native_scene_gpu_ema_ms_ = native_scene_gpu_ema_ms_ == 0.0 ? gpu_ms :
-                    native_scene_gpu_ema_ms_ + (gpu_ms - native_scene_gpu_ema_ms_) * 0.1;
-            }
-            if (frame_generated_[frame_slot_]) {
-                generated_gpu_ms_ += gpu_ms;
-                ++generated_gpu_samples_;
-                generated_gpu_ema_ms_ = generated_gpu_ema_ms_ == 0.0 ? gpu_ms : generated_gpu_ema_ms_ * 0.9 + gpu_ms * 0.1;
-            }
+            frame_gpu_.add(gpu_ms, frame_scene_drawn_[frame_slot_], frame_generated_[frame_slot_]);
             stats_.gpu_ms += gpu_ms;
             ++stats_.gpu_samples;
             gpu_window_.ms += gpu_ms;
@@ -2080,7 +1993,6 @@ void RendererVk::begin_frame() {
     index_ring_.begin_frame(frame_slot_);
     constant_ring_.begin_frame(frame_slot_);
     constants_sets_.clear();
-    texture_lists_used_ = 0u;
     encoder_.attach(frame.commands);
     reset_draw_bindings();
     scene_pass_open_ = false;
@@ -2129,21 +2041,7 @@ std::uint64_t RendererVk::end_frame(bool present_swap_chain, SubmissionCallback 
     frame_generated_[frame_slot_] = generated;
     frame_scene_drawn_[frame_slot_] = scene_drawn_;
     timestamp_pending_[frame_slot_] = timestamps_ != VK_NULL_HANDLE;
-    for (ProbeSlot& probes : probe_slots_) {
-        if (probes.fence == kProbesInFrame) {
-            probes.fence = fence;
-        }
-    }
-    if (scene_capture_.buffer && scene_capture_.fence == 0u && !scene_capture_pending_path_.empty()) {
-        scene_capture_.fence = fence;
-    }
-    if (backbuffer_capture_.buffer && backbuffer_capture_.fence == 0u &&
-        !backbuffer_capture_pending_path_.empty()) {
-        backbuffer_capture_.fence = fence;
-    }
-    if (display_capture_.buffer && display_capture_.fence == 0u && !display_capture_pending_path_.empty()) {
-        display_capture_.fence = fence;
-    }
+    captures_.submitted(fence);
     if (on_submitted != nullptr) {
         on_submitted(submission_context, fence);
     }
@@ -2178,25 +2076,21 @@ std::uint64_t RendererVk::end_frame(bool present_swap_chain, SubmissionCallback 
                          static_cast<double>(gpu_window_.passes) / gpu_window_.recorded,
                          static_cast<double>(gpu_window_.copies) / gpu_window_.recorded, scene_extent_.width,
                          scene_extent_.height, swapchain_.image.width, swapchain_.image.height);
-            std::fprintf(stderr, "[vk-gpu] scene target opened a frame (closed by > opened by):");
+            galaxy::whole_lines::Line line;
+            line.add("[vk-gpu] scene target opened a frame (closed by > opened by):");
             for (const GpuWindow::Open& open : gpu_window_.opens) {
                 if (open.count != 0u) {
-                    std::fprintf(stderr, " %s > %s%s %.2f;", open.closed, open.opened, open.cleared ? " (clear)" : "",
-                                 static_cast<double>(open.count) / gpu_window_.recorded);
+                    line.add(" %s > %s%s %.2f;", open.closed, open.opened, open.cleared ? " (clear)" : "",
+                             static_cast<double>(open.count) / gpu_window_.recorded);
                 }
             }
-            std::fprintf(stderr, "\n");
+            line.write(stderr);
         }
-        if (!trace_present_stats_enabled() && profile_samples_ != 0u) {
-            static constexpr const char* names[] = {"scene", "resolve", "frame-read", "display-copy", "bloom", "scene-aa",
-                                                    "scene-ao", "upscale", "rt", "present", "camera",
-                                                    "ao-distance", "ao-occlusion", "ao-denoise", "ao-upsample", "ao-apply"};
-            std::fprintf(stderr, "[gpu-profile] %u sampled submissions; GPU ms:", profile_samples_);
-            for (std::size_t p = 0; p < std::size(names); ++p)
-                std::fprintf(stderr, " %s=%.3f", names[p], pass_ms_[p] / profile_samples_);
-            std::fprintf(stderr, "\n");
-            pass_ms_.fill(0.0);
-            profile_samples_ = 0;
+        if (!trace_present_stats_enabled() && pass_times_.window_frames() != 0u) {
+            galaxy::whole_lines::Line line;
+            line.add("[gpu-profile] %u sampled submissions; GPU ms:", pass_times_.window_frames());
+            line.add("%s", pass_times_.take_window_list().c_str());
+            line.write(stderr);
         }
         gpu_window_ = GpuWindow{};
     }
@@ -2209,9 +2103,11 @@ void RendererVk::present_swapchain_image() {
     vk::Context& context = vk::Context::get();
     const RenderConfig cfg = get_render_config();
     // On a variable refresh display with VSync on the pacer holds presents under the refresh (paced_present_rate); a frame
-    // under the cap goes out as soon as it is ready.
+    // under the cap goes out as soon as it is ready. Interpolated pictures are paced by their slot clock (RenderCore), as
+    // on Direct3D: a second wait after the slot would carry a picture past the refresh it was drawn for.
     const float paced_fps = paced_present_rate(presented_max_fps(cfg), cfg.vsync_interval, variable_refresh_, display_refresh_hz_);
-    const double pace_wait_ms = present_pacer_.pace(variable_refresh_ ? 0u : cfg.vsync_interval, paced_fps);
+    const double pace_wait_ms =
+        interpolation_mode() ? 0.0 : present_pacer_.pace(variable_refresh_ ? 0u : cfg.vsync_interval, paced_fps);
     const std::int64_t present_start = galaxy::qpc_now();
     {
         // The target rate: dynamic multi frame generation reaches it, a fixed multiplier is the largest multiple of 60 at or
@@ -2241,23 +2137,57 @@ void RendererVk::present_swapchain_image() {
     // that one shown, a refresh late now and then on some drivers: the presents would switch between landing in their
     // slot's refresh and the one after, each switch showing a refresh twice. Where the device has no present wait, or under
     // frame generation (whose presents are the library's), the frame fences bound the queue.
-    const bool ids = context.present_wait() && swapchain_.mode == VK_PRESENT_MODE_FIFO_KHR && !swapchain_fsr_ &&
-                     !frame_generation_running();
+    const bool ids = (context.present_wait() || swapchain_.ids2) && swapchain_.mode == VK_PRESENT_MODE_FIFO_KHR &&
+                     !swapchain_fsr_ && !frame_generation_running();
     const std::uint64_t wait_id = present_moment_ != 0 ? present_id_before_last_ : last_present_id_;
     if (ids && wait_id != 0u) {
-        const VkResult waited = vkWaitForPresentKHR(context.device(), swapchain_.handle, wait_id, 100'000'000ull);
+        VkResult waited = VK_SUCCESS;
+        if (swapchain_.ids2) {
+            VkPresentWait2InfoKHR wait{VK_STRUCTURE_TYPE_PRESENT_WAIT_2_INFO_KHR};
+            wait.presentId = wait_id;
+            wait.timeout = 100'000'000ull;
+            waited = vkWaitForPresent2KHR(context.device(), swapchain_.handle, &wait);
+        } else {
+            waited = vkWaitForPresentKHR(context.device(), swapchain_.handle, wait_id, 100'000'000ull);
+        }
         if (waited == VK_TIMEOUT && ++present_wait_timeouts_ <= 4u) {
             std::fprintf(stderr, "[present] the previous frame was not shown within 100 ms\n");
         }
     }
     std::uint64_t this_present_id = 0u;
     VkPresentIdKHR present_id_info{VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
-    if (ids) {
+    VkPresentId2KHR present_id2_info{VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR};
+    // A swap chain made for present timing: every present has an id (its timing result names it), in id 2's form.
+    // Never more asked for than the results' queue holds (32, create_swapchain): a full queue would fail the present,
+    // and presents that do not finish (a hidden window) leave their results unread. Only while the window is shown: a
+    // present of a window never shown (a hidden test run) that asks for its timing never finishes, and every present
+    // wait after it runs out its time (measured: 15 steps a second instead of 60).
+    const bool timed_present =
+        swapchain_.timed && window_shown_ && !frame_generation_running() && swapchain_.timing_outstanding < 31u;
+    if (ids || timed_present) {
         this_present_id = ++present_id_counter_;
-        present_id_info.swapchainCount = 1;
-        present_id_info.pPresentIds = &this_present_id;
-        present_id_info.pNext = info.pNext;
-        info.pNext = &present_id_info;
+        if (swapchain_.ids2) {
+            present_id2_info.swapchainCount = 1;
+            present_id2_info.pPresentIds = &this_present_id;
+            present_id2_info.pNext = info.pNext;
+            info.pNext = &present_id2_info;
+        } else {
+            present_id_info.swapchainCount = 1;
+            present_id_info.pPresentIds = &this_present_id;
+            present_id_info.pNext = info.pNext;
+            info.pNext = &present_id_info;
+        }
+    }
+    // When it reached the display: one stage's time in the runtime's clock, read back by report_present_times.
+    VkPresentTimingInfoEXT timing_info{VK_STRUCTURE_TYPE_PRESENT_TIMING_INFO_EXT};
+    VkPresentTimingsInfoEXT timings_info{VK_STRUCTURE_TYPE_PRESENT_TIMINGS_INFO_EXT};
+    if (timed_present) {
+        timing_info.timeDomainId = swapchain_.time_domain_id;
+        timing_info.presentStageQueries = swapchain_.timing_stage;
+        timings_info.swapchainCount = 1;
+        timings_info.pTimingInfos = &timing_info;
+        timings_info.pNext = info.pNext;
+        info.pNext = &timings_info;
     }
     // A frame that comes a refresh late (the time since the previous present is over a quarter longer than the rate asks for)
     // is shown at once rather than held for the next refresh.
@@ -2288,9 +2218,12 @@ void RendererVk::present_swapchain_image() {
     // An interpolated picture is timed by its moment on the display's vsync grid, at any refresh rate; the game's own
     // frames by the game's frame slots, which follow the vsyncs where the refresh rate is a multiple of 60.
     // qpc_now() is CLOCK_MONOTONIC nanoseconds off Windows: the presentation times' clock.
+    // Timed only where the swap chain keeps every picture (present_slots.h presents_timed): MAILBOX on Android is the
+    // BufferQueue's async mode, whose next present replaces a picture held for its slot.
+    const bool timed = context.display_timing() && presents_timed(swap_queue());
     std::int64_t grid = 0;
-    const bool by_moment = context.display_timing() && moment != 0 && vblank_grid(grid, vsync);
-    const bool by_frames = !by_moment && context.display_timing() && host_window::present_grid(frame_start, period, vsync, now);
+    const bool by_moment = timed && moment != 0 && vblank_grid(grid, vsync);
+    const bool by_frames = !by_moment && timed && host_window::present_grid(frame_start, period, vsync, now);
     if ((by_moment || by_frames) && step >= vsync - vsync / 16) {
         PresentTiming& timing = present_timing_;
         if (by_moment) {
@@ -2352,6 +2285,15 @@ void RendererVk::present_swapchain_image() {
     }
     vk::streamline_vk::mark_present_end();
     const bool queued = ids && (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR);
+    // The pacing recorder: the present's id where its moment on the display will be reported (present timing's, or
+    // the display timing's).
+    {
+        const bool shown = result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR;
+        galaxy::pacing::presented(!shown ? 0u
+                                  : timed_present ? this_present_id
+                                  : present_times.swapchainCount != 0u ? present_time.presentID
+                                                                       : 0u);
+    }
     present_id_before_last_ = queued ? last_present_id_ : 0u;
     last_present_id_ = queued ? this_present_id : 0u;
     streamline_frame_open_ = false;
@@ -2398,6 +2340,14 @@ void RendererVk::present_swapchain_image() {
         measured_present_count_ = 0u;
     }
     report_present_stats();
+    if (timed_present) {
+        if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
+            ++swapchain_.timing_outstanding;
+        }
+    }
+    if (swapchain_.timed && swapchain_.timing_outstanding != 0u) {
+        report_present_times();
+    }
     // Android keeps only the last few frames' timings: read them often.
     if (context.display_timing() && present_timing_.next_id % 4u == 0u) {
         report_present_timing();
@@ -2405,6 +2355,100 @@ void RendererVk::present_swapchain_image() {
     if (!window_shown_ && window_ != nullptr && !host_window::hidden_window_mode_enabled()) {
         window_shown_ = true;
         host_window::show_window(window_);
+    }
+}
+
+// The swap chain's own present clock and the runtime's, read together: a result's time t (nanoseconds) is then
+// calibration_qpc + (t - calibration_local) in the runtime's ticks. Read again every second, so neither clock's drift
+// adds up.
+bool RendererVk::calibrate_present_clock() {
+#if defined(__APPLE__)
+    return false;
+#else
+#if defined(_WIN32)
+    constexpr VkTimeDomainKHR runtime_clock = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
+#else
+    constexpr VkTimeDomainKHR runtime_clock = VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+#endif
+    VkSwapchainCalibratedTimestampInfoEXT swap{VK_STRUCTURE_TYPE_SWAPCHAIN_CALIBRATED_TIMESTAMP_INFO_EXT};
+    swap.swapchain = swapchain_.handle;
+    swap.presentStage =
+        swapchain_.time_domain == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT ? swapchain_.timing_stage : VkPresentStageFlagsEXT{0};
+    swap.timeDomainId = swapchain_.time_domain_id;
+    std::array<VkCalibratedTimestampInfoKHR, 2> infos{};
+    infos[0].sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR;
+    infos[0].pNext = &swap;
+    infos[0].timeDomain = swapchain_.time_domain;
+    infos[1].sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR;
+    infos[1].timeDomain = runtime_clock;
+    std::array<std::uint64_t, 2> times{};
+    std::uint64_t deviation = 0;
+    if (vkGetCalibratedTimestampsKHR(vk::Context::get().device(), 2u, infos.data(), times.data(), &deviation) !=
+        VK_SUCCESS) {
+        return false;
+    }
+    swapchain_.calibration_local = times[0];
+    swapchain_.calibration_qpc = static_cast<std::int64_t>(times[1]);
+    return true;
+#endif
+}
+
+// Present timing's results (VK_EXT_present_timing): each finished present's moment at the swap chain's stage, in the
+// runtime's clock, to the pacing recorder; the refresh duration when the swap chain's timing properties change.
+void RendererVk::report_present_times() {
+    const VkDevice device = vk::Context::get().device();
+    if (swapchain_.local_clock && galaxy::qpc_now() - swapchain_.calibration_qpc > galaxy::qpc_frequency()) {
+        (void)calibrate_present_clock();  // a failed read keeps the last
+    }
+    constexpr std::uint32_t kResults = 16u;
+    std::array<VkPresentStageTimeEXT, kResults> stages{};
+    std::array<VkPastPresentationTimingEXT, kResults> results{};
+    for (std::uint32_t i = 0; i < kResults; ++i) {
+        results[i].sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT;
+        results[i].presentStageCount = 1u;
+        results[i].pPresentStages = &stages[i];
+    }
+    VkPastPresentationTimingInfoEXT info{VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT};
+    info.flags = VK_PAST_PRESENTATION_TIMING_ALLOW_OUT_OF_ORDER_RESULTS_BIT_EXT;
+    info.swapchain = swapchain_.handle;
+    VkPastPresentationTimingPropertiesEXT properties{VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT};
+    properties.presentationTimingCount = kResults;
+    properties.pPresentationTimings = results.data();
+    if (vkGetPastPresentationTimingEXT(device, &info, &properties) < VK_SUCCESS) {
+        return;
+    }
+    if (properties.timingPropertiesCounter != swapchain_.timing_properties_counter) {
+        VkSwapchainTimingPropertiesEXT timing{VK_STRUCTURE_TYPE_SWAPCHAIN_TIMING_PROPERTIES_EXT};
+        std::uint64_t counter = 0;
+        if (vkGetSwapchainTimingPropertiesEXT(device, swapchain_.handle, &timing, &counter) == VK_SUCCESS) {
+            swapchain_.timing_properties_counter = counter;
+            // Nanoseconds to the runtime's ticks; 0 where the refresh varies.
+            swapchain_.refresh_qpc = static_cast<std::int64_t>(static_cast<double>(timing.refreshDuration) *
+                                                               static_cast<double>(galaxy::qpc_frequency()) / 1e9);
+        }
+    }
+    const std::uint32_t count = std::min(properties.presentationTimingCount, kResults);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const VkPastPresentationTimingEXT& r = results[i];
+        if (r.reportComplete != VK_TRUE) {
+            continue;
+        }
+        swapchain_.timing_outstanding -= swapchain_.timing_outstanding != 0u ? 1u : 0u;
+        if (r.timeDomainId != swapchain_.time_domain_id) {
+            continue;
+        }
+        if (r.presentStageCount == 0u || stages[i].time == 0u) {
+            galaxy::pacing::not_shown(r.presentId);  // complete with no time: it never reached the display
+        } else if (swapchain_.local_clock) {
+            const double since_ns =
+                static_cast<double>(static_cast<std::int64_t>(stages[i].time - swapchain_.calibration_local));
+            galaxy::pacing::displayed(r.presentId,
+                                      swapchain_.calibration_qpc +
+                                          std::llround(since_ns * static_cast<double>(galaxy::qpc_frequency()) / 1e9),
+                                      swapchain_.refresh_qpc);
+        } else {
+            galaxy::pacing::displayed(r.presentId, static_cast<std::int64_t>(stages[i].time), swapchain_.refresh_qpc);
+        }
     }
 }
 
@@ -2430,6 +2474,9 @@ void RendererVk::report_present_timing() {
     const std::int64_t half_vsync = (timing.vsync_ns != 0 ? timing.vsync_ns : kGameStepNs / 2) / 2;
     for (std::uint32_t i = 0; i < count; ++i) {
         const auto actual = static_cast<std::int64_t>(past[i].actualPresentTime);
+        if (!swapchain_.timed) {  // present timing's reports, where it is there, are the recorder's
+            galaxy::pacing::displayed(past[i].presentID, actual, timing.refresh_ns != 0 ? timing.refresh_ns : timing.vsync_ns);
+        }
         const auto at = past[i].presentID % timing.requested.size();
         const bool identified = timing.requested_id[at] == past[i].presentID;
         const std::int64_t requested = identified ? timing.requested[at] : 0;
@@ -2519,17 +2566,8 @@ void RendererVk::report_present_stats() {
     }
     message << " gpu-samples=" << stats_.gpu_samples << " gpu-total-ms=" << stats_.gpu_ms;
     if (pass_queries_ != VK_NULL_HANDLE) {
-        static constexpr const char* kPassNames[] = {"scene", "resolve", "frame-read", "display-copy", "bloom", "scene-aa",
-                                                     "scene-ao", "upscale", "rt", "present", "camera",
-                                                     "ao-distance", "ao-occlusion", "ao-denoise", "ao-upsample", "ao-apply"};
-        static_assert(std::size(kPassNames) == static_cast<std::size_t>(GpuPass::Count));
-        const double profiled = static_cast<double>(std::max(profile_samples_, 1u));
-        message << " gpu-pass-ms=";
-        for (std::size_t pass = 0; pass < std::size(kPassNames); ++pass) {
-            message << (pass == 0 ? "" : ",") << kPassNames[pass] << ':' << pass_ms_[pass] / profiled;
-        }
-        pass_ms_.fill(0.0);
-        profile_samples_ = 0;
+        const double profiled = static_cast<double>(std::max(pass_times_.window_frames(), 1u));
+        message << pass_times_.take_window_field();  // each pass's ms a profiled frame
         // Flag bits in order: vertex, clipped primitives, fragment, compute.
         const std::array<double, 4>& st = stats_sum_;
         message << " gpu-stats=vs:" << st[0] / profiled << ",prims:" << st[1] / profiled << ",ps:" << st[2] / profiled
@@ -2544,12 +2582,6 @@ void RendererVk::report_present_stats() {
     stats_.window_start_qpc = now;
     stats_.last_present_qpc = now;
 }
-
-namespace {
-constexpr const char* kPassTimeNames[] = {"scene", "resolve", "frame read", "display copy", "bloom", "scene aa", "scene ao",
-                                          "upscale", "ray tracing", "present", "camera", "ao distance", "ao occlusion",
-                                          "ao denoise", "ao upsample", "ao apply"};
-}  // namespace
 
 void RendererVk::gpu_pass(GpuPass pass) {
     (void)gpu_pass_mark(pass, false);
@@ -2576,7 +2608,7 @@ unsigned RendererVk::gpu_pass_mark(GpuPass pass, bool pass_begins) {
     if (changed && pass_recording_ && commands_ != VK_NULL_HANDLE && pass != GpuPass::Count && vk::Context::get().debug_labels() &&
         vkCmdInsertDebugUtilsLabelEXT != nullptr) {
         VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
-        label.pLabelName = kPassTimeNames[static_cast<std::size_t>(pass)];
+        label.pLabelName = kGpuPassPageNames[static_cast<std::size_t>(pass)];
         vkCmdInsertDebugUtilsLabelEXT(commands_, &label);
     }
     // Tiled GPUs execute a render pass tile by tile. Interior timestamps do not delimit whole-image work;
@@ -2592,13 +2624,7 @@ unsigned RendererVk::gpu_pass_mark(GpuPass pass, bool pass_begins) {
 }
 
 std::size_t RendererVk::gpu_pass_times(GpuPassTime* out, std::size_t capacity) const noexcept {
-    std::size_t count = 0u;
-    for (std::size_t pass = 0u; pass < std::size(kPassTimeNames) && count < capacity; ++pass) {
-        if (const float ms = pass_ema_ms_[pass].load(std::memory_order_relaxed); ms > 0.0f) {
-            out[count++] = {kPassTimeNames[pass], ms};
-        }
-    }
-    return count;
+    return pass_times_.page_times(out, capacity);
 }
 
 void RendererVk::prepare_gpu_pass_queries() {
@@ -2607,12 +2633,7 @@ void RendererVk::prepare_gpu_pass_queries() {
     // recorded or read.
     const bool full = ::galaxy::diagnosing(::galaxy::kDiagnoseGpuPasses);
     const bool wanted = full || gpu_timing_wanted_.load(std::memory_order_relaxed);
-    if (!wanted && profile_frame_) {
-        for (std::atomic<float>& average : pass_ema_ms_) {
-            average.store(0.0f, std::memory_order_relaxed);
-        }
-    }
-    profile_frame_ = timestamps_ != VK_NULL_HANDLE && wanted;
+    profile_frame_ = pass_times_.begin_frame(timestamps_ != VK_NULL_HANDLE && wanted);
     if (!profile_frame_) return;
     const VkDevice device = vk::Context::get().device();
     if (pass_queries_ == VK_NULL_HANDLE) {
@@ -2644,24 +2665,8 @@ void RendererVk::read_gpu_passes() {
     if (marks > 1u && vkGetQueryPoolResults(device, pass_queries_, frame_slot_ * kGpuPassSlots, marks,
                                             marks * sizeof(std::uint64_t), ticks.data(), sizeof(std::uint64_t),
                                             VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-        ++profile_samples_;
-        std::array<double, static_cast<std::size_t>(GpuPass::Count)> frame_ms{};
-        for (unsigned i = 0; i + 1u < marks; ++i) {
-            if (ticks[i + 1u] >= ticks[i]) {
-                const double ms = static_cast<double>(ticks[i + 1u] - ticks[i]) * ms_per_tick;
-                pass_ms_[static_cast<std::size_t>(pass_marks_[frame_slot_][i])] += ms;
-                frame_ms[static_cast<std::size_t>(pass_marks_[frame_slot_][i])] += ms;
-            }
-        }
-        // The page's running average of each pass over the frames that ran it.
-        for (std::size_t pass = 0u; pass < frame_ms.size(); ++pass) {
-            if (frame_ms[pass] > 0.0) {
-                const float before = pass_ema_ms_[pass].load(std::memory_order_relaxed);
-                const float value = static_cast<float>(frame_ms[pass]);
-                pass_ema_ms_[pass].store(before == 0.0f ? value : before + (value - before) * 0.1f, std::memory_order_relaxed);
-            }
-        }
-        galaxy::bench::note_gpu_frame(kPassTimeNames, frame_ms.data(), std::min(std::size(kPassTimeNames), frame_ms.size()));
+        pass_times_.add_frame(gpu_pass_ms(ticks.data(), pass_marks_[frame_slot_].data(), marks - 1u, ms_per_tick),
+                              frame_scene_drawn_[frame_slot_] && !frame_generated_[frame_slot_]);
     }
     pass_mark_count_[frame_slot_] = 0u;
     std::array<std::uint64_t, 4> counts{};
@@ -2675,9 +2680,6 @@ void RendererVk::read_gpu_passes() {
     stats_pending_[frame_slot_] = false;
 }
 
-// The share of wall time the GPU may spend on the frame before Match Output steps down (RendererD3D12's rule).
-constexpr double kGpuBudgetBusy = 0.80;
-
 void RendererVk::sync_post_process() {
     const bool was_ready = post_.ready();
     if (!post_.poll_ready()) {
@@ -2685,6 +2687,7 @@ void RendererVk::sync_post_process() {
     }
     if (!was_ready) {
         set_post_process_status(post_.status());
+        post_.prepare_pipelines(scene_passes(float_scene_));
     }
     const PostProcessSettings next = post_process_settings_from(get_render_config());
     const PostProcessSettings& current = post_.settings();
@@ -2720,6 +2723,7 @@ void RendererVk::refresh_display_rate() {
         }
     }
     variable_refresh_ = variable;
+    g_variable_refresh.store(variable, std::memory_order_relaxed);
     if (std::abs(hz - display_refresh_hz_) >= 0.1) {
         if (!variable) {
             std::cerr << "[display] refresh-hz=" << hz << '\n';
@@ -2811,8 +2815,13 @@ void RendererVk::follow_window_and_resize() {
 #endif
     const std::uint64_t extent = host_window::pending_resize_extent.exchange(0u, std::memory_order_acq_rel);
     if (extent != 0u) {
-        const auto width = static_cast<std::uint32_t>(extent >> 32u);
-        const auto height = static_cast<std::uint32_t>(extent & 0xffffffffu);
+        const vk::Extent2 window = vk::unpack_window_extent(extent);
+        const std::uint32_t width = window.width;
+        const std::uint32_t height = window.height;
+        if (width != 0u && height != 0u) {
+            window_width_ = width;
+            window_height_ = height;
+        }
         if (width != swapchain_.extent.width || height != swapchain_.extent.height) {
             swapchain_dirty_ = true;
         }
@@ -2923,11 +2932,11 @@ bool RendererVk::capture_sdr_picture(VkCommandBuffer commands, const vk::Texture
             }
         }
     }
-    const std::uint64_t bytes = static_cast<std::uint64_t>(width) * height * 4u;
-    if (!backbuffer_capture_.buffer || backbuffer_capture_.buffer->size < bytes) {
-        backbuffer_capture_.buffer = context.create_readback_buffer(bytes, "backbuffer capture");
+    if (!hdr_capture_) {
+        return false;
     }
-    if (!hdr_capture_ || !backbuffer_capture_.buffer) {
+    std::shared_ptr<vk::Buffer> readback = capture_buffer(static_cast<std::uint64_t>(width) * height * 4u, "backbuffer capture");
+    if (!readback) {
         return false;
     }
     VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -2956,14 +2965,9 @@ bool RendererVk::capture_sdr_picture(VkCommandBuffer commands, const vk::Texture
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {width, height, 1};
-    vkCmdCopyImageToBuffer(commands, hdr_capture_->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           backbuffer_capture_.buffer->buffer, 1, &region);
+    vkCmdCopyImageToBuffer(commands, hdr_capture_->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->buffer, 1, &region);
     hdr_capture_->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    backbuffer_capture_.fence = 0u;
-    backbuffer_capture_pending_path_ = backbuffer_capture_path_;
-    backbuffer_capture_width_ = width;
-    backbuffer_capture_height_ = height;
-    backbuffer_capture_bgra_ = false;
+    captures_.recorded({std::move(readback), 0u, backbuffer_capture_path_, width, height, width * 4u, Captures::Form::Rgba8});
     return true;
 }
 
@@ -2984,6 +2988,12 @@ bool RendererVk::present(const DisplayTexture* source, bool capture_backbuffer, 
         surface_lock_ = {};
         return false;  // remade at the next frame boundary
     }
+    if (!capture_backbuffer && unseen_.now(window_, window_shown_)) {
+        // No image while the window cannot be seen (a hidden start, minimised, cloaked): the frame is drawn, nothing is
+        // presented, as Direct3D's on DXGI_STATUS_OCCLUDED. A frame that takes a test picture still presents.
+        surface_lock_ = {};
+        return false;
+    }
     std::uint32_t image = 0;
     // A second at most: an image the presentation engine never returns (a surface going away) skips the frame.
     constexpr std::uint64_t kAcquireTimeoutNs = 1'000'000'000ull;
@@ -2991,8 +3001,11 @@ bool RendererVk::present(const DisplayTexture* source, bool capture_backbuffer, 
     VkResult result = VK_SUCCESS;
     {
         const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::Acquire);
+        galaxy::timeline::record(galaxy::timeline::Event::AcquireBegin);
         result = swapchain_calls_.acquire(context.device(), swapchain_.handle, kAcquireTimeoutNs, frame.acquired, VK_NULL_HANDLE,
                                           &image);
+        const bool acquired = result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR;
+        galaxy::timeline::record(galaxy::timeline::Event::AcquireEnd, acquired ? image : 0u, acquired ? 0u : 1u);
     }
     vk::note_driver_cpu(vk::DriverCall::Acquire, vk::thread_cpu_ns() - acquire_cpu);
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_ERROR_SURFACE_LOST_KHR || result == VK_TIMEOUT ||
@@ -3113,19 +3126,16 @@ bool RendererVk::present(const DisplayTexture* source, bool capture_backbuffer, 
     };
 
     // Screenshots and test pictures stay SDR: an HDR10 image is not one the gates compare, so the SDR picture is drawn again.
-    if (capture_backbuffer && swapchain_.hdr && !backbuffer_capture_path_.empty() && backbuffer_capture_pending_path_.empty() &&
+    if (capture_backbuffer && swapchain_.hdr && !backbuffer_capture_path_.empty() &&
         capture_sdr_picture(commands, *shown, content, allocate)) {
         hand_to_amd();
         return true;
     }
-    if (capture_backbuffer && swapchain_.copyable && !swapchain_.hdr && !backbuffer_capture_path_.empty() &&
-        backbuffer_capture_pending_path_.empty()) {
+    if (capture_backbuffer && swapchain_.copyable && !swapchain_.hdr && !backbuffer_capture_path_.empty()) {
         // The finished image, copied out for a test snapshot (PRESENT_SRC -> TRANSFER_SRC and back).
-        const std::uint64_t bytes = static_cast<std::uint64_t>(bb_w) * bb_h * 4u;
-        if (!backbuffer_capture_.buffer || backbuffer_capture_.buffer->size < bytes) {
-            backbuffer_capture_.buffer = context.create_readback_buffer(bytes, "backbuffer capture");
-        }
-        if (backbuffer_capture_.buffer) {
+        std::shared_ptr<vk::Buffer> readback =
+            capture_buffer(static_cast<std::uint64_t>(swapchain_.image.width) * swapchain_.image.height * 4u, "backbuffer capture");
+        if (readback) {
             image_barrier(commands, swapchain_.images[image], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
@@ -3133,15 +3143,13 @@ bool RendererVk::present(const DisplayTexture* source, bool capture_backbuffer, 
             VkBufferImageCopy region{};
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             region.imageExtent = {swapchain_.image.width, swapchain_.image.height, 1};
-            vkCmdCopyImageToBuffer(commands, swapchain_.images[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                   backbuffer_capture_.buffer->buffer, 1, &region);
+            vkCmdCopyImageToBuffer(commands, swapchain_.images[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->buffer, 1,
+                                   &region);
             image_barrier(commands, swapchain_.images[image], VK_IMAGE_ASPECT_COLOR_BIT, gpu::Use::CopySource,
                           gpu::Use::Present, gpu::Contents::Keep, 1u);
-            backbuffer_capture_.fence = 0u;
-            backbuffer_capture_pending_path_ = backbuffer_capture_path_;
-            backbuffer_capture_width_ = swapchain_.image.width;
-            backbuffer_capture_height_ = swapchain_.image.height;
-            backbuffer_capture_bgra_ = swapchain_.format == VK_FORMAT_B8G8R8A8_UNORM;
+            captures_.recorded({std::move(readback), 0u, backbuffer_capture_path_, swapchain_.image.width,
+                                swapchain_.image.height, swapchain_.image.width * 4u,
+                                swapchain_.format == VK_FORMAT_B8G8R8A8_UNORM ? Captures::Form::Bgra8 : Captures::Form::Rgba8});
             hand_to_amd();
             return true;
         }

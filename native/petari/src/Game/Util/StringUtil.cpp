@@ -11,6 +11,7 @@
 #include <cstdarg>
 #include <cstdlib>
 #include <nebula_format.h>
+#include <nebula_utf8.h>
 
 namespace {
     // Clear times count game frames.
@@ -603,5 +604,26 @@ namespace MR {
         if (mText != mInline) {
             ::free(mText);
         }
+    }
+
+    u32 utf8ToText16(char16_t* pDst, const char* pSrc) {
+        const u8* p = reinterpret_cast< const u8* >(pSrc);
+        const u8* pEnd = p;
+        while (*pEnd != 0) {
+            pEnd++;
+        }
+        u32 length = 0;
+        while (p < pEnd) {
+            length += nebula_utf8::put_utf16(nebula_utf8::next(p, pEnd), pDst != nullptr ? pDst + length : nullptr);
+        }
+        if (pDst != nullptr) {
+            pDst[length] = 0;
+        }
+        return length + 1;
+    }
+
+    const char16_t* setTextFromUtf8(Text16& rText, const char* pSrc) {
+        utf8ToText16(rText.room(utf8ToText16(nullptr, pSrc)), pSrc);
+        return rText.c_str();
     }
 };  // namespace MR

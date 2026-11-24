@@ -31,7 +31,10 @@ void pump_events(int timeout_ms) noexcept;
 // vsync times predict, so every frame stays on screen for the same number of vsyncs. False, at once, when there are
 // no recent vsyncs (out of sight, not yet shown), the display's rate does not divide the period, or the platform has
 // no display clock: the host's own clock times the frame then.
-bool wait_display_frame(std::int64_t period_ns, std::int64_t& last_ns) noexcept;
+bool wait_display_frame(std::int64_t period_ns, std::int64_t& last_ns, bool in_between) noexcept;
+// The app out of sight: the display clock asks for no vsyncs (Android's Choreographer callbacks, Apple's display link)
+// until it is let go, so no thread wakes at the display's rate for a game that waits. Any thread.
+void set_display_clock_held(bool held) noexcept;
 // The frame grid (CLOCK_MONOTONIC nanoseconds): the latest frame slot, the frame period, the display's vsync
 // interval and now; false while frames follow the host's clock.
 [[nodiscard]] bool display_grid(std::int64_t& slot_ns, std::int64_t& period_ns, std::int64_t& vsync_ns,
@@ -110,11 +113,23 @@ struct InputState {
     float finger_land_y = 0.0f;
     // Since it came down, the finger has gone past the system's touch slop (a still fingertip's tremor stays inside).
     bool finger_moved = false;
+    // For Nebula's menus (menu_finger): the pointer's touches counted (one more each time its finger comes down), the
+    // furthest the finger has gone from where it came down (window pixels), and its speed as it was lifted (window pixels
+    // a second; 0 when it held still before lifting). The display's touch slop in window pixels (0: none given).
+    std::uint32_t finger_touches = 0;
+    float finger_travel_px = 0.0f;
+    float finger_vx = 0.0f;
+    float finger_vy = 0.0f;
+    float touch_slop_px = 0.0f;
     // The pointer's place (finger_x, finger_y) came from a mouse: it points wherever it is over the window, as on
     // Windows, with none of a finger's rules (shown only while it touches and a moment after; a menu's pointer only
     // from a tap). `mouse_inside`: the mouse is over the window.
     bool mouse_pointer = false;
     bool mouse_inside = false;
+    // The mouse's own motion while the window holds it for a mod's first-person look (set_mouse_look), since the game
+    // last took it (take_input_state): x right, y down.
+    float mouse_dx = 0.0f;
+    float mouse_dy = 0.0f;
     int window_width = 0;
     int window_height = 0;
     bool window_focused = true;
@@ -140,6 +155,9 @@ void set_menu_context(bool menu) noexcept;
 void set_title_screen(bool title) noexcept;
 // Nebula's menu is open: a finger is its mouse (native_game_input), so a swipe is no wheel.
 void set_direct_touch(bool direct) noexcept;
+// A mod's first-person look holds the mouse (any thread; the window's thread applies it at its next pump): the cursor
+// hidden and kept still, its moves into InputState::mouse_dx/dy. Given up while the window is not in front.
+void set_mouse_look(bool hold) noexcept;
 // Rumble on the gamepad with this SDL id (0: none) at `strength` (0..1). Any thread: SDL's thread applies it.
 void rumble(std::uint32_t pad_id, float strength) noexcept;
 

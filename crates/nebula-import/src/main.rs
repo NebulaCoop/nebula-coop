@@ -77,8 +77,9 @@ fn run(arguments: &[OsString]) -> Result<ExitCode> {
             println!("{}", stats.summary());
             Ok(ExitCode::SUCCESS)
         }
-        [command, input, output] if command == "rt-materials" => {
-            cook::hit_record::audit(Path::new(input), Path::new(output))?;
+        [command, input] if command == "collision-proof" => {
+            let (models, leaves) = cook::kcl::prove_disc(Path::new(input))?;
+            println!("collision models proved: {models}, octree leaves agreeing: {leaves}");
             Ok(ExitCode::SUCCESS)
         }
         [command, input, output] if command == "programs" => {

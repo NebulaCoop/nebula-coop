@@ -36,6 +36,8 @@ bench::PartView part(double fps, std::size_t stages) {
     p.low_1_fps = fps * 0.7;
     p.p99_ms = 1000.0 / (fps * 0.6);
     p.stutters = 3u;
+    p.steps_per_s = 59.96;
+    p.steps_low_1 = 58.4;
     p.limiter = "gpu";
     p.gpu_passes = {{"opaque", 4.0}, {"bloom", 1.0}, {"scene ao", 0.5}, {"ao denoise", 0.25}, {"present", 0.001}};
     p.game_ms = 2.0;
@@ -70,7 +72,7 @@ bench::ResultView result(const char* when, const char* backend) {
     r.refresh_hz = 60.0;
     r.verdict = "fits";
     r.yours = part(143.0, 2u);
-    r.standard = part(98.6, 2u);
+    r.yours.stages[1].average_fps = 98.6;
     return r;
 }
 
@@ -105,13 +107,16 @@ int main() {
         check_marks(pages[0].table, 2u, "summary marks");
         check(pages[0].table.find("RESULT\tSMOOTH AT 60 FPS") != std::string::npos, "the outcome");
         check(pages[0].table.find("AVERAGE\t143 FPS") != std::string::npos, "whole above 100 FPS");
+        check(pages[0].table.find("GAME STEPS A SECOND\t60.0") != std::string::npos &&
+                  pages[0].table.find("GAME STEPS, 1% LOW\t58.4") != std::string::npos,
+              "the game's own steps beside the pictures");
 
         // Stages: the stage column left aligned, a stage named by its id, each part's heading spanning.
         check_marks(pages[1].table, 6u, "stage marks");
         check(pages[1].table.rfind("\t#<STAGE\t#AVERAGE", 0) == 0, "the stage heading is left aligned");
         check(pages[1].table.find("1\t<@CosmosGardenGalaxy\t143 FPS") != std::string::npos, "a stage line");
         check(pages[1].table.find("\n#YOUR SETTINGS\n") != std::string::npos, "the part heading is a line alone");
-        check(pages[1].table.find("\t#<ALL STAGES\t#98.6 FPS") != std::string::npos, "one place under 100 FPS");
+        check(pages[1].table.find("2\t<@HeavenlyBeachGalaxy\t98.6 FPS") != std::string::npos, "one place under 100 FPS");
 
         // Where the time goes: four cells a line, the hardware group's names left aligned.
         check_marks(pages[2].table, 4u, "time marks");

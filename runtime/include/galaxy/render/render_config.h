@@ -44,16 +44,12 @@ struct RenderConfig {
 
     // Swap-chain options, read once at start.
 
-    // scene target multisampling (1, 2, 4 or 8), up to what the adapter supports; single-sampled with temporal upscaling or
-    // ray tracing.
+    // scene target multisampling (1, 2, 4 or 8), up to what the adapter supports; single-sampled with temporal upscaling.
     unsigned msaa_samples        = 1;
 
     // Frames per second presented (0: the display's rate, at least 60; kUnlimitedFrameRate: no cap; see
     // present_frame_rate).
     float    max_fps             = static_cast<float>(kGameStepsPerSecond);
-
-    // Submits the game's records at their own 60 Hz cadence instead of one present per game frame.
-    bool     frame_rate_decouple = false;
 
     // Mip LOD bias in units of 0.5 LOD levels (0 full detail, 2 quarter), applied to every sampler.
     unsigned texture_lod_bias    = 0;
@@ -73,7 +69,7 @@ struct RenderConfig {
     bool     enhanced_lighting   = false;
     // The enhanced lighting's scene in a wide target with its camera (scene_camera.h). No row: its look is not accepted.
     bool     wide_scene          = true;
-    // Ambient occlusion of the 3D scene (ambient_occlusion.h); ray-traced lighting has its own.
+    // Ambient occlusion of the 3D scene (ambient_occlusion.h).
     bool     ambient_occlusion   = false;
     // Which: SSAO instead of GTAO.
     bool     ambient_occlusion_ssao = false;
@@ -131,28 +127,6 @@ struct RenderConfig {
     unsigned hdr_peak            = 0;
     unsigned hdr_black           = 0;
 
-    // Ray tracing, on a device that can trace (rt_caps.h); ignored elsewhere.
-    bool     ray_tracing_enabled = false;
-    // The preset: 0 medium, 1 high, 2 low, 3 reference (path traced, to compare), 4 custom (the parts as
-    // set one by one). A preset sets every part (rt_apply_preset).
-    unsigned rt_quality          = 0;
-    // The parts, each its own setting, in RtPart's order (sun shadows, local lights, sky and bounce light, reflections,
-    // glass and water, light in the air): 0 off, 1 low, 2 medium, 3 high.
-    std::array<std::uint8_t, 6> rt_parts{2u, 2u, 2u, 2u, 2u, 2u};
-    // Plan 19.2: what one shadow ray a pixel cost this GPU at the output size (ms), measured once by the tracer in the
-    // first stage it traced with a sun (0: not yet). It sets the preset (high under 0.35 ms, medium under 1.2, else
-    // low) unless the player chose one: rt_chosen, set by the Settings rows.
-    float    rt_probe_ms         = 0.0f;
-    bool     rt_chosen           = false;
-    // The lighting style: 0 painted (the art's own light, relit by the tracer's ratios), 1 physical (where
-    // a painted mesh's paint is one light, the real sun takes its place).
-    unsigned rt_style            = 1;
-    // Light the lens scatters around every bright surface.
-    bool     rt_lens_bloom       = true;
-    // A soft shadow under the player while ray tracing, to judge a landing (the game's own drop shadow is left out
-    // then).
-    bool     rt_landing_shadow   = true;
-
     // Texture packs (texture_pack.h): replacements from the mods'
     // textures/ folders. preload loads the whole pack at start instead of each texture at its first
     // use; dump writes every newly decoded texture once, as a PNG under its pack name, to
@@ -187,16 +161,14 @@ struct RenderConfig {
     friend bool operator==(const RenderConfig&, const RenderConfig&) = default;
 };
 
-// Whether the lit colour channels are summed at the pixel: asked for, or needed by the enhanced lighting, or by ray
-// tracing (a light's traced share is a pixel's).
+// Whether the lit colour channels are summed at the pixel: asked for, or needed by the enhanced lighting.
 [[nodiscard]] inline bool lights_at_pixel(const RenderConfig& config) noexcept {
-    return config.per_pixel_lighting || config.enhanced_lighting || config.ray_tracing_enabled;
+    return config.per_pixel_lighting || config.enhanced_lighting;
 }
 
-// Whether the 3D scene is drawn in the wide (FP16) target with its camera: for the enhanced lighting, or while tracing
-// (the relit scene goes over 1). `tracing`: ray tracing on and the tracer started.
-[[nodiscard]] inline bool scene_wide(const RenderConfig& config, bool tracing) noexcept {
-    return (config.enhanced_lighting || tracing) && config.wide_scene;
+// Whether the 3D scene is drawn in the wide (FP16) target with its camera: for the enhanced lighting.
+[[nodiscard]] inline bool scene_wide(const RenderConfig& config) noexcept {
+    return config.enhanced_lighting && config.wide_scene;
 }
 
 // Frames per second the game picture is presented at. The game renders 60; lower rates present the newest frame on
@@ -221,6 +193,36 @@ inline unsigned interpolated_frames_per_game_frame(double rate) {
     const double frames = std::ceil(rate / kGameStepRate - 1e-3) - 1.0;
     if (!(frames < static_cast<double>(kUnboundedGeneratedFrames))) return kUnboundedGeneratedFrames;
     return std::max(1u, static_cast<unsigned>(frames));
+}
+
+// The sync interval of a DXGI present (Direct3D 12 and 11; P-022: one copy). `configured`: the settings' (0 off, 1, 2),
+// kept as it is but for 1 on a display of a fixed rate; `refresh_hz` the display's (whole hertz, as EnumDisplaySettings
+// reports 119 for 119.88; 0 unknown); `game_frame`: the picture is a game frame, not one between two; `interpolating()`:
+// pictures between game frames are on (asked only when it decides).
+// A game frame at 60 (in-between pictures off, or a movie between them) goes out at once and the display repeats it
+// until the next: the step clock keeps the frames on the display's grid where its rate is a multiple
+// (galaxy/step_lock.h, frame_phase.h). A sync interval of a whole step held each frame back that long (file F, M1: at
+// 240 Hz the present call was made 12.9 ms after its step and came back at 29.3 ms). A rate capped under 60 (30), or of
+// in-between pictures that is a part of the refresh, keeps whole refreshes per picture.
+template <class Interpolating>
+inline unsigned dxgi_sync_interval(unsigned configured, bool variable_refresh, double refresh_hz, float max_fps,
+                                   bool game_frame, Interpolating&& interpolating) {
+    if (configured != 1u || variable_refresh) {
+        return configured;  // a variable refresh display shows a frame at once: whole refreshes mean nothing
+    }
+    if (refresh_hz <= 0.0) {
+        return 1u;
+    }
+    const double asked = present_frame_rate(max_fps, configured, refresh_hz);
+    const double rate = game_frame ? std::min(kGameStepRate, asked) : asked;
+    if ((game_frame || !interpolating()) && rate >= kGameStepRate - 0.5) {
+        return 1u;
+    }
+    const double multiple = std::round(refresh_hz / rate);
+    if (multiple >= 2.0 && multiple <= 4.0 && std::abs(refresh_hz - rate * multiple) <= 0.015 * refresh_hz) {
+        return static_cast<unsigned>(multiple);
+    }
+    return 1u;
 }
 
 inline constexpr std::array<unsigned, 9> kInternalHeights{0, 144, 240, 360, 480, 720, 1080, 1440, 2160};
@@ -304,12 +306,9 @@ struct RenderFeatureCaps {
     std::uint32_t adapter_luid_low = 0;
     std::uint32_t adapter_luid_high = 0;
     std::array<char, 128> adapter_description{};
-    bool dxr_device5_supported = false;
-    unsigned dxr_raytracing_tier = 0;
     bool streamline_bridge_built = false;
     RenderFeatureStatus msaa;
     RenderFeatureStatus taa;
-    RenderFeatureStatus dxr;
     RenderFeatureStatus streamline;
     RenderFeatureStatus reflex;
     RenderFeatureStatus dlss_super_resolution;
@@ -324,17 +323,10 @@ struct RenderFeatureCaps {
     const char* reason);
 
 // The settings as the renderer runs them, a copy taken under the lock (never a partial update): the player's, except
-// while the tracer runs, when the scene renders single-sampled and is anti-aliased temporally (the tracer
-// reads one depth and one item a pixel): MSAA is set aside and, without a temporal upscaler chosen, FSR 3 runs, in its
-// native anti-aliasing mode or at FSR 1's chosen scale. On a surface that presents only at its refresh
-// (present_waits_for_refresh) VSync is on whatever was chosen.
+// on a surface that presents only at its refresh (present_waits_for_refresh), where VSync is on whatever was chosen.
 [[nodiscard]] RenderConfig get_render_config();
-// The player's settings as chosen and saved (Nebula Settings, config.ini): ray tracing off gives them back whole.
+// The player's settings as chosen and saved (Nebula Settings, config.ini).
 [[nodiscard]] RenderConfig get_render_config_chosen();
-// Set as the tracer starts (with whether FSR 3 runs on this device) and stops.
-void set_render_tracing(bool tracing, bool fsr3) noexcept;
-// Whether the tracer runs (set_render_tracing).
-[[nodiscard]] bool render_tracing() noexcept;
 
 // FSR 3 frame generation is built into this renderer (RenderConfig::frame_generation 2; 1 is DLSS).
 [[nodiscard]] bool fsr_frame_generation_compiled() noexcept;
@@ -351,10 +343,6 @@ void set_present_waits_for_refresh(bool waits) noexcept;
 // added. A report older than 100 ms (loading, other scenes, a game that never reports) counts as no.
 void note_frame_generation_allowed(bool allowed) noexcept;
 [[nodiscard]] bool frame_generation_allowed() noexcept;
-// The game's report each frame (NEBULA_CONTEXT_CAMERA_WATER): the camera's depth under water in eye units, < 0 out of
-// water. A report older than 100 ms counts as out of water.
-void note_camera_water(float depth) noexcept;
-[[nodiscard]] float camera_water_depth() noexcept;
 // The rate the game presents at: max_fps, or 60 while frame generation runs.
 [[nodiscard]] inline float presented_max_fps(const RenderConfig& cfg) noexcept {
     return frame_generation_running() ? static_cast<float>(kGameStepsPerSecond) : cfg.max_fps;
@@ -376,27 +364,6 @@ void note_camera_water(float depth) noexcept;
     return max_fps > 0.0f ? std::min(max_fps, refresh) : refresh;
 }
 void set_render_config(const RenderConfig& cfg);
-
-// Ray tracing's parts, in RenderConfig::rt_parts' order; each 0 off, 1 low, 2 medium, 3 high.
-enum class RtPart : std::uint8_t { Sun, Lights, Indirect, Reflect, Transmit, Volume, Count };
-inline constexpr unsigned kRtPresetReference = 3u, kRtPresetCustom = 4u;
-inline unsigned rt_part(const RenderConfig& cfg, RtPart part) noexcept {
-    return part < RtPart::Count ? std::min<unsigned>(cfg.rt_parts[static_cast<std::size_t>(part)], 3u) : 0u;
-}
-
-// The presets' parts: low leaves the painted reflections; reference takes high's parts and the reference
-// path tracer draws the picture.
-inline void rt_apply_preset(RenderConfig& cfg) noexcept {
-    constexpr std::uint8_t kParts[4][6] = {
-        {2u, 2u, 2u, 2u, 2u, 2u},  // medium
-        {3u, 3u, 3u, 3u, 3u, 3u},  // high
-        {1u, 1u, 1u, 0u, 1u, 1u},  // low
-        {3u, 3u, 3u, 3u, 3u, 3u},  // reference
-    };
-    if (cfg.rt_quality < kRtPresetCustom) {
-        std::copy(std::begin(kParts[cfg.rt_quality]), std::end(kParts[cfg.rt_quality]), cfg.rt_parts.begin());
-    }
-}
 
 // Whether the renderer refines curved surfaces: the CURVED SURFACES row is offered and
 // RenderConfig::curved_surfaces takes effect.
@@ -430,13 +397,6 @@ bool save_render_config_to_file();
 [[nodiscard]] unsigned first_start_internal_height(bool shared_memory, unsigned output_lines) noexcept;
 // The PERFORMANCE preset: the 3D scene and the 2D layer at 480 lines and one enlarge at present, every optional pass off.
 void apply_performance_preset(RenderConfig& cfg) noexcept;
-// The benchmark's standard settings, the same on every device so their results compare: the scene at 1920 x 1080 (16:9
-// at 1080 lines, whatever the window's shape), MSAA 4x, SMAA high, ambient occlusion, enhanced and per-pixel lighting,
-// bloom and 16x anisotropic filtering; no upscaler, dynamic resolution, frame generation, ray tracing
-// or HDR, and the benchmark's presenting (apply_benchmark_presenting). The window, display and GPU stay as they are.
-inline constexpr unsigned kBenchmarkStandardLines = 1080u;
-inline constexpr unsigned kBenchmarkStandardAspect = 4u;  // kAspectRatios: 16:9
-void apply_benchmark_standard(RenderConfig& cfg) noexcept;
 // How the benchmark presents, at every step: the game at its own pace and Nebula's interpolated frames between its
 // frames as fast as the device makes them, without VSync (kUnlimitedFrameRate). While a benchmark runs the GPU's
 // generated-frame budget is not applied (RenderCore::interp_gpu_governor): each picture shows the moment it is drawn
@@ -474,10 +434,9 @@ bool choose_next_start_renderer(RendererKind renderer);
 [[nodiscard]] RendererKind renderer_in_settings_file();
 
 // Records the adapter the renderer runs on (adapter.ini beside config.ini) for the settings, which offer DLSS only
-// on an NVIDIA RTX adapter: description (UTF-8), PCI vendor and device id, its gpu_identity() and whether it runs
-// Nebula's ray tracing.
+// on an NVIDIA RTX adapter: description (UTF-8), PCI vendor and device id and its gpu_identity().
 void record_render_adapter(const char* description, unsigned vendor_id, unsigned device_id,
-                           unsigned subsys_id, bool ray_tracing) noexcept;
+                           unsigned subsys_id) noexcept;
 // The adapter record_render_adapter was last given (empty before the renderer starts).
 struct RenderAdapter {
     std::string description;

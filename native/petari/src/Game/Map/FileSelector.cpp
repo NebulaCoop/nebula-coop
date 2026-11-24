@@ -151,10 +151,12 @@ FileSelector::FileSelector(const char* pName)
 }
 
 void FileSelector::init(const TableIter& rIter) {
-    while (!initStep(rIter, UINT64_MAX)) {}
+    LoadSlice whole = LoadSlice::whole();
+    while (!initStep(rIter, whole)) {}
 }
 
-bool FileSelector::initStep(const TableIter& rIter, uint64_t deadline) {
+// One item of the slice for each part made, and for each file item.
+bool FileSelector::initStep(const TableIter& rIter, LoadSlice& rSlice) {
     do {
         switch (mInitStep) {
         case 0:
@@ -168,7 +170,6 @@ bool FileSelector::initStep(const TableIter& rIter, uint64_t deadline) {
         case 2: createSky(); break;
         case 3:
             if (!createFileItemStep()) {
-                if (nebula_host()->clock_ns(nebula_host()->user) >= deadline) return false;
                 continue;
             }
             break;
@@ -193,7 +194,7 @@ bool FileSelector::initStep(const TableIter& rIter, uint64_t deadline) {
         default: return true;
         }
         ++mInitStep;
-    } while (nebula_host()->clock_ns(nebula_host()->user) < deadline);
+    } while (!rSlice.spend());
     return false;
 }
 

@@ -1,4 +1,5 @@
 #include "galaxy/texture_categories.h"
+#include "galaxy/test_wait.h"
 #include "galaxy/test_temp.h"
 // SPDX-License-Identifier: GPL-3.0-only
 // Texture packs: hashes, names, DDS layouts and decodes, PNG round trips, the index, loads, the budget and dumps, and
@@ -208,12 +209,13 @@ void test_sampler_shift() {
     mode.min_lod = 0.0f;
     key = make_sampler_key(mode, 9u, 2.0f);
     expect(key.min_lod == 0.0f, "close-up replacement base level remains visible");
-    key = make_sampler_key(mode, 11u, 3.0f, true, 2.0f);
-    expect(key.lod_bias == -1.0f && key.max_lod == 10.0f && ((key.filter >> 5u) & 7u) == 7u,
+    // The frame's lines over the authored lines are the programs' (sampler_frame_bias lines), not the key's: the key
+    // holds the replacement's own shift only.
+    key = make_sampler_key(mode, 11u, 3.0f, true);
+    expect(key.lod_bias == -3.0f && key.max_lod == 10.0f && ((key.filter >> 5u) & 7u) == 7u,
            "arbitrary replacement levels pair by authored index across the full chain");
-    key = make_sampler_key(mode, 11u, 3.0f, true, 2.0f, -1.5f);
-    expect(key.lod_bias == -1.0f && (key.filter & kSamplerAuthoredLevels) != 0u,
-           "arbitrary replacement levels leave out the scene's bias and are marked drawn by hand");
+    expect((key.filter & kSamplerAuthoredLevels) != 0u && sampler_frame_bias(mode, true, false) == SamplerFrameBias::lines,
+           "arbitrary replacement levels take the lines' bias, not the scene's, and are marked drawn by hand");
 }
 
 // Levels drawn by hand: found by their mean colour and coverage, and sampled as the game sampled them.
@@ -284,16 +286,20 @@ void test_authored_levels() {
     mode.mip = 1;
     mode.max_lod = 4.0f;
     mode.lod_bias = 0.25f;
-    const SamplerKey key = make_sampler_key(mode, 5u, 0.0f, false, 1.5f, -1.0f, true);
-    expect(key.lod_bias == 1.75f && key.max_lod == 4.0f && ((key.filter >> 5u) & 7u) == 5u &&
-               (key.filter & kSamplerAuthoredLevels) != 0u,
-           "the game's levels drawn by hand keep its range and level filter at the authored lines, without the scene's bias");
-    const SamplerKey plain = make_sampler_key(mode, 5u, 0.0f, false, 1.5f, -1.0f, false);
-    expect(plain.lod_bias == -0.75f && (plain.filter & kSamplerAuthoredLevels) == 0u,
+    // The key holds the game's own bias; the frame's part is the programs' (sampler_frame_bias): the lines' for levels
+    // drawn by hand, the scene's for smaller copies, none for a sampler with no levels.
+    const SamplerKey key = make_sampler_key(mode, 5u, 0.0f, false, true);
+    expect(key.lod_bias == 0.25f && key.max_lod == 4.0f && ((key.filter >> 5u) & 7u) == 5u &&
+               (key.filter & kSamplerAuthoredLevels) != 0u && sampler_frame_bias(mode, false, true) == SamplerFrameBias::lines,
+           "the game's levels drawn by hand keep its range and level filter, and take the lines' bias, not the scene's");
+    const SamplerKey plain = make_sampler_key(mode, 5u, 0.0f, false, false);
+    expect(plain.lod_bias == 0.25f && (plain.filter & kSamplerAuthoredLevels) == 0u &&
+               sampler_frame_bias(mode, false, false) == SamplerFrameBias::scene,
            "smaller copies take the scene's bias and no authored lines");
     mode.mip = 0;
-    expect((make_sampler_key(mode, 5u, 0.0f, false, 1.5f, -1.0f, true).filter & kSamplerAuthoredLevels) == 0u,
-           "a sampler reading the first level only has no levels to choose");
+    expect((make_sampler_key(mode, 5u, 0.0f, false, true).filter & kSamplerAuthoredLevels) == 0u &&
+               sampler_frame_bias(mode, false, true) == SamplerFrameBias::none,
+           "a sampler reading the first level only has no levels to choose and no frame bias");
 }
 
 struct Gpu {
@@ -346,18 +352,17 @@ struct Gpu {
     }
 };
 
-// Pumps until `done` or about two seconds.
+// Pumps until `done`: the index and the loads come from threads below the normal priority, which a busy machine runs
+// seconds late, so the wait is for the event, up to galaxy::kTestWaitDeadline (N-1073).
 template <typename Done>
 bool pump_until(TexturePacks& packs, std::vector<std::pair<std::uint32_t, TexturePackPixels>>& uploads, Done done,
                 bool* changed = nullptr) {
-    for (int i = 0; i < 400; ++i) {
+    return galaxy::test_wait([&] {
         packs.begin_frame();
         const bool now = packs.pump(uploads);
         if (changed != nullptr) *changed = *changed || now;
-        if (done()) return true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-    return false;
+        return done();
+    });
 }
 
 void test_packs(Gpu& gpu, const std::filesystem::path& root) {
@@ -466,10 +471,12 @@ void test_packs(Gpu& gpu, const std::filesystem::path& root) {
     packs.dump(name_hash("Coin"), 4u, 4u, pixels.data());
     packs.dump(name_hash("NotAName"), 4u, 4u, pixels.data());
     const std::filesystem::path file = settings.dumps / TexturePacks::kGameId / "Items" / "Coin.png";
-    for (int i = 0; i < 2000 && (packs.stats().dumped == 0u || packs.stats().unnamed_dumps == 0u); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
+    // Both counted, and the file read back whole (it can exist while the writer is still at it).
     TexturePackPixels back;
+    (void)galaxy::test_wait([&] {
+        return packs.stats().dumped != 0u && packs.stats().unnamed_dumps != 0u &&
+               load_texture_pack_image(file, false, back, nullptr);
+    });
     expect(packs.stats().dumped == 1u && packs.stats().unnamed_dumps == 1u &&
                load_texture_pack_image(file, false, back, nullptr) && back.width == 4u && back.levels[0] == pixels,
            "dumped PNG holds the texture once, under its category");
@@ -570,21 +577,20 @@ void test_cache(Gpu& gpu, const std::filesystem::path& root) {
     settings.dumps = root / "cache-dumps";
     settings.budget_bytes = 64ull << 20;
     cache.configure_texture_packs(settings);
-    for (int i = 0; i < 400 && cache.texture_pack_stats().names == 0u; ++i) {
+    (void)galaxy::test_wait([&] {
         next_frame();
-        if (cache.texture_pack_stats().names == 0u) std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
+        return cache.texture_pack_stats().names != 0u;
+    });
     expect(cache.texture_pack_stats().names == 1u, "cache publishes the pack index");
     const TextureHandle original = cache.handle(id);
     expect(original.resource != nullptr && original.resource->GetDesc().Width == 32u && original.lod_shift == 0u,
            "the original shows while its replacement loads");
     TextureHandle replaced{};
-    for (int i = 0; i < 400; ++i) {
+    (void)galaxy::test_wait([&] {
         next_frame();
         replaced = cache.handle(id);
-        if (replaced.resource != nullptr && replaced.resource->GetDesc().Width == 96u) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
+        return replaced.resource != nullptr && replaced.resource->GetDesc().Width == 96u;
+    });
     expect(replaced.resource != nullptr && replaced.resource->GetDesc().Width == 96u && replaced.width == 32u &&
                replaced.height == 32u && replaced.mip_levels == 7u && std::fabs(replaced.lod_shift - std::log2(3.0f)) < 1e-6f,
            "the replacement takes the original's place (source size kept, 3x shift)");
@@ -604,10 +610,9 @@ void test_cache(Gpu& gpu, const std::filesystem::path& root) {
     (void)cache.register_image(made);
     next_frame();
     const std::filesystem::path dumped = settings.dumps / TexturePacks::kGameId / "Objects" / "CacheTex.png";
-    for (int i = 0; i < 2000 && !std::filesystem::exists(dumped); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
+    // The file is waited for until it reads back whole: it can exist while the writer is still at it.
     TexturePackPixels pixels;
+    (void)galaxy::test_wait([&] { return load_texture_pack_image(dumped, false, pixels, nullptr); });
     expect(load_texture_pack_image(dumped, false, pixels, nullptr) && pixels.width == 32u && pixels.height == 32u,
            "dump writes the texture under its name");
     next_frame();
@@ -683,8 +688,18 @@ void test_categories_off() {
     std::filesystem::remove_all(root, error);
 }
 
+// nebula_texture_level_bytes counts in 64 bits (M-168): an image of more than 4 GB of texels does not wrap to a small
+// size that a record's size check would pass.
+void test_level_bytes() {
+    expect(nebula_texture_level_bytes(65536u, 65536u, 1u, NEBULA_TEXTURE_RGBA8) == (std::uint64_t{1} << 34u),
+           "65536 x 65536 RGBA8 is 2^34 bytes, not 0");
+    expect(nebula_texture_level_bytes(32u, 32u, 6u, NEBULA_TEXTURE_RGBA8) == 4u * (1024u + 256u + 64u + 16u + 4u + 1u),
+           "the levels of 32 x 32 RGBA8");
+}
+
 int main() {
     set_names();
+    test_level_bytes();
     test_categories_off();
     const std::filesystem::path root = galaxy::test_temp_path("nebula-texture-pack-test");
     std::filesystem::remove_all(root);

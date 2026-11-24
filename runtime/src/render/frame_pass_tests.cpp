@@ -1,5 +1,7 @@
 // Picture serial accounting, the scene target conversion shader, and scene target-copy geometry tests.
 
+#include "galaxy/render/d3d11/d3d11_context.h"
+#include "galaxy/render/device_memory.h"
 #include "galaxy/render/frame_pass.h"
 #include "galaxy/render/renderer_d3d12.h"
 #include "galaxy/render/texture_store.h"
@@ -83,8 +85,29 @@ bool compiles_scene_conversion_shader(std::string& diagnostics) {
 
 }  // namespace
 
+// N-1050: Direct3D 11 reads an adapter without video memory of its own as unified (WARP's desc), a discrete card's
+// 8 GB as not, and what it reads is what the benchmark and the first calibration see (device_unified_memory).
+bool test_d3d11_unified_memory() {
+    using Microsoft::WRL::ComPtr;
+    ComPtr<IDXGIFactory4> factory;
+    ComPtr<IDXGIAdapter1> warp;
+    DXGI_ADAPTER_DESC1 desc{};
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) || FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp))) ||
+        FAILED(warp->GetDesc1(&desc))) {
+        return expect(false, "the WARP adapter's desc");
+    }
+    bool ok = expect(galaxy::render::d3d11::unified_memory(desc.DedicatedVideoMemory),
+                     "WARP (no video memory of its own) is unified memory on Direct3D 11");
+    ok &= expect(!galaxy::render::d3d11::unified_memory(std::uint64_t{8} << 30u), "a card's own 8 GB is not");
+    galaxy::render::set_device_unified_memory(galaxy::render::d3d11::unified_memory(desc.DedicatedVideoMemory));
+    ok &= expect(galaxy::render::device_unified_memory(), "the renderer's answer is what device_unified_memory reports");
+    galaxy::render::set_device_unified_memory(false);
+    return ok;
+}
+
 int main() {
     bool passed = true;
+    passed &= test_d3d11_unified_memory();
 
     {
         std::string diagnostics;
@@ -127,43 +150,6 @@ int main() {
         passed &= expect_near(viewport.width, 2560.0f, "a full viewport spans the target's width");
         passed &= expect_near(viewport.height, 1824.0f, "a full viewport spans the target's height");
         passed &= expect(viewport.valid() && viewport.min_depth <= viewport.max_depth, "the depth range stays valid");
-    }
-
-    {
-        // A screen probe names a point in frame units; the pixel is the one holding it, at any render scale.
-        const float units = static_cast<float>(galaxy::render::kFrameUnits);
-        const auto probe_at = [units](float fx, float fy) {
-            galaxy::render::ScreenProbe probe{};
-            probe.x = fx * units;
-            probe.y = fy * units;
-            return probe;
-        };
-        for (const galaxy::render::FrameMap frame : {galaxy::render::FrameMap(1920u, 1368u), galaxy::render::FrameMap(1067u, 760u),
-                                                     galaxy::render::FrameMap(3840u, 2736u)}) {
-            const auto middle = galaxy::render::screen_probe_pixel(probe_at(0.5f, 0.5f), frame);
-            passed &= expect(middle.x == frame.width / 2u && middle.y == frame.height / 2u,
-                             "a probe at the middle of the frame reads the pixel there at any render scale");
-            const auto first = galaxy::render::screen_probe_pixel(probe_at(0.0f, 0.0f), frame);
-            passed &= expect(first.x == 0u && first.y == 0u, "a probe at the top left reads pixel 0, 0");
-            const auto last = galaxy::render::screen_probe_pixel(probe_at(1.0f, 1.0f), frame);
-            passed &= expect(last.x == frame.width - 1u && last.y == frame.height - 1u,
-                             "a probe on the far edge reads the last pixel, not past it");
-            const auto quarter = galaxy::render::screen_probe_pixel(probe_at(0.25f, 0.75f), frame);
-            passed &= expect(quarter.x == frame.width / 4u && quarter.y == (frame.height * 3u) / 4u,
-                             "a probe reads the row and column that hold its point, top down");
-        }
-        galaxy::render::ScreenProbe off{};
-        off.x = -1.0f;
-        off.y = -1.0f;
-        passed &= expect(galaxy::render::screen_probe_pixel(off, galaxy::render::FrameMap(1920u, 1368u)).x == ~0u,
-                         "a point the game did not ask about names no pixel");
-        galaxy::render::ScreenProbe nan_probe{};
-        nan_probe.x = std::numeric_limits<float>::quiet_NaN();
-        nan_probe.y = 0.0f;
-        passed &= expect(galaxy::render::screen_probe_pixel(nan_probe, galaxy::render::FrameMap(1920u, 1368u)).x == ~0u,
-                         "a point that is not a number names no pixel");
-        passed &= expect(galaxy::render::screen_probe_pixel(probe_at(0.5f, 0.5f), galaxy::render::FrameMap()).x == ~0u,
-                         "an empty target names no pixel");
     }
 
     if (!passed) {

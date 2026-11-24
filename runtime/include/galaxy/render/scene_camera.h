@@ -24,6 +24,10 @@ public:
 
     bool initialize(ID3D12Device* device);
     void shutdown();
+    // Every pipeline of the pass for each sample count up to `max_samples` (a power of two, at most 8) while the renderer
+    // starts (P-052), so a frame never makes one; one the device refuses is not tried again. On any thread, while no
+    // frame records with the pass.
+    void prepare_pipelines(unsigned max_samples);
     [[nodiscard]] bool ready() const noexcept { return ready_; }
 
     struct Inputs {
@@ -34,7 +38,6 @@ public:
         unsigned width = 0u, height = 0u, samples = 1u;
         float seconds = 0.0f;  // since the last meter; below zero the eye starts open
         bool resolve = false;  // tone-map MSAA samples directly into a single-sample output
-        unsigned finish = 0u;  // the traced relight's finish (scene_camera.hlsl g_finish): 0 none, 1 in sun, 2 sunless
     };
     // The pipeline state is left set for this pass; the caller binds its own again.
     bool record(ID3D12GraphicsCommandList* list, DescriptorRing& ring, const Inputs& in);
@@ -56,6 +59,7 @@ private:
     std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 4> camera_{};
     Microsoft::WRL::ComPtr<ID3D12PipelineState> camera_resolve_;
     std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 4> widen_{};
+    unsigned failed_ = 0u;  // the device would not make: bits 0-3 camera_, 4 camera_resolve_, 5-8 widen_ (not tried again)
     Microsoft::WRL::ComPtr<ID3D12Resource> exposure_;
     bool exposure_ready_ = false;
     bool ready_ = false;

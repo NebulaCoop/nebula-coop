@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // The Metal device (mtl_context.h).
 #include "galaxy/render/mtl/mtl_context.h"
+#include "galaxy/render/mtl/command_buffer_failure.h"
 
+#include "galaxy/launch_args.h"
 #include "galaxy/render/render_config.h"
+#include "galaxy/render/renderer_choice.h"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -16,6 +19,17 @@
 #include <utility>
 
 namespace galaxy::render::mtl {
+
+namespace {
+
+// A failed command buffer's words (command_buffer_failure.h: every error is a lost device, P-008).
+std::string failure_text(NSError* error) {
+    const char* const words = error != nil ? error.localizedDescription.UTF8String : nullptr;
+    return command_buffer_failure_text(error != nil && [error.domain isEqualToString:MTLCommandBufferErrorDomain],
+                                       error != nil ? static_cast<long>(error.code) : 0L, words != nullptr ? words : "");
+}
+
+}  // namespace
 
 // Format's numbers are Metal's.
 static_assert(static_cast<std::uint32_t>(Format::R8) == MTLPixelFormatR8Unorm);
@@ -193,6 +207,13 @@ bool Context::initialize(const std::string& chosen_gpu) {
         return true;
     }
     failure_.clear();
+    if (::galaxy::launch_args().software_device) {
+        // Metal has no software device: said at the start (renderer_choice.h).
+        const std::string missing = software_device_missing_line(RendererKind::kMetal);
+        std::printf("%s\n", missing.c_str());
+        failure_ = missing.substr(std::string("[gpu] ").size());
+        return false;
+    }
     @autoreleasepool {
         id<MTLDevice> device = nil;
 #if TARGET_OS_OSX
@@ -291,10 +312,18 @@ std::uint64_t Context::commit_with(Object command_buffer, bool frame) {
     id<MTLCommandBuffer> const commands = (__bridge id<MTLCommandBuffer>)command_buffer;
     // One committing thread (the render thread): the values rise in commit order.
     const std::uint64_t value = submitted_.load(std::memory_order_relaxed) + 1u;
-    [commands addCompletedHandler:^(id<MTLCommandBuffer> done) {
-        const bool failed = done.status == MTLCommandBufferStatusError;
-        Context::get().completed(value, failed, failed ? std::string(done.error.localizedDescription.UTF8String ?: "") : std::string());
-    }];
+    if (simulated_loss_.exchange(false, std::memory_order_acq_rel)) {
+        // An extension's lose_gpu_device: Metal has no call that removes a device, so this buffer's end is reported as
+        // a lost device's, and the same recovery runs.
+        [commands addCompletedHandler:^(id<MTLCommandBuffer>) {
+            Context::get().completed(value, true, "device lost (asked)");
+        }];
+    } else {
+        [commands addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            const bool failed = done.status == MTLCommandBufferStatusError;
+            Context::get().completed(value, failed, failed ? failure_text(done.error) : std::string());
+        }];
+    }
     if (frame) {
         const std::lock_guard<std::mutex> lock(deferred_mutex_);
         for (Deferred& entry : deferred_) {

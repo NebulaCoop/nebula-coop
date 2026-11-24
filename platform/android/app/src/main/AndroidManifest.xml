@@ -30,6 +30,7 @@
          (finding a peer). -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- mods:begin (app/build.gradle.kts takes everything to mods:end out of a build with no mod support) -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
     <!-- LumaCore's capture services, audio.microphone and capture.camera: asked of the player only when a
@@ -39,6 +40,7 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <!-- mods:end -->
 
     <!-- Updates for an install from Nebula's releases (Updates.kt): the release list and the signed APK (INTERNET, above),
          then Android's installer, which asks the player. An install from a store updates through the store and checks nothing. -->
@@ -87,6 +89,7 @@
             <meta-data
                 android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
                 android:resource="@xml/wiimote_usb" />
+            <!-- mods:begin -->
             <!-- "Open with Nebula" on a mod (a .luma or .lumacoop has no type of its own: by its name; archives by their type) and
                  Share to Nebula: the files go where a drop on the launcher would (LauncherModel.dropped). -->
             <intent-filter>
@@ -129,9 +132,11 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="application/*" />
             </intent-filter>
+            <!-- mods:end -->
         </activity>
 
-        <!-- The game, in its own process: one run per process (the native game starts once). -->
+        <!-- The game, in its own process: one run per process (the native game starts once), so it handles every
+             configuration change: one it did not would recreate it in the same process (ConfigChangesTest). -->
         <activity
             android:name=".GameActivity"
             android:exported="${gameExported}"
@@ -140,7 +145,7 @@
             android:screenOrientation="fullUser"
             android:resizeableActivity="true"
             android:preferMinimalPostProcessing="true"
-            android:configChanges="layoutDirection|locale|grammaticalGender|fontScale|fontWeightAdjustment|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation|density" />
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection|density|colorMode|grammaticalGender|fontWeightAdjustment" />
 
         <!-- Android's installer's answer to an update (Updates.install): its confirmation screen. -->
         <receiver

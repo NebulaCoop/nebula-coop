@@ -137,7 +137,7 @@ const Rule& benchmark_schema() {
                                       {"ambient_occlusion", boolean()}, {"ambient_occlusion_ssao", boolean()},
                                       {"enhanced_lighting", boolean()}, {"per_pixel_lighting", boolean()},
                                       {"bloom", integer()}, {"vsync_interval", integer()}, {"max_fps", n},
-                                      {"frame_generation", integer()}, {"ray_tracing", boolean()},
+                                      {"frame_generation", integer()},
                                       {"display_mode", integer()}});
         const Rule spread = nullable(object({{"average", n}, {"p99", n}, {"worst", n}}));
         const Rule limiter = one_of({"gpu", "render thread", "game thread", "display", "game frames", "waiting"});
@@ -151,6 +151,7 @@ const Rule& benchmark_schema() {
             {"low_01_fps", n},
             {"frame_ms", object({{"average", n}, {"p50", n}, {"p95", n}, {"p99", n}, {"p999", n}, {"worst", n}})},
             {"stutters", integer()},
+            {"game_steps", object({{"steps", integer()}, {"average_per_s", n}, {"low_1_per_s", n}, {"worst_ms", n}})},
         };
         // benchmark.h RenderPart: the render thread's time by part.
         const Rule part_name = one_of({"frame wait", "acquire", "submit", "present", "resource free", "texture create",
@@ -193,7 +194,7 @@ const Rule& benchmark_schema() {
              {"slowest_frames", list(slow_frame, 10)}},
             frames));
         const Rule run = object({
-            {"part", one_of({"yours", "standard"})},
+            {"part", one_of({"yours"})},
             {"measured_with", settings},
             {"summary", object(with({{"limiter", limiter}, {"display_limited", boolean()}}, frames))},
             {"scenes", list(scene, 16)},
@@ -234,9 +235,9 @@ const Rule& benchmark_schema() {
                                                         {"recommended", integer()}}),
                                                 16)}}))},
             {"summary", object({{"verdict", one_of({"fits", "cpu_bound", "below_target", "none"})},
-                                {"average_fps", n}, {"low_10_fps", n}, {"low_1_fps", n}, {"spare_percent", n},
-                                {"limiter", limiter}, {"worst_stage", text(64)}, {"standard_average_fps", n},
-                                {"standard_low_10_fps", n}, {"standard_low_1_fps", n}})},
+                                {"average_fps", n}, {"low_10_fps", n}, {"low_1_fps", n}, {"game_steps_per_s", n},
+                                {"game_steps_low_1_per_s", n}, {"spare_percent", n},
+                                {"limiter", limiter}, {"worst_stage", text(64)}})},
         });
     }();
     return schema;

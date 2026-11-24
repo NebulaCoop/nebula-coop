@@ -18,6 +18,7 @@
 #include "Game/Render/FrameList.hpp"
 #include "Game/LiveActor/Nerve.hpp"
 #include "Game/NameObj/NameObjRegister.hpp"
+#include "Game/Scene/GameScene.hpp"
 #include "Game/Screen/HomeButtonLayout.hpp"
 #include "Game/Screen/SystemWipeHolder.hpp"
 #include "Game/System/AudSystemWrapper.hpp"
@@ -39,6 +40,7 @@
 #include "Game/Util/SystemUtil.hpp"
 #include <Game/Ui/UiInit.hpp>
 #include <NebulaGpu.h>
+#include <nebula_module.h>
 #include <nebula_math.h>
 #include "Game/Screen/NebulaMenuFocus.hpp"
 #include "Game/Screen/NebulaPrepare.hpp"
@@ -136,7 +138,9 @@ void GameSystem::startToLoadSystemArchive() {
 
 void GameSystem::exeInitializeAudio() {
     if (MR::isFirstStep(this)) {
+        nebula_log("game system: opening the sound system\n");
         mObjHolder->createAudioSystem();
+        nebula_log("game system: the sound system call returned\n");
     }
 
     updateSceneController();
@@ -148,6 +152,7 @@ void GameSystem::exeInitializeAudio() {
 
 void GameSystem::exeInitializeBootScene() {
     if (MR::isFirstStep(this)) {
+        nebula_log("game system: sound system created; starting the boot scene\n");
         MR::requestChangeScene(SceneKind_Boot);
     }
 
@@ -328,6 +333,11 @@ void GameSystem::updateSceneController() {
     const bool isSceneHeld = mHomeButtonLayout->isActive() || GameSystemFunction::isOccurredSystemWarning() || isSkipPrompt;
     mIsSceneResumed = mWasSceneHeld && !isSceneHeld;
     mWasSceneHeld = isSceneHeld;
+
+    // The settings' galaxy select's names, from the game's message data, while the menu holds the scene too (P-261).
+    if (isDoneLoadSystemArchive()) {
+        GameScene::answerGalaxySelectNames();
+    }
 
     if (isSceneUpdate || isResetProcessing) {
         mSequenceDirector->update();
