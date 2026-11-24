@@ -106,7 +106,7 @@ class StoreTest(unittest.TestCase):
         self.assertTrue(failures.first_counted(both).startswith("tour/d3d12"))
 
     def test_the_signature_leaves_out_what_changes_from_run_to_run(self):
-        a = failures.signature("build", "exit 1, 1 FAILED: C:/Users/x/build-20261120-101500/a.obj  12.3 s at 4a67ed3e6")
+        a = failures.signature("build", "exit 1, 1 FAILED: C:/Users/x/build-20261120-101500/a.obj  12.3 s at 4a67ed3e6")  # release-check: allow
         b = failures.signature("build", "exit 1, 1 FAILED: D:/NebulaWork/build-20261121-090000/a.obj  98.7 s at 790626cb5")
         self.assertEqual(a, b)
         self.assertNotEqual(failures.signature("build", "exit 1, 2 FAILED: link"), failures.signature("build", "exit 1, 2 FAILED: compile"))

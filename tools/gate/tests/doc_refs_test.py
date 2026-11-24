@@ -62,7 +62,7 @@ class DocRefsTest(unittest.TestCase):
 
     def test_text_that_is_not_a_reference_is_left_alone(self):
         for text in ("`renderer_common.cpp`",                 # no folder: which file is not known
-                     "`C:/Users/x/file.txt`", "`D:/NebulaWork/a/b.md`", "`/usr/lib/x.so`", "`~/x/y.md`",
+                     "`C:/Users/x/file.txt`", "`D:/NebulaWork/a/b.md`", "`/usr/lib/x.so`", "`~/x/y.md`",  # release-check: allow
                      "`https://example.com/a/b.html`",
                      "`runtime/src/*.cpp`", "`runtime/<name>/x.cpp`", "`runtime/{a,b}/x.cpp`",
                      "`rows/p022c`",                         # a branch: no extension

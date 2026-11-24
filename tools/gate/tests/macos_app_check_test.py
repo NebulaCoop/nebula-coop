@@ -205,8 +205,8 @@ unanswered = clean()
 unanswered["Contents/MacOS/Nebula"] = program(x86={"libraries": (SYSTEM, "@rpath/libgone.dylib"), "rpaths": ("@executable_path/../Frameworks",)})
 refused(unanswered, ["@rpath/libgone.dylib"], "an @rpath library no file of the app answers", "--no-mods")
 absolute = clean()
-absolute["Contents/MacOS/Nebula"] = program(arm={"rpaths": ("/Users/builder/work/lib",)})
-refused(absolute, ["rpath /Users/builder/work/lib"], "an absolute rpath", "--no-mods")
+absolute["Contents/MacOS/Nebula"] = program(arm={"rpaths": ("/Users/builder/work/lib",)})  # release-check: allow
+refused(absolute, ["rpath /Users/builder/work/lib"], "an absolute rpath", "--no-mods")  # release-check: allow
 newer = clean()
 newer["Contents/Frameworks/libsmg_game_plain.dylib"] = module(x86={"minos": (13, 0)})
 refused(newer, ["needs macOS 13.0.0, above 12.0"], "a module for macOS 13 in the x86_64 half", "--no-mods")

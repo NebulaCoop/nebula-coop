@@ -105,7 +105,7 @@ class Guard(unittest.TestCase):
                      b"D:/NebulaWork/plan/x", "D:/NebulaWork/build/gate-runs/history.tsv", "D:\\NebulaWork\\build\\gate-runs\\measure-history.tsv"):
             self.assertTrue(r("open", path), path)
         for path in (3, None, "", "D:/NebulaWork/plan-other/x", "D:/NebulaWork/plan.tsv", "D:/NebulaWork/build/gate-runs/20261121-x/result.json",
-                     "D:/NebulaWork/build/gate-runs-old/x", "C:/Users/x/Temp/y", str(self.tmp / "z")):
+                     "D:/NebulaWork/build/gate-runs-old/x", "C:/Users/x/Temp/y", str(self.tmp / "z")):  # release-check: allow
             self.assertFalse(r("open", path), path)
         os.chdir(str(self.tmp))
         self.assertFalse(r("open", "relative.txt"), "a relative path is made absolute first")

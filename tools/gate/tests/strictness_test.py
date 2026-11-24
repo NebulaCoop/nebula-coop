@@ -52,7 +52,7 @@ class Repo:
         self.root = self.dir / "r"
         self.root.mkdir()
         self.env = mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(self.config), "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t",
-                                                "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"})
+                                                "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"})  # release-check: allow
         self.env.start()
         self.git("init", "-q", "-b", "main")
         self.write({"tools/gate/known-failures.tsv": "check\ttest\tledger row\tfirst seen\twhat\n",

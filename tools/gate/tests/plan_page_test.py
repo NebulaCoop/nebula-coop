@@ -592,21 +592,21 @@ class StatusTextTest(unittest.TestCase):
             "| R-001 | started | stress | soak | - | not traced | 1 |"], "in the order given: open fail repairs first")
 
     def test_a_path_that_starts_with_the_home_folder_is_written_with_a_tilde(self):
-        for old, new in (("C:/Users/vaibh/Documents/Nebula/a.txt", "~/Documents/Nebula/a.txt"),
-                         ("C:\\Users\\vaibh\\AppData\\Local\\Temp\\x", "~/AppData\\Local\\Temp\\x"),
-                         ("C:\\Users/vaibh\\Documents/y", "~/Documents/y"),
-                         ("c:/USERS/vaibh/z", "~/z"),
+        for old, new in (("C:/Users/vaibh/Documents/Nebula/a.txt", "~/Documents/Nebula/a.txt"),  # release-check: allow
+                         ("C:\\Users\\vaibh\\AppData\\Local\\Temp\\x", "~/AppData\\Local\\Temp\\x"),  # release-check: allow
+                         ("C:\\Users/vaibh\\Documents/y", "~/Documents/y"),  # release-check: allow
+                         ("c:/USERS/vaibh/z", "~/z"),  # release-check: allow
                          ("D:/NebulaWork/plan/native/x", "D:/NebulaWork/plan/native/x"),
                          ("C:/Users/vaibh", "C:/Users/vaibh"),
                          ("C:/Windows/Users/vaibh/x", "C:/Windows/Users/vaibh/x")):
             self.assertEqual(page.home_short(old), new, old)
-        self.assertEqual(page.home_short("see C:/Users/vaibh/a and C:\\Users\\vaibh\\b"), "see ~/a and ~/b")
+        self.assertEqual(page.home_short("see C:/Users/vaibh/a and C:\\Users\\vaibh\\b"), "see ~/a and ~/b")  # release-check: allow
 
     def test_the_rule_is_applied_to_the_whole_file(self):
         static, data, rows, events = self.state(faults=2)
-        events[0]["first_error"] = "cannot open C:/Users/vaibh/Documents/MarioGalaxyRecomp/x.py"
-        events[1]["could_not"] = "read C:\\Users\\vaibh\\AppData\\Local\\Temp\\log.txt"
-        data["blocked"][0]["reason"] = "see C:/Users/vaibh/notes.txt"
+        events[0]["first_error"] = "cannot open C:/Users/vaibh/Documents/MarioGalaxyRecomp/x.py"  # release-check: allow
+        events[1]["could_not"] = "read C:\\Users\\vaibh\\AppData\\Local\\Temp\\log.txt"  # release-check: allow
+        data["blocked"][0]["reason"] = "see C:/Users/vaibh/notes.txt"  # release-check: allow
         text, _, _ = page.make_status(static, data, rows, events, "2026-11-20T12:00:00")
         self.assertNotIn("Users", text)
         self.assertIn("cannot open ~/Documents/MarioGalaxyRecomp/x.py", text)

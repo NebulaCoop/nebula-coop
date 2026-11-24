@@ -44,7 +44,7 @@ if start is not None:
         git = gate.GIT
         source, long_tree, work = t / "tree", t / "Nebula-long", t / "runs"
         sh(git, "init", "-q", str(source))
-        for k, v in (("user.name", "test"), ("user.email", "test@example.invalid"), ("commit.gpgsign", "false"),
+        for k, v in (("user.name", "test"), ("user.email", "test@example.invalid"), ("commit.gpgsign", "false"),  # release-check: allow
                      ("core.hooksPath", ".git/hooks")):
             sh(git, "-C", str(source), "config", k, v)
 
