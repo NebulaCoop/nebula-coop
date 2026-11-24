@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """release_guard.py --repo OWNER/NAME --commit SHA [--report-only]: whether a release may be built from a commit.
 
-A release is built only from a commit main holds (main moves only through the gate) whose Check run (check.yml) on
-GitHub ended green: release.yml's first job runs this and every package job needs that job (P-023). It asks GitHub
-through the gh command (GH_TOKEN): the comparison of the commit with main, and the Check runs of the commit.
+A release is built only from a commit main holds (main moves only through pull requests) whose "Build result" check
+(build.yml, the check main requires) on GitHub ended green: release.yml's first job runs this and every package job needs
+that job (P-023). It asks GitHub through the gh command (GH_TOKEN): the comparison of the commit with main, and the
+commit's "Build result" check runs.
 Exit 0 when both hold; 1 with the reason otherwise. --report-only prints the answer and exits 0 (a dry run builds
 packages from any branch)."""
 import argparse
 import json
 import subprocess
 import sys
+
+# The job of build.yml that main's ruleset requires (it gates on the Windows build, the importer and the installer tests).
+CHECK = "Build result"
 
 
 def gh(*args):
@@ -29,15 +33,15 @@ def judge(repo, commit, ask=gh):
     if status not in ("ahead", "identical"):
         return "main does not hold %s (compared with main: %s): a release is built from a commit on main" % (commit[:9], status)
     try:
-        runs = json.loads(ask("api", "repos/%s/actions/workflows/check.yml/runs?head_sha=%s&per_page=100" % (repo, commit)))
+        runs = json.loads(ask("api", "repos/%s/commits/%s/check-runs?check_name=%s&per_page=100" % (repo, commit, CHECK.replace(" ", "%20"))))
     except (RuntimeError, ValueError) as e:
-        return "GitHub could not list the Check runs of %s: %s" % (commit[:9], e)
-    ended = [(r.get("status"), r.get("conclusion")) for r in runs.get("workflow_runs", [])]
+        return "GitHub could not list the %s checks of %s: %s" % (CHECK, commit[:9], e)
+    ended = [(r.get("status"), r.get("conclusion")) for r in runs.get("check_runs", [])]
     if any(s == "completed" and c == "success" for s, c in ended):
         return None
     if not ended:
-        return "%s has no Check run: a release is built from a commit whose Check run passed" % commit[:9]
-    return "no Check run of %s passed (%s)" % (commit[:9], ", ".join("%s/%s" % (s, c) for s, c in ended))
+        return "%s has no %s check: a release is built from a commit whose %s passed" % (commit[:9], CHECK, CHECK)
+    return "no %s check of %s passed (%s)" % (CHECK, commit[:9], ", ".join("%s/%s" % (s, c) for s, c in ended))
 
 
 def main():
@@ -48,7 +52,7 @@ def main():
     a = p.parse_args()
     why = judge(a.repo, a.commit)
     if why is None:
-        print("release_guard: %s is on main and its Check run passed" % a.commit[:9])
+        print("release_guard: %s is on main and its %s check passed" % (a.commit[:9], CHECK))
         return 0
     print("release_guard: %s%s" % (why, " (a dry run: reported only)" if a.report_only else ""))
     return 0 if a.report_only else 1

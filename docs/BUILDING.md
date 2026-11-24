@@ -101,21 +101,28 @@ inside it.
 
 ## Releases
 
-Pushing a version tag publishes a release (`.github/workflows/release.yml`):
+Pushing a version tag builds a release (`.github/workflows/release.yml`), as upstream Nebula's 2.0 releases are built.
+Write its notes first, in `.github/release-notes/<version>.md` (a tag without them is refused), and tag a commit on main
+whose Build result passed:
 
 ```powershell
-git tag -a v2.0.0 -m "Nebula 2.0.0"
-git push origin v2.0.0
+git tag -a v2.0.0-beta.1 -m "Nebula 2.0.0-beta.1"
+git push origin v2.0.0-beta.1
 ```
 
-The Release workflow builds the host and the game module (the host with cross-file optimization), makes Setup with the
-script above, runs `tools/release_check.ps1` on it (without Defender), and publishes `Nebula-Setup.exe` and
-`Nebula-Setup.exe.sig` as the GitHub release `Nebula 2.0.0`, with install steps and the pull requests since the last
-release as its notes. A tag with `-beta.` in it (`v2.0.0-beta.1`) makes `Nebula-Beta-Setup.exe`, which only betas update
-to; any tag with a `-` part is a pre-release. When a release for the tag already exists (made by hand on GitHub), its
-notes are kept and only the files are added. Setup's update check reads this repository's releases. Its ray-tracing
-tables have a header and no rows (Setup refuses an empty file): they describe the game's own data and are kept outside
-the repository. `Nebula.pdb` is kept as the run's `release-symbols` download for 90 days.
+The tag's version is `CMakeLists.txt`'s project version, with `-beta.<n>` for a beta. The workflow makes the draft release
+`Nebula <version>` with those notes (a beta is a pre-release) and builds every package into it: the Windows Setup
+(`Nebula-Setup.exe`, checked by `tools/release_check.ps1` without Defender), the Linux package
+(`Nebula-Linux-x64.tar.gz`), the Mac app (`Nebula-macOS.zip`, Intel and Apple silicon) and the Android app
+(`Nebula-Android-unsigned.apk`), each with the manifest its update reads. A beta's files are `Nebula-Beta-...`, and every
+build carries the label (`NEBULA_VERSION_SUFFIX`), so a beta reports `2.0.0-beta.1` and only betas update to it.
+Unlike upstream's betas, ours keep mod support. Each package is started once on GitHub's machines before it is added.
+Then `installer/sign-release.ps1` signs the draft (below), and the release is published by hand on GitHub. The
+`Nebula.pdb` files are kept as the run's `release-symbols-*` downloads for 90 days.
+
+**Actions** > **Release** > **Run workflow** with **dry run** builds every package from a branch and keeps them as the
+run's downloads (no tag, no release); its **version** builds as that version (and needs its notes). A pull request
+that changes how a release is built runs a dry run too.
 
 Setup installs NebulaCoop beside an installed upstream Nebula, never over it: `%LOCALAPPDATA%\Programs\NebulaCoop`,
 data in `%LOCALAPPDATA%\NebulaCoop`, its own Start menu folder, `HKCU\Software\NebulaCoop` and Add/Remove Programs entry
@@ -124,9 +131,17 @@ file type and no `nebula:` links: those stay Nebula's. When a first install find
 or its data folder), Setup offers to copy its saves and settings, and its packed game when this version can read it,
 so the disc is not asked for. Nebula's folders are only read. Updates never ask.
 
-Updates run only a Setup signed with the release key, the private half of `installer/release-public-key.xml`. Put
-that private key (RSA XML) in the repository secret `NEBULA_RELEASE_KEY`; without it Setup is published unsigned and
-installed copies don't update to it. To make a new key pair (keep `nebula-release-private.xml` out of the repository):
+Updates take only what the release key signs: the private half of `installer/release-public-key.xml`. Put that private
+key (RSA XML) in the repository secret `NEBULA_RELEASE_KEY`, and the workflow signs the draft itself: the Setup, every
+manifest and `SHA256SUMS`. The Android app is signed with the app signing key when the repository has it as the secrets
+`NEBULA_ANDROID_KEYSTORE` (the keystore, base64), `NEBULA_ANDROID_STORE_PASSWORD`, `NEBULA_ANDROID_KEY_ALIAS` and
+`NEBULA_ANDROID_KEY_PASSWORD`. Whatever the workflow had no key for, sign on the PC that has it:
+
+```powershell
+.\installer\sign-release.ps1 -Tag v2.0.0-beta.1 -AndroidSigning <signing.properties>
+```
+
+To make a new key pair (keep `nebula-release-private.xml` out of the repository):
 
 ```powershell
 $rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider 4096
@@ -136,6 +151,4 @@ New-Item -ItemType Directory -Force "$env:USERPROFILE\.nebula-release-key" | Out
 [IO.File]::WriteAllText("$PWD\installer\release-public-key.xml", $rsa.ToXmlString($false))
 ```
 
-Run it from the repository's root. A pull request that changes the Release workflow, the installer,
-`native/build.ps1` or `tools/release_check.ps1` builds Setup the same way without publishing it (the `nebula-setup`
-download), and so does **Actions** > **Release** > **Run workflow**.
+Run it from the repository's root.

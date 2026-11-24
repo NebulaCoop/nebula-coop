@@ -1,11 +1,11 @@
-"""release_guard_test.py: a release is built only from a commit main holds whose Check run passed (P-023).
+"""release_guard_test.py: a release is built only from a commit main holds whose Build result check passed (P-023).
 
 python -X utf8 -I tools/gate/tests/release_guard_test.py
 
 tools/release_guard.judge with GitHub's answers made up:
-- a commit main holds (compare: ahead or identical) with a green Check run may be released;
+- a commit main holds (compare: ahead or identical) with a green Build result check may be released;
 - a commit main does not hold (behind, diverged) is refused, whatever its runs;
-- a commit with no Check run, or only red, cancelled or unfinished ones, is refused; one green run among red ones is
+- a commit with no Build result check, or only red, cancelled or unfinished ones, is refused; one green run among red ones is
   enough (a run started again);
 - a failed question to GitHub refuses, naming it.
 And release.yml: its first job runs the guard, and every package job needs that job.
@@ -39,7 +39,9 @@ def asker(status, runs, fail=None):
             raise RuntimeError("HTTP 502")
         if "/compare/" in args[1]:
             return json.dumps({"status": status})
-        return json.dumps({"workflow_runs": [{"status": s, "conclusion": c} for s, c in runs]})
+        if "check_name=Build%20result" not in args[1]:
+            raise RuntimeError("asked for another check: " + args[1])
+        return json.dumps({"check_runs": [{"status": s, "conclusion": c} for s, c in runs]})
     return ask
 
 
@@ -52,15 +54,15 @@ if release_guard is not None:
     check(why is not None and "main does not hold" in why, "a commit main does not hold is refused: %s" % why)
     check(judge("o/r", "a" * 40, asker("diverged", green)) is not None, "a diverged commit is refused")
     why = judge("o/r", "a" * 40, asker("ahead", []))
-    check(why is not None and "no Check run" in why, "no Check run is refused: %s" % why)
+    check(why is not None and "no Build result check" in why, "no Build result check is refused: %s" % why)
     why = judge("o/r", "a" * 40, asker("ahead", [("completed", "failure"), ("in_progress", None), ("completed", "cancelled")]))
-    check(why is not None and "no Check run" in why and "completed/failure" in why, "red, unfinished, cancelled: refused: %s" % why)
+    check(why is not None and "no Build result check" in why and "completed/failure" in why, "red, unfinished, cancelled: refused: %s" % why)
     check(judge("o/r", "a" * 40, asker("ahead", [("completed", "failure"), ("completed", "success")])) is None,
           "one green run among red ones is enough")
     why = judge("o/r", "a" * 40, asker("ahead", green, fail="/compare/"))
     check(why is not None and "could not compare" in why, "a failed comparison refuses: %s" % why)
-    why = judge("o/r", "a" * 40, asker("ahead", green, fail="/runs"))
-    check(why is not None and "could not list" in why, "a failed run list refuses: %s" % why)
+    why = judge("o/r", "a" * 40, asker("ahead", green, fail="/check-runs"))
+    check(why is not None and "could not list" in why, "a failed check list refuses: %s" % why)
 
 text = (TREE / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 jobs = text.split("\njobs:\n", 1)[1]
