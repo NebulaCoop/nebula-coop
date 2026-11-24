@@ -1,13 +1,14 @@
-"""release_workflow_test.py: the version and the mod switch of a release (release.yml, cmake/nebula_options.cmake).
+"""release_workflow_test.py: the version of a release, and its mod support (release.yml, cmake/nebula_options.cmake).
 
 python -X utf8 -I tools/gate/tests/release_workflow_test.py
 
 - The workflow's "Version and notes" step is run by bash on a planted folder (a CMakeLists.txt with the project's version, a
-  .github/release-notes folder): v2.0.0-beta.1 is a pre-release (prefix Nebula-Beta, suffix -beta.1, mod support OFF) that needs
-  .github/release-notes/2.0.0-beta.1.md; v2.0.0 is a release as before (prefix Nebula, no suffix, mod support ON); a dry run
-  names its version or takes CMakeLists.txt's; a tag that is not the project's version, or has another label, is refused.
-- Every package job takes the two outputs as NEBULA_MODS and NEBULA_VERSION_SUFFIX; the LumaKit job runs only with mod support;
-  the jobs that need it go on when it is skipped; a pre-release is created as a pre-release with its notes file.
+  .github/release-notes folder): v2.0.0-beta.1 is a pre-release (prefix Nebula-Beta, suffix -beta.1) that needs
+  .github/release-notes/2.0.0-beta.1.md; v2.0.0 is a release (prefix Nebula, no suffix); a dry run names its version or
+  takes CMakeLists.txt's; a tag that is not the project's version, or has another label, is refused.
+- Every package job takes the version's label as NEBULA_VERSION_SUFFIX. NebulaCoop keeps mod support in every release, a
+  beta too (co-op's built-in mods need it): no job turns NEBULA_MODS off, the LumaKit job always runs and every package is
+  checked to hold the mod kit. A pre-release is created as a pre-release with its notes file.
 - cmake/nebula_options.cmake, configured by cmake alone: NEBULA_MODS=OFF (as a variable or in the environment, the variable
   first) defines NEBULA_NO_MODS for every program, the version's label is -beta.<n> or nothing.
 Exit 0 when every case holds.
@@ -82,12 +83,12 @@ with tempfile.TemporaryDirectory(prefix="release-workflow-") as folder:
     tmp = pathlib.Path(folder)
     code, out, said = version_step(tmp, tag="v2.0.0-beta.1", notes=["2.0.0-beta.1"])
     check(code == 0 and out.get("version") == "2.0.0-beta.1" and out.get("prefix") == "Nebula-Beta" and out.get("suffix") == "-beta.1"
-          and out.get("mods") == "OFF", "v2.0.0-beta.1: a pre-release, no mod support: %s %s" % (out, said))
+          and "mods" not in out, "v2.0.0-beta.1: a pre-release: %s %s" % (out, said))
     code, out, said = version_step(tmp, tag="v2.0.0-beta.1", notes=["2.0.0"])
     check(code != 0 and "release-notes/2.0.0-beta.1.md" in said, "v2.0.0-beta.1 without its notes is refused: %s" % said)
     code, out, said = version_step(tmp, tag="v2.0.0", notes=["2.0.0"])
     check(code == 0 and out.get("version") == "2.0.0" and out.get("prefix") == "Nebula" and out.get("suffix") == ""
-          and out.get("mods") == "ON", "v2.0.0: a release as before, mod support: %s %s" % (out, said))
+          , "v2.0.0: a release: %s %s" % (out, said))
     code, out, said = version_step(tmp, tag="v2.0.0", notes=[])
     check(code != 0 and "release-notes/2.0.0.md" in said, "v2.0.0 without its notes is refused: %s" % said)
     code, out, said = version_step(tmp, tag="v2.1.0", notes=["2.1.0"])
@@ -95,10 +96,10 @@ with tempfile.TemporaryDirectory(prefix="release-workflow-") as folder:
     code, out, said = version_step(tmp, tag="v2.0.0-rc.1", notes=["2.0.0-rc.1"])
     check(code != 0, "a label other than -beta.<n> is refused: %s" % said)
     code, out, said = version_step(tmp, tag="")
-    check(code == 0 and out.get("version") == "2.0.0" and out.get("mods") == "ON" and out.get("suffix") == "",
-          "a dry run with no version builds the project's version with mod support: %s %s" % (out, said))
+    check(code == 0 and out.get("version") == "2.0.0" and out.get("suffix") == "",
+          "a dry run with no version builds the project's version: %s %s" % (out, said))
     code, out, said = version_step(tmp, dry_version="2.0.0-beta.1", notes=["2.0.0-beta.1"])
-    check(code == 0 and out.get("version") == "2.0.0-beta.1" and out.get("mods") == "OFF" and out.get("suffix") == "-beta.1"
+    check(code == 0 and out.get("version") == "2.0.0-beta.1" and out.get("suffix") == "-beta.1"
           and out.get("prefix") == "Nebula-Beta", "a dry run that names the beta builds it as the beta: %s %s" % (out, said))
     code, out, said = version_step(tmp, dry_version="v2.0.0-beta.1", notes=["2.0.0-beta.1"])
     check(code == 0 and out.get("version") == "2.0.0-beta.1", "a dry run's version may carry the v: %s" % said)
@@ -110,16 +111,16 @@ with tempfile.TemporaryDirectory(prefix="release-workflow-") as folder:
     # ---- the jobs
     for job in ("windows-hosts", "windows-game", "windows-setup", "linux", "macos", "android"):
         text = job_text(job)
-        check("NEBULA_MODS: ${{ needs.release.outputs.mods }}" in text and "NEBULA_VERSION_SUFFIX: ${{ needs.release.outputs.suffix }}" in text,
-              "the %s job takes the mod switch and the version's label from the release job" % job)
-    lumakit = job_text("lumakit")
-    check("needs.release.outputs.mods == 'ON'" in lumakit.split("runs-on")[0], "the lumakit job runs only with mod support")
+        check("NEBULA_VERSION_SUFFIX: ${{ needs.release.outputs.suffix }}" in text,
+              "the %s job takes the version's label from the release job" % job)
+    check("NEBULA_MODS:" not in WORKFLOW and "-NoMods" not in WORKFLOW and "--no-mods" not in WORKFLOW,
+          "no job turns mod support off")
+    check("if:" not in job_text("lumakit").split("runs-on")[0], "the lumakit job always runs")
     for job in ("windows-setup", "linux", "macos", "android"):
-        head = job_text(job).split("runs-on")[0]
-        check("needs.lumakit.result == 'skipped'" in head and "!cancelled()" in head, "the %s job goes on when the lumakit job is skipped" % job)
-    check("needs.release.result == 'success'" in job_text("windows-setup").split("runs-on")[0] and
-          "needs.windows-game.result == 'success'" in job_text("windows-setup").split("runs-on")[0],
-          "and still needs the jobs it takes its files from")
+        text = job_text(job)
+        head = text.split("runs-on")[0]
+        check("lumakit" in head and "check_mod_support_package.py" in text and "--mods" in text,
+              "the %s job waits for the LumaKit check and checks its package holds the mod kit" % job)
     draft = step_script("The draft release")
     check("*-*) prerelease=--prerelease" in draft and '--notes-file ".github/release-notes/$VERSION.md"' in draft,
           "a version with a label is created as a pre-release, with its notes file")

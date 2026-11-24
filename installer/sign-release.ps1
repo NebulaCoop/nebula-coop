@@ -19,7 +19,7 @@ The keys stay on this PC, so this script finishes the draft:
 
 What the release already has signed is left as it is, and the script names what the release does not have yet: run it
 again once the workflow adds it. The release stays a draft: publish it on GitHub, or with
-gh release edit <tag> --repo keepvaibin/nebula --draft=false. A beta's files are named Nebula-Beta-...
+gh release edit <tag> --repo NebulaCoop/nebula-coop --draft=false. A beta's files are named Nebula-Beta-...
 
 Requires PowerShell 5.1 or later, the GitHub CLI (gh, signed in to GitHub) and the Android SDK's build-tools (apksigner,
 from ANDROID_HOME or the default SDK folder).
@@ -27,7 +27,7 @@ from ANDROID_HOME or the default SDK folder).
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$Tag,
-    [string]$Repository = 'keepvaibin/nebula',
+    [string]$Repository = 'NebulaCoop/nebula-coop',
     # The app signing key: a properties file as platform/android/app/build.gradle.kts's nebula.signing reads it.
     [string]$AndroidSigning = '',
     # The release key's private half (RSA XML).
@@ -118,12 +118,16 @@ try {
     if ($assets -contains $apk) {
         Write-Host "$apk is signed already."
     } elseif ($assets -contains $unsignedApk) {
-        if (-not $AndroidSigning) { throw "$unsignedApk needs the app signing key: pass -AndroidSigning <signing.properties>" }
+        # The release workflow runs this without the app signing key when the repository has none: the app is left for
+        # the release PC, where it runs again with -AndroidSigning.
+        if (-not $AndroidSigning) { Write-Host "$unsignedApk is left unsigned: run this again with -AndroidSigning <signing.properties>" }
+        else {
         Invoke-Checked gh @('release', 'download', $Tag, '--repo', $Repository, '--pattern', $unsignedApk, '--dir', $folder)
         Sign-Apk (Join-Path $folder $unsignedApk) (Join-Path $folder $apk) (Read-Properties $AndroidSigning)
         Invoke-Checked gh @('release', 'upload', $Tag, '--repo', $Repository, '--clobber', (Join-Path $folder $apk))
         Invoke-Checked gh @('release', 'delete-asset', $Tag, $unsignedApk, '--repo', $Repository, '--yes')
         $assets = @($assets | Where-Object { $_ -ne $unsignedApk }) + $apk
+        }
     }
 
     # 2. The release-key signatures.
