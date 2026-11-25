@@ -166,6 +166,15 @@ with tempfile.TemporaryDirectory(prefix="mod-support-package-") as folder:
     (tmp / "full-Setup.exe").write_bytes(setup(*base, "app/smg_game.dll", "app/luma/mods/lumakit.luma"))
     check(run(tmp / "full-Setup.exe", "--mods")[0] == 0, "a Setup with the kit passes --mods")
     check(run(tmp / "clean-Setup.exe", "--mods")[0] == 1, "a Setup without it fails --mods")
+    # As build-native-setup.ps1 makes it: a real zip, LumaKit (itself a zip, "PK" first) stored as it is, resources after.
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        for entry in base + ("app/smg_game.dll",):
+            archive.writestr(entry, b"x" * 64, zipfile.ZIP_DEFLATED)
+        archive.writestr("app/luma/mods/lumakit.luma", b"PK\x03\x04" + b"kit" * 20, zipfile.ZIP_STORED)
+    (tmp / "zip-Setup.exe").write_bytes(b"MZ" + b"\0" * 64 + payload.getvalue() + b"\0" * 32 + b"RCDATA after")
+    code, out = run(tmp / "zip-Setup.exe", "--mods")
+    check(code == 0, "a Setup whose payload is a real zip with a stored LumaKit passes --mods: %s" % out)
 
     # ---- Not a package.
     (tmp / "notes.txt").write_text("x", encoding="utf-8")

@@ -15,8 +15,10 @@ With --mods it must hold the game module with the rows and LumaKit.
 
 Prints what it found, one line each; exit 0 when the package is what was asked, 1 when not, 2 when it cannot be read.
 """
+import io
 import pathlib
 import re
+import struct
 import sys
 import tarfile
 import zipfile
@@ -47,10 +49,34 @@ def entries(path):
             read = [n for n in names if n.endswith((".plist", ".strings", ".desktop")) or n == "AndroidManifest.xml"]
             return sorted(names), {n: archive.read(n) for n in read}
     if name.endswith(".exe"):
-        # Setup carries its files as one zip in a resource; the zip's entry names are stored as they are.
+        # Setup carries its files as one zip in a resource: read as a zip where its central directory is found, else
+        # by the entry names, which are stored as they are.
         data = path.read_bytes()
-        return sorted({m.decode("ascii") for m in re.findall(rb"app/[A-Za-z0-9_./\-]+", data)}), {}
+        names = setup_payload_names(data)
+        if names is None:
+            names = {m.decode("ascii") for m in re.findall(rb"app/[A-Za-z0-9_./\-]+", data)}
+        return sorted(names), {}
     raise ValueError("a package is a Setup .exe, a .tar.gz, a .zip or an .apk: " + path.name)
+
+
+def setup_payload_names(data):
+    """The entry names of the zip in Setup's PAYLOAD resource, or None when none is found. Names alone can't be cut out
+    of the bytes: a name runs on into what follows it when that is letters, as a .luma (itself a zip, stored as it is)
+    starting "PK" after its name, or the next central directory record's "PK"."""
+    end = data.rfind(b"PK\x05\x06")
+    while end != -1:
+        try:
+            size, offset, comment = struct.unpack_from("<IIH", data, end + 12)
+            start = end - size - offset
+            if size and start >= 0 and data[end - size:end - size + 4] == b"PK\x01\x02":
+                with zipfile.ZipFile(io.BytesIO(data[start:end + 22 + comment])) as archive:
+                    names = {n for n in archive.namelist() if not n.endswith("/")}
+                if any(n.startswith("app/") for n in names):
+                    return names
+        except (struct.error, zipfile.BadZipFile, ValueError):
+            pass
+        end = data.rfind(b"PK\x05\x06", 0, end)
+    return None
 
 
 def android_forms(text):
