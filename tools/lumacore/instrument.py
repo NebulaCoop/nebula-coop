@@ -2086,7 +2086,7 @@ def write_depfile(path, output, included):
 
 
 # What instrument.py writes beside OUTPUT (Unit.write), all kept by the cache.
-OUTPUT_SUFFIXES = ('', '.numbers', '.types', '.rows', '.functions', '.places', '.left', '.globals')
+OUTPUT_SUFFIXES = ('', '.numbers', '.types', '.rows', '.functions', '.places', '.needs', '.left', '.globals')
 
 
 def file_digest(path):
