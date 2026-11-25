@@ -8068,6 +8068,16 @@ int main(int argc, char** argv) {
         galaxy::whole_lines::flush();
         std::_Exit(0);
     }
+#if defined(NEBULA_HOST_RENDERER)
+    // The package's start check needs no disc (upstream runs it before any game file is looked for), so it goes
+    // before the default game.pak lookup below, which would end a start with no content folder.
+    if (const unsigned frames = ::galaxy::launch_args().start_check; frames != 0u) {
+        // The process ends here without the renderer's shutdown, as a game's end does (finish_and_exit).
+        const int code = run_start_check(frames);
+        galaxy::whole_lines::flush();
+        std::_Exit(code);
+    }
+#endif
     // Without --pak and --saves, the disc and saves are found as find_default_pak and default_nand say, so the
     // program starts with no arguments from a folder that holds content/game.pak.
     fs::path program = galaxy::program_directory();
@@ -8082,12 +8092,6 @@ int main(int argc, char** argv) {
         }
     }
 #if defined(NEBULA_HOST_RENDERER)
-    if (const unsigned frames = ::galaxy::launch_args().start_check; frames != 0u) {
-        // The process ends here without the renderer's shutdown, as a game's end does (finish_and_exit).
-        const int code = run_start_check(frames);
-        galaxy::whole_lines::flush();
-        std::_Exit(code);
-    }
     if (benchmark) {
         // No save folder: the game's saves stay in memory. Straight to the title, no time limit (it quits when done).
         saves.clear();
